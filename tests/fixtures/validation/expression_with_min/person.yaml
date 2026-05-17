@@ -1,0 +1,9 @@
+name: person
+format: csv
+rows: 5
+data:
+  - name: score
+    range:
+      min: 0.0
+      max: 100.0
+    expression: "1 + 1"

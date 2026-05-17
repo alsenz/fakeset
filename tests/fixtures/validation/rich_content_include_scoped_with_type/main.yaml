@@ -1,0 +1,14 @@
+name: main
+format: jsonl
+rows: 3
+data:
+  - name: items
+    type: list
+    content:
+      includes:
+        - file: source.yaml
+          ref: src
+      fields:
+        - name: label
+          type: string    # error: type must not be set on an include-scoped ref
+          ref: src.label

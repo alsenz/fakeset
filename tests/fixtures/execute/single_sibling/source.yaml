@@ -1,0 +1,7 @@
+name: source
+format: csv
+rows: 20
+data:
+  - name: id
+    type: string
+    generator: uuid

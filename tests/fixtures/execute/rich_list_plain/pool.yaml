@@ -1,0 +1,10 @@
+name: pool
+format: jsonl
+rows: 10
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: tag
+    type: string
+    generator: word

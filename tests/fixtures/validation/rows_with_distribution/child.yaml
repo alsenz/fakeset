@@ -1,0 +1,7 @@
+name: child
+format: parquet
+rows: 50
+includes:
+  - file: base.yaml
+    ref: base_data
+    distribution: 0.5

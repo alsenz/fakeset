@@ -1,0 +1,38 @@
+name: organisations
+format: parquet
+rows: 100
+data:
+  - name: org_id
+    type: string
+    generator: uuid
+  - name: company_name
+    type: string
+    generator: company_name
+  - name: industry
+    type: string
+    generator: industry
+  - name: bic
+    type: string
+    generator: bic
+  - name: active
+    type: boolean
+  - name: directors
+    type: list
+    count: {min: 1, max: 25}
+    content:
+      includes:
+        - file: individuals.yaml
+          ref: individual
+          distribution: 0.2
+      fields:
+        - name: role
+          type: string
+          value: "director"
+        - name: status
+          type: string
+          value: "active"
+        - name: name
+          ref: individual.full_name
+        - name: employer
+          type: string
+          ref: company_name

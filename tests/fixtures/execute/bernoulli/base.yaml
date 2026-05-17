@@ -1,0 +1,9 @@
+name: base
+format: csv
+rows: 6
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: category
+    type: string

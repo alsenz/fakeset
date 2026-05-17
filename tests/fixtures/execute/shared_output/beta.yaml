@@ -1,0 +1,11 @@
+name: beta
+format: csv
+rows: 4
+output_file: combined
+data:
+  - name: kind
+    type: string
+    value: "beta"
+  - name: id
+    type: string
+    generator: uuid

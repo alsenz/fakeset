@@ -1,0 +1,7 @@
+name: bad_ref_with_type
+format: parquet
+rows: 10
+data:
+  - name: title
+    type: string
+    ref: some_ref.title

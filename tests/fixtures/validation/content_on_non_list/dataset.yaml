@@ -1,0 +1,8 @@
+name: bad_content_field
+format: parquet
+rows: 10
+data:
+  - name: label
+    type: string
+    content:
+      type: number

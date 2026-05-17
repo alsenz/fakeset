@@ -1,0 +1,7 @@
+name: person
+format: csv
+rows: 5
+data:
+  - name: email
+    generator: email
+    expression: "1 + 1"

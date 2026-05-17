@@ -1,0 +1,12 @@
+name: items
+format: jsonl
+rows: 20
+data:
+  - name: label
+    type: string
+    generator: word
+  - name: value
+    type: number
+    range:
+      min: 1
+      max: 100

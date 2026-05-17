@@ -1,0 +1,6 @@
+name: missing_include_ref
+format: parquet
+rows: 10
+data:
+  - name: employee_id
+    ref: nonexistent_ref.id

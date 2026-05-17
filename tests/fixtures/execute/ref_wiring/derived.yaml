@@ -1,0 +1,11 @@
+name: derived
+format: csv
+includes:
+  - file: source.yaml
+    ref: src
+data:
+  - name: id
+    ref: src.id
+  - name: label
+    type: string
+    generator: word

@@ -1,0 +1,12 @@
+name: person
+format: csv
+rows: 5
+data:
+  - name: first_name
+    type: string
+    generator: first_name
+  - name: last_name
+    type: string
+    generator: last_name
+  - name: full_name
+    expression: "first_name || ' ' || last_name"

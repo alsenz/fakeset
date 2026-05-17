@@ -1,0 +1,11 @@
+name: person
+format: csv
+rows: 20
+data:
+  - name: age
+    type: number
+    range:
+      min: 10.0
+      max: 80.0
+  - name: category
+    expression: "CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END"

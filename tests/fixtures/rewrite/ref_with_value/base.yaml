@@ -1,0 +1,6 @@
+name: base
+format: parquet
+rows: 10
+data:
+  - name: status
+    type: string

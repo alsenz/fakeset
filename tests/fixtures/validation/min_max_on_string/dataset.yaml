@@ -1,0 +1,9 @@
+name: min_max_on_string
+format: parquet
+rows: 10
+data:
+  - name: label
+    type: string
+    range:
+      min: 0.0
+      max: 100.0

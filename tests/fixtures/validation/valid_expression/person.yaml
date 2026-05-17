@@ -1,0 +1,11 @@
+name: person
+format: csv
+rows: 5
+data:
+  - name: age
+    type: number
+    range:
+      min: 20.0
+      max: 60.0
+  - name: adult_life
+    expression: "age - 18"

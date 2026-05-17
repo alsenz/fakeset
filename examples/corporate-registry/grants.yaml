@@ -1,0 +1,23 @@
+name: grants
+format: parquet
+includes:
+  - file: micro.yaml
+    ref: micro_enterprises
+    distribution: 0.1
+data:
+  - name: grant_id
+    type: string
+    generator: uuid
+  - name: recipient_id
+    ref: micro_enterprises.sme_id
+  - name: amount
+    type: number
+    range:
+      min: 5000
+      max: 250000
+  - name: purpose
+    type: string
+    generator: buzzword
+  - name: awarded_at
+    type: date
+    generator: date

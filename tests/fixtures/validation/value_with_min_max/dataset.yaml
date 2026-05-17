@@ -1,0 +1,9 @@
+name: value_with_min_max
+format: parquet
+rows: 10
+data:
+  - name: score
+    type: number
+    value: 42.0
+    range:
+      min: 0.0

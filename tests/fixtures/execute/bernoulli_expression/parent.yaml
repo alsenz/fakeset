@@ -1,0 +1,11 @@
+name: parent
+format: csv
+rows: 10
+data:
+  - name: score
+    type: number
+    range:
+      min: 0.0
+      max: 100.0
+  - name: doubled
+    expression: "score * 2"

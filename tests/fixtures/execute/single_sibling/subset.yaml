@@ -1,0 +1,9 @@
+name: subset
+format: csv
+includes:
+  - file: source.yaml
+    ref: src
+    distribution: 0.5
+data:
+  - name: id
+    ref: src.id

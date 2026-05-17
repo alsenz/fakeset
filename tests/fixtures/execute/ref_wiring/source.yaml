@@ -1,0 +1,10 @@
+name: source
+format: csv
+rows: 5
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: name
+    type: string
+    generator: first_name

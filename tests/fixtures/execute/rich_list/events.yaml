@@ -1,0 +1,26 @@
+name: events
+format: jsonl
+rows: 5
+data:
+  - name: event_id
+    type: string
+    generator: uuid
+  - name: title
+    type: string
+    generator: sentence
+  - name: attendees
+    type: list
+    count:
+      min: 1
+      max: 4
+    content:
+      includes:
+        - file: people.yaml
+          ref: person
+          distribution: 0.5
+      fields:
+        - name: name
+          ref: person.full_name
+        - name: event_title
+          type: string
+          ref: title

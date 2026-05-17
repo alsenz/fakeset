@@ -1,0 +1,8 @@
+name: c
+format: parquet
+includes:
+  - file: b.yaml
+    ref: b_ref
+data:
+  - name: id
+    ref: b_ref.id

@@ -1,0 +1,9 @@
+name: min_gt_max
+format: parquet
+rows: 10
+data:
+  - name: score
+    type: number
+    range:
+      min: 100.0
+      max: 1.0

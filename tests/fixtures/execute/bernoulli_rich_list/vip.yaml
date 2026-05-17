@@ -1,0 +1,9 @@
+name: vip
+format: jsonl
+includes:
+  - file: events.yaml
+    ref: events
+    distribution: 0.5
+data:
+  - name: title
+    ref: events.title

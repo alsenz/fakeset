@@ -1,0 +1,22 @@
+name: medium_enterprises
+format: parquet
+includes:
+  - file: smes.yaml
+    ref: smes
+    distribution: 0.0067
+data:
+  - name: sme_id
+    ref: smes.sme_id
+  - name: sme_status
+    ref: smes.sme_status
+    value: "medium"
+  - name: employee_count
+    type: number
+    range:
+      min: 50
+      max: 249
+  - name: annual_revenue
+    type: number
+    range:
+      min: 10000000
+      max: 50000000

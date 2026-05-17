@@ -1,0 +1,9 @@
+name: bad_schema_field
+format: parquet
+rows: 10
+data:
+  - name: score
+    type: number
+    fields:
+      - name: sub
+        type: string

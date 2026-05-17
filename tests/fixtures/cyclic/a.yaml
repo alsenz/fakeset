@@ -1,0 +1,5 @@
+name: a
+format: parquet
+includes:
+  - file: b.yaml
+    ref: b_data

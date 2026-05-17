@@ -1,0 +1,28 @@
+name: orders
+format: csv
+rows: 100
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: amount
+    type: number
+    range:
+      min: 10
+      max: 1000
+variants:
+  - distribution: 0.6
+    data:
+      - name: status
+        type: string
+        value: pending
+  - distribution: 0.3
+    data:
+      - name: status
+        type: string
+        value: shipped
+  - distribution: 0.1
+    data:
+      - name: status
+        type: string
+        value: cancelled

@@ -1,0 +1,22 @@
+name: small_enterprises
+format: parquet
+includes:
+  - file: smes.yaml
+    ref: smes
+    distribution: 0.0433
+data:
+  - name: sme_id
+    ref: smes.sme_id
+  - name: sme_status
+    ref: smes.sme_status
+    value: "small"
+  - name: employee_count
+    type: number
+    range:
+      min: 10
+      max: 49
+  - name: annual_revenue
+    type: number
+    range:
+      min: 2000000
+      max: 10000000

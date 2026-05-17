@@ -1,0 +1,22 @@
+name: valid_generators
+format: parquet
+rows: 10
+data:
+  - name: first_name
+    type: string
+    generator: first_name
+  - name: company
+    type: string
+    generator: company_name
+  - name: score
+    type: number
+    generator: positive_decimal
+  - name: signup_date
+    type: date
+    generator: date
+  - name: last_seen
+    type: date_time
+    generator: date_time
+  - name: lat
+    type: number
+    generator: latitude

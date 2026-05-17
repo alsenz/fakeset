@@ -1,0 +1,9 @@
+name: pool
+format: jsonl
+rows: 100
+data:
+  - name: val
+    type: number
+    range:
+      min: 1
+      max: 10

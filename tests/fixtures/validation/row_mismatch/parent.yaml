@@ -1,0 +1,7 @@
+name: parent
+format: parquet
+includes:
+  - file: a.yaml
+    ref: a_data
+  - file: b.yaml
+    ref: b_data

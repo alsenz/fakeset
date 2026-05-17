@@ -1,0 +1,13 @@
+name: main
+format: jsonl
+rows: 3
+data:
+  - name: items
+    type: list
+    content:
+      includes:
+        - file: source.yaml
+          ref: src
+      fields:
+        - name: doubled
+          expression: "src_val * 2"    # error: expression not supported in rich content

@@ -1,0 +1,10 @@
+name: ambiguous
+format: csv
+includes:
+  - file: source_a.yaml
+    ref: a
+  - file: source_b.yaml
+    ref: b
+data:
+  - name: doubled_age
+    expression: "age * 2"

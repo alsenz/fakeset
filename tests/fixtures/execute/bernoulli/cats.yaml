@@ -1,0 +1,12 @@
+name: cats
+format: csv
+includes:
+  - file: base.yaml
+    ref: b
+    distribution: 0.5
+data:
+  - name: id
+    ref: b.id
+  - name: category
+    ref: b.category
+    value: "cats"

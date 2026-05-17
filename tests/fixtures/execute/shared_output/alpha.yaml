@@ -1,0 +1,11 @@
+name: alpha
+format: csv
+rows: 3
+output_file: combined
+data:
+  - name: kind
+    type: string
+    value: "alpha"
+  - name: id
+    type: string
+    generator: uuid

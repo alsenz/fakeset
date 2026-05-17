@@ -1,0 +1,19 @@
+name: smes
+format: parquet
+includes:
+  - file: organisations.yaml
+    ref: organisations
+    distribution: 0.99
+data:
+  - name: sme_id
+    type: string
+    generator: uuid
+  - name: sme_status
+    type: string
+  - name: org_id
+    ref: organisations.org_id
+  - name: employee_count
+    type: number
+  - name: annual_revenue
+    type: number
+    generator: positive_decimal

@@ -1,0 +1,22 @@
+name: micro_enterprises
+format: parquet
+includes:
+  - file: smes.yaml
+    ref: smes
+    distribution: 0.95
+data:
+  - name: sme_id
+    ref: smes.sme_id
+  - name: sme_status
+    ref: smes.sme_status
+    value: "micro"
+  - name: employee_count
+    type: number
+    range:
+      min: 1
+      max: 9
+  - name: annual_revenue
+    type: number
+    range:
+      min: 0
+      max: 2000000

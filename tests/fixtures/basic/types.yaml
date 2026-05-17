@@ -1,0 +1,3 @@
+name: types
+format: parquet
+rows: 10

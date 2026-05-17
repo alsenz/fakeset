@@ -1,0 +1,16 @@
+name: directors
+format: parquet
+includes:
+  - file: individuals.yaml
+    ref: individual
+    distribution: 0.3
+data:
+  - name: role
+    type: string
+    value: "director"
+  - name: status
+    type: string
+  - name: name
+    ref: individual.full_name
+  - name: employer
+    type: string

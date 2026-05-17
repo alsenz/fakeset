@@ -1,0 +1,7 @@
+name: bad_generator
+format: parquet
+rows: 10
+data:
+  - name: score
+    type: number
+    generator: first_name

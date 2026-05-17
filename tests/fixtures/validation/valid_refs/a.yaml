@@ -1,0 +1,11 @@
+name: a
+format: parquet
+includes:
+  - file: b.yaml
+    ref: b_data
+    distribution: 0.5
+data:
+  - name: employee_id
+    ref: b_data.employee_id
+  - name: score
+    ref: b_data.score

@@ -1,0 +1,10 @@
+name: a
+format: parquet
+includes:
+  - file: b.yaml
+    ref: b_data
+    distribution: 0.5
+data:
+  - name: email
+    ref: b_data.email
+    generator: company_name

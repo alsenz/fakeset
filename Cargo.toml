@@ -1,0 +1,61 @@
+[package]
+name = "fakeset"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib/lib.rs"
+
+[[bin]]
+name = "fakeset"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = "0.4"
+semver = "1"
+uuid = { version = "1", features = ["v4"] }
+arrow = { version = "58.3.0", features = ["csv", "json"] }
+clap = { version = "4.6.1", features = ["derive"] }
+datafusion = "53.1.0"
+fake = { version = "5.1.0", features = [
+  "derive",
+  "dummy",
+  "always-true-rng",
+  "base64",
+  "bigdecimal-rs",
+  "bson_oid",
+  "chrono",
+  "chrono-tz",
+  "either",
+  "email_address",
+  "ferroid",
+  "geo",
+  "geo-types",
+  "glam",
+  "http",
+  "indexmap",
+  "maybe-non-empty-collections",
+  "num-traits",
+  "rand_core",
+  "random_color",
+  "rust_decimal",
+  "semver",
+  "serde_json",
+  "time",
+  "ulid",
+  "url",
+  "url-escape",
+  "uuid",
+  "zerocopy",
+] }
+parquet = "58.3.0"
+petgraph = "0.8.3"
+rand = "0.10.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+walkdir = "2.5.0"
+
+[dev-dependencies]
+serde_json = "1"

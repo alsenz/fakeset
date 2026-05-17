@@ -1,0 +1,13 @@
+name: valid_value
+format: parquet
+rows: 10
+data:
+  - name: status
+    type: string
+    value: "active"
+  - name: version
+    type: number
+    value: 1.0
+  - name: verified
+    type: boolean
+    value: true

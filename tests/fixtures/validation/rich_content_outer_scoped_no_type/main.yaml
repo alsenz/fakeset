@@ -1,0 +1,16 @@
+name: main
+format: jsonl
+rows: 3
+data:
+  - name: title
+    type: string
+    generator: sentence
+  - name: items
+    type: list
+    content:
+      includes:
+        - file: source.yaml
+          ref: src
+      fields:
+        - name: event_title
+          ref: title    # error: outer-scoped ref with no type:

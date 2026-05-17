@@ -1,0 +1,8 @@
+name: value_with_generator
+format: parquet
+rows: 10
+data:
+  - name: name
+    type: string
+    generator: first_name
+    value: "Alice"

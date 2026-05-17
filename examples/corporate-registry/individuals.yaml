@@ -1,0 +1,15 @@
+name: individuals
+format: parquet
+data:
+  - name: full_name
+    type: string
+    generator: name
+  - name: role
+    type: string
+    generator: profession
+  - name: email
+    type: string
+    generator: email
+  - name: phone
+    type: string
+    generator: phone_number

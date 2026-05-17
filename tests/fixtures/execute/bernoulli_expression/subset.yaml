@@ -1,0 +1,9 @@
+name: subset
+format: csv
+includes:
+  - file: parent.yaml
+    ref: p
+    distribution: 0.5
+data:
+  - name: score
+    ref: p.score

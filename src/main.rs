@@ -1,0 +1,340 @@
+use anyhow::Result;
+use clap::Parser;
+use fakeset::{
+    executor::execute, expressions::pull_down_expression_deps, graph::build_dag,
+    load_all_datasets, models::SyntheticDataset,
+    plan::{build_plan, ExecutionPlan, ExecutionStep},
+    rewrite::{apply_global_locales, resolve_refs}, segment::DEFAULT_MAX_SIBLINGS, validate::validate,
+};
+use petgraph::visit::Topo;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "fakeset", about = "Generate fake datasets from YAML definitions")]
+struct Cli {
+    /// Files and directories containing YAML dataset definitions
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+
+    /// Directory to write generated outputs into
+    #[arg(short, long, default_value = "output")]
+    output: PathBuf,
+
+    /// Print the DAG with field details before the rewrite pass, then exit
+    #[arg(long)]
+    print_dag: bool,
+
+    /// Print the DAG with field details after the rewrite pass (resolved types
+    /// and merged constraints), then exit
+    #[arg(long)]
+    print_rewritten: bool,
+
+    /// Print the execution plan (row counts, sibling segments, prefill wiring), then exit
+    #[arg(long)]
+    print_plan: bool,
+
+    /// Maximum number of siblings allowed in one sibling group (default 16).
+    /// Segment enumeration is 2^N, so raising this requires proportionally more RAM.
+    #[arg(long, default_value_t = DEFAULT_MAX_SIBLINGS)]
+    max_siblings: usize,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let datasets = load_all_datasets(&cli.paths)?;
+    let dag = build_dag(&datasets)?;
+    let datasets = pull_down_expression_deps(&datasets)?;
+    for warning in validate(&datasets)? {
+        eprintln!("{warning}");
+    }
+
+    if cli.print_dag {
+        println!("=== DAG (before rewrite) ===\n");
+        print_datasets(&datasets, &dag.graph);
+        return Ok(());
+    }
+
+    let mut resolved = resolve_refs(&datasets)?;
+    apply_global_locales(&mut resolved);
+
+    if cli.print_rewritten {
+        println!("=== DAG (after rewrite) ===\n");
+        print_datasets(&resolved, &dag.graph);
+        return Ok(());
+    }
+
+    let plan = build_plan(&dag, &resolved, cli.max_siblings)?;
+
+    if cli.print_plan {
+        println!("=== Execution Plan ({} steps) ===\n", plan.steps.len());
+        print_plan(&plan);
+        return Ok(());
+    }
+
+    println!(
+        "Loaded {} dataset(s) into DAG ({} include edge(s))",
+        dag.graph.node_count(),
+        dag.graph.edge_count(),
+    );
+
+    execute(&plan, &cli.output).await?;
+
+    println!("Done. Output written to {}", cli.output.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plan pretty-printer
+// ---------------------------------------------------------------------------
+
+fn print_plan(plan: &ExecutionPlan) {
+    for (i, step) in plan.steps.iter().enumerate() {
+        match step {
+            ExecutionStep::GenerateDataset { dataset, rows, prefills, .. } => {
+                println!(
+                    "[{}] generate: {} ({} rows, {})",
+                    i + 1, dataset.name, rows, dataset.format
+                );
+                for field in &dataset.data {
+                    print_field(field, 4);
+                }
+                for p in prefills {
+                    let src = p.from_path.file_stem()
+                        .and_then(|s: &std::ffi::OsStr| s.to_str())
+                        .unwrap_or("?");
+                    println!("    prefill: {}.{} → {}", src, p.from_column, p.into_column);
+                }
+            }
+            ExecutionStep::GenerateSiblingGroup { parent, segments, siblings, .. } => {
+                let total: usize = segments.iter().map(|s| s.rows).sum();
+                println!(
+                    "[{}] sibling group: {} ({} rows across {} segments, {})",
+                    i + 1, parent.name, total, segments.len(), parent.format
+                );
+                for seg in segments {
+                    let names: Vec<&str> = seg.siblings.iter()
+                        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()))
+                        .collect();
+                    let label = if names.is_empty() {
+                        "(parent-only)".to_string()
+                    } else {
+                        format!("{{{}}}", names.join(", "))
+                    };
+                    if seg.field_constraints.is_empty() {
+                        println!("    segment {} → {} rows", label, seg.rows);
+                    } else {
+                        let overrides: Vec<String> = seg.field_constraints.iter()
+                            .filter_map(|(k, fc)| {
+                                fc.value.as_ref().map(|v| format!("{k}={}", format_yaml_value(v)))
+                                    .or_else(|| {
+                                        let lo = fc.min.map(|v| format!("min:{v}"));
+                                        let hi = fc.max.map(|v| format!("max:{v}"));
+                                        let parts: Vec<_> = [lo, hi].into_iter().flatten().collect();
+                                        if parts.is_empty() { None } else { Some(format!("{k}({})", parts.join(" "))) }
+                                    })
+                            })
+                            .collect();
+                        println!("    segment {} → {} rows [{}]", label, seg.rows, overrides.join(", "));
+                    }
+                }
+                println!("    siblings:");
+                for sib in siblings {
+                    println!("      {} ({})", sib.dataset.name, sib.dataset.format);
+                }
+            }
+            ExecutionStep::GenerateInnerFlat {
+                list_field_name, outer_path, flat_key, include_path,
+                include_distribution, count, ..
+            } => {
+                let outer = outer_path.file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("?");
+                let inc = include_path.file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("?");
+                let flat = flat_key.file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("?");
+                let dist = include_distribution
+                    .map(|d| format!(" dist:{:.0}%", d * 100.0))
+                    .unwrap_or_default();
+                let count_label = match count {
+                    fakeset::models::CountSpec::Fixed(n) => format!("{n}"),
+                    fakeset::models::CountSpec::Uniform { min, max } => format!("{min}–{max}"),
+                    fakeset::models::CountSpec::Normal { mean, .. } => format!("~{mean}"),
+                };
+                println!(
+                    "[{}] inner flat: {}.{} from {} (count:{}, inc:{}{}) → {}",
+                    i + 1, outer, list_field_name, inc, count_label, inc, dist, flat
+                );
+            }
+            ExecutionStep::AssembleRichList { outer_path, dataset, flat_specs } => {
+                let outer = outer_path.file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("?");
+                let fields: Vec<&str> = flat_specs.iter().map(|(n, _)| n.as_str()).collect();
+                println!(
+                    "[{}] assemble rich list: {} ← [{}] ({})",
+                    i + 1, outer, fields.join(", "), dataset.format
+                );
+            }
+            ExecutionStep::WriteSharedOutput { output_file, format } => {
+                println!(
+                    "[{}] write shared: {} ({})",
+                    i + 1, output_file, format
+                );
+            }
+        }
+        println!();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DAG pretty-printer
+// ---------------------------------------------------------------------------
+
+fn print_datasets(
+    datasets: &HashMap<PathBuf, SyntheticDataset>,
+    graph: &petgraph::graph::DiGraph<PathBuf, ()>,
+) {
+    let mut topo = Topo::new(graph);
+    let mut order: Vec<PathBuf> = Vec::new();
+    while let Some(idx) = topo.next(graph) {
+        order.push(graph[idx].clone());
+    }
+
+    for path in &order {
+        let Some(ds) = datasets.get(path) else {
+            continue;
+        };
+
+        let rows_str = ds
+            .rows
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let skip_str = if ds.skip { " skip" } else { "" };
+        let locale_str = ds.locale.as_ref()
+            .map(|l| format!(", locale: {l}"))
+            .unwrap_or_default();
+        println!(
+            "{} [{}] (rows: {}{}{})",
+            ds.name, ds.format, rows_str, skip_str, locale_str
+        );
+
+        if let Some(ref of) = ds.output_file {
+            println!("  output_file: {of}");
+        }
+
+        if !ds.includes.is_empty() {
+            println!("  includes:");
+            for inc in &ds.includes {
+                let dist = inc
+                    .distribution
+                    .map(|d| format!(" dist: {:.0}%", d * 100.0))
+                    .unwrap_or_default();
+                println!("    {} (ref: {}{})", inc.file, inc.reference, dist);
+            }
+        }
+
+        if !ds.data.is_empty() {
+            println!("  fields:");
+            for field in &ds.data {
+                print_field(field, 4);
+            }
+        }
+
+        if !ds.variants.is_empty() {
+            let fixed_sum: f64 = ds.variants.iter().filter_map(|v| v.distribution).sum();
+            let n_free = ds.variants.iter().filter(|v| v.distribution.is_none()).count();
+            let free_share = if n_free > 0 { (1.0 - fixed_sum) / n_free as f64 } else { 0.0 };
+            println!("  variants: {} →", ds.variants.len());
+            for (i, v) in ds.variants.iter().enumerate() {
+                let d = v.distribution.unwrap_or(free_share);
+                let locale_tag = v.locale.as_ref().map(|l| format!(" locale:{l}")).unwrap_or_default();
+                println!("    v{i} ({:.0}%{locale_tag}):", d * 100.0);
+                for field in &v.data {
+                    print_field(field, 6);
+                }
+            }
+        }
+
+        println!();
+    }
+}
+
+fn print_field(field: &fakeset::models::Field, indent: usize) {
+    let pad = " ".repeat(indent);
+
+    if let Some(ref expr) = field.expression {
+        let hidden_tag = if field.hidden { " [hidden]" } else { "" };
+        println!("{pad}{:<24} expr: {}{}", field.name, expr, hidden_tag);
+        return;
+    }
+
+    let type_str = field
+        .field_type
+        .as_ref()
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let ref_str = field.ref_field.as_deref().unwrap_or("-");
+
+    let gen_str = field
+        .generator
+        .as_ref()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut extras: Vec<String> = Vec::new();
+    if let Some(r) = &field.range {
+        if let Some(lo) = r.min { extras.push(format!("min:{lo}")); }
+        if let Some(hi) = r.max { extras.push(format!("max:{hi}")); }
+    }
+    if let Some(ref v) = field.value {
+        extras.push(format!("value:{}", format_yaml_value(v)));
+    }
+    let extras_str = if extras.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", extras.join(", "))
+    };
+
+    println!(
+        "{pad}{:<24} type:{:<12} ref:{:<30} gen:{:<20}{}",
+        field.name, type_str, ref_str, gen_str, extras_str
+    );
+
+    for sub in &field.fields {
+        print_field(sub, indent + 2);
+    }
+    match field.content.as_deref() {
+        Some(c) if c.includes.is_empty() => {
+            print!("{pad}  [content] ");
+            print_field(&c.item, indent + 2);
+        }
+        Some(c) => {
+            println!("{pad}  [rich list content]");
+            for inc in &c.includes {
+                let dist = inc.distribution
+                    .map(|d| format!(" dist:{:.0}%", d * 100.0))
+                    .unwrap_or_default();
+                println!("{pad}    include: {} (ref: {}{})", inc.file, inc.reference, dist);
+            }
+            for f in &c.item.fields {
+                print_field(f, indent + 4);
+            }
+        }
+        None => {}
+    }
+}
+
+fn format_yaml_value(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::Null => "null".to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::String(s) => format!("\"{s}\""),
+        serde_yaml::Value::Sequence(_) => "[...]".to_string(),
+        serde_yaml::Value::Mapping(_) => "{...}".to_string(),
+        serde_yaml::Value::Tagged(t) => format!("{:?}", t),
+    }
+}

@@ -1,0 +1,20 @@
+name: outer
+format: jsonl
+rows: 10
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: samples
+    type: list
+    count:
+      mean: 3.0
+      std_dev: 1.0
+    content:
+      includes:
+        - file: pool.yaml
+          ref: p
+          distribution: 0.8
+      fields:
+        - name: val
+          ref: p.val

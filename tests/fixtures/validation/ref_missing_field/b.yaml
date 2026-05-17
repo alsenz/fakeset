@@ -1,0 +1,6 @@
+name: b
+format: parquet
+rows: 100
+data:
+  - name: id
+    type: string

@@ -1,0 +1,17 @@
+name: valid_min_max
+format: parquet
+rows: 10
+data:
+  - name: score
+    type: number
+    range:
+      min: 0.0
+      max: 100.0
+  - name: lower_only
+    type: number
+    range:
+      min: 1.0
+  - name: upper_only
+    type: number
+    range:
+      max: 50.0

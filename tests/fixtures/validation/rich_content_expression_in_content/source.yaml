@@ -1,0 +1,8 @@
+name: source
+format: csv
+rows: 5
+data:
+  - name: val
+    type: number
+    min: 1
+    max: 10
