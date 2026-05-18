@@ -1,7 +1,9 @@
 pub mod constraints;
 pub mod executor;
+pub mod expand_variants;
 pub mod expressions;
 pub mod generator;
+pub mod schema;
 pub mod segment;
 pub mod graph;
 pub mod models;

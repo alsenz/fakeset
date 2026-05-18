@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use crate::models::{Field, Generator, Range};
 use serde_yaml::Value as YamlValue;
 
@@ -19,6 +20,34 @@ pub struct FieldConstraints {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub value: Option<YamlValue>,
+}
+
+/// Validate the constraint set of a field at `path`, returning detailed error messages.
+/// Covers value+generator, value+range, and min>max conflicts.
+pub fn validate_field_constraints(path: &str, field: &Field) -> Result<()> {
+    let fc = FieldConstraints::from(field);
+    if fc.value.is_some() {
+        if fc.generator.is_some() {
+            bail!(
+                "field '{path}': `value` and `generator` cannot both be set \
+                 — `value` emits a constant, making the generator redundant"
+            );
+        }
+        if fc.min.is_some() || fc.max.is_some() {
+            bail!(
+                "field '{path}': `value` and `range` cannot both be set \
+                 — `value` emits a constant, making bounds meaningless"
+            );
+        }
+    }
+    if let (Some(lo), Some(hi)) = (fc.min, fc.max) {
+        if lo > hi {
+            bail!(
+                "field '{path}': `range.min` ({lo}) must be less than or equal to `range.max` ({hi})"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl Satisfiable for FieldConstraints {

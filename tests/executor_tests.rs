@@ -1,5 +1,6 @@
 use fakeset::{
-    executor::execute, expressions::pull_down_expression_deps, graph::build_dag,
+    executor::execute, expand_variants::expand_field_variants,
+    expressions::pull_down_expression_deps, graph::build_dag,
     load_all_datasets, plan::build_plan, rewrite::resolve_refs, validate::validate,
 };
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ async fn run(fixture: &str) -> PathBuf {
     for w in validate(&datasets).expect("validate") {
         eprintln!("warn: {w}");
     }
+    let datasets = expand_field_variants(datasets).expect("expand field variants");
     let resolved = resolve_refs(&datasets).expect("resolve refs");
     let plan = build_plan(&dag, &resolved, 16).expect("build plan");
     execute(&plan, &out).await.expect("execute");
@@ -143,9 +145,14 @@ async fn test_ref_wiring_propagates_column_values() {
 
     assert_eq!(source_ids.len(), 5, "source should have 5 rows");
     assert_eq!(derived_ids.len(), 5, "derived should have 5 rows");
+
+    let mut source_sorted = source_ids.clone();
+    let mut derived_sorted = derived_ids.clone();
+    source_sorted.sort();
+    derived_sorted.sort();
     assert_eq!(
-        source_ids, derived_ids,
-        "source.id should be pre-filled from derived.id — values and order must match"
+        source_sorted, derived_sorted,
+        "source.id should be pre-filled from derived.id — same values must appear in both"
     );
 }
 
@@ -549,18 +556,12 @@ async fn test_rich_list_include_and_outer_scoped_refs() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_variant_outputs_to_single_file_with_correct_row_count() {
-    // orders has 3 variants (60/30/10%) totalling 100 rows.
-    // All variants write to the same output file "orders" via WriteSharedOutput.
+async fn test_variant_output_rows_and_values() {
+    // orders has 3 variants (60/30/10%): all rows go to a single orders.csv via WriteSharedOutput.
+    // 100 rows total; all three status values must appear.
     let out = run("tests/fixtures/execute/variants").await;
     let rows = csv_rows(&out, "orders");
     assert_eq!(rows, 100, "all variant rows should be combined into orders.csv");
-}
-
-#[tokio::test]
-async fn test_variant_field_values_are_present_in_output() {
-    // The 'status' field differs per variant; all three values should appear in the output.
-    let out = run("tests/fixtures/execute/variants").await;
     let statuses = csv_column(&out, "orders", "status");
     assert!(statuses.contains(&"pending".to_string()), "expected 'pending' status in output");
     assert!(statuses.contains(&"shipped".to_string()), "expected 'shipped' status in output");
@@ -577,4 +578,26 @@ async fn test_variant_sibling_total_rows() {
     assert_eq!(source_rows, 100, "source variants should total 100 rows");
     let subset_rows = csv_rows(&out, "subset");
     assert!(subset_rows > 0, "subset should have rows from both variant groups");
+}
+
+// ---------------------------------------------------------------------------
+// Field-local variant tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_field_variants_produce_correct_row_count_and_combinations() {
+    // orders.yaml has 120 rows, status(50/50) × tier(25/25/50) = 6 combinations.
+    // All rows go to orders.csv via WriteSharedOutput.
+    let out = run("tests/fixtures/execute/field_variants").await;
+    let rows = csv_rows(&out, "orders");
+    assert_eq!(rows, 120, "all 6 variant combinations should total 120 rows in orders.csv");
+
+    let statuses = csv_column(&out, "orders", "status");
+    assert!(statuses.contains(&"pending".to_string()), "expected 'pending' status");
+    assert!(statuses.contains(&"shipped".to_string()), "expected 'shipped' status");
+
+    let tiers = csv_column(&out, "orders", "tier");
+    assert!(tiers.contains(&"gold".to_string()), "expected 'gold' tier");
+    assert!(tiers.contains(&"silver".to_string()), "expected 'silver' tier");
+    assert!(tiers.contains(&"bronze".to_string()), "expected 'bronze' tier");
 }

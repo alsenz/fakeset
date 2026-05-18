@@ -1,0 +1,24 @@
+name: orders
+format: csv
+output_file: orders
+rows: 120
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: status
+    type: variant
+    variants:
+      - value: "pending"
+        distribution: 0.5
+      - value: "shipped"
+        distribution: 0.5
+  - name: tier
+    type: variant
+    variants:
+      - value: "gold"
+        distribution: 0.25
+      - value: "silver"
+        distribution: 0.25
+      - value: "bronze"
+        distribution: 0.5

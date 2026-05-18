@@ -1,8 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use fakeset::{
-    executor::execute, expressions::pull_down_expression_deps, graph::build_dag,
-    load_all_datasets, models::SyntheticDataset,
+    executor::execute, expand_variants::expand_field_variants,
+    expressions::pull_down_expression_deps, graph::build_dag,
+    load_all_datasets, models::{Format, SyntheticDataset},
     plan::{build_plan, ExecutionPlan, ExecutionStep},
     rewrite::{apply_global_locales, resolve_refs}, segment::DEFAULT_MAX_SIBLINGS, validate::validate,
 };
@@ -38,18 +39,29 @@ struct Cli {
     /// Segment enumeration is 2^N, so raising this requires proportionally more RAM.
     #[arg(long, default_value_t = DEFAULT_MAX_SIBLINGS)]
     max_siblings: usize,
+
+    /// Override the output format for every dataset (parquet, csv, json, jsonl).
+    /// Takes precedence over per-dataset `format:` declarations.
+    #[arg(long, value_name = "FORMAT")]
+    output_format: Option<Format>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let datasets = load_all_datasets(&cli.paths)?;
+    let mut datasets = load_all_datasets(&cli.paths)?;
+    if let Some(ref fmt) = cli.output_format {
+        for ds in datasets.values_mut() {
+            ds.format = fmt.clone();
+        }
+    }
     let dag = build_dag(&datasets)?;
     let datasets = pull_down_expression_deps(&datasets)?;
     for warning in validate(&datasets)? {
         eprintln!("{warning}");
     }
+    let datasets = expand_field_variants(datasets)?;
 
     if cli.print_dag {
         println!("=== DAG (before rewrite) ===\n");
@@ -211,13 +223,12 @@ fn print_datasets(
             .rows
             .map(|r| r.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let skip_str = if ds.skip { " skip" } else { "" };
         let locale_str = ds.locale.as_ref()
             .map(|l| format!(", locale: {l}"))
             .unwrap_or_default();
         println!(
-            "{} [{}] (rows: {}{}{})",
-            ds.name, ds.format, rows_str, skip_str, locale_str
+            "{} [{}] (rows: {}{})",
+            ds.name, ds.format, rows_str, locale_str
         );
 
         if let Some(ref of) = ds.output_file {
@@ -263,6 +274,22 @@ fn print_datasets(
 
 fn print_field(field: &fakeset::models::Field, indent: usize) {
     let pad = " ".repeat(indent);
+
+    if matches!(field.field_type, Some(fakeset::models::FieldType::Variant)) {
+        let parquet_tag = field.parquet.as_ref()
+            .map(|p| format!(" [parquet:{:?}]", p.datatype))
+            .unwrap_or_default();
+        println!("{pad}{:<24} type:variant ({} choices){}",
+            field.name, field.variants.len(), parquet_tag);
+        for (i, v) in field.variants.iter().enumerate() {
+            let d = v.distribution.map(|d| format!("{:.0}%", d * 100.0))
+                .unwrap_or_else(|| "free".to_string());
+            let vtype = v.field_type.as_ref().map(|t| format!("{t}")).unwrap_or_else(|| "inferred".to_string());
+            let vval = v.value.as_ref().map(|val| format!("={}", format_yaml_value(val))).unwrap_or_default();
+            println!("{pad}  [{i}] {d} type:{vtype}{vval}");
+        }
+        return;
+    }
 
     if let Some(ref expr) = field.expression {
         let hidden_tag = if field.hidden { " [hidden]" } else { "" };

@@ -2,11 +2,12 @@ use anyhow::Result;
 use petgraph::visit::Topo;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::segment::{plan_segments, Segment, Sibling};
 use crate::graph::DatasetGraph;
-use crate::models::{resolve_include, split_ref, CountSpec, Field, Format, Include, Locale, Schema, SyntheticDataset, VariantSchema};
-use crate::rewrite::stamp_locale;
+use crate::models::{for_each_content_include, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Locale, Schema, SyntheticDataset, VariantSchema};
+use crate::rewrite::apply_locale_to_schema;
 
 const DEFAULT_ROWS: usize = 100;
 
@@ -31,7 +32,7 @@ pub enum ExecutionStep {
     /// in `computed` for `GenerateInnerFlat` to read, and `AssembleRichList` does the emit.
     GenerateDataset {
         path: PathBuf,
-        dataset: SyntheticDataset,
+        dataset: Arc<SyntheticDataset>,
         rows: usize,
         prefills: Vec<PrefillSource>,
         skip_emit: bool,
@@ -42,7 +43,7 @@ pub enum ExecutionStep {
     /// `computed`.
     GenerateSiblingGroup {
         parent_path: PathBuf,
-        parent: SyntheticDataset,
+        parent: Arc<SyntheticDataset>,
         segments: Vec<Segment>,
         siblings: Vec<Sibling>,
         skip_parent_emit: bool,
@@ -70,7 +71,7 @@ pub enum ExecutionStep {
     /// filters hidden columns, and writes output.
     AssembleRichList {
         outer_path: PathBuf,
-        dataset: SyntheticDataset,
+        dataset: Arc<SyntheticDataset>,
         flat_specs: Vec<(String, PathBuf)>,
     },
     /// Flush a shared output file: union + shuffle all accumulated batches, write once.
@@ -89,18 +90,15 @@ pub struct ExecutionPlan {
 // Variant helpers
 // ---------------------------------------------------------------------------
 
-fn variant_key(path: &Path, i: usize) -> PathBuf {
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    path.with_file_name(format!("{stem}___variant_{i}.internal"))
+fn internal_path(base: &Path, label: &str) -> PathBuf {
+    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+    base.with_file_name(format!("{stem}___{label}.internal"))
 }
 
-/// Fill in distributions for variants that have none, sharing the remainder equally.
-fn resolve_variant_distributions(variants: &[VariantSchema]) -> Vec<f64> {
-    let fixed_sum: f64 = variants.iter().filter_map(|v| v.distribution).sum();
-    let n_free = variants.iter().filter(|v| v.distribution.is_none()).count();
-    let free_share = if n_free > 0 { (1.0 - fixed_sum) / n_free as f64 } else { 0.0 };
-    variants.iter().map(|v| v.distribution.unwrap_or(free_share)).collect()
+fn variant_key(path: &Path, i: usize) -> PathBuf {
+    internal_path(path, &format!("variant_{i}"))
 }
+
 
 /// Split `parent_rows` into `dists.len()` integer counts that sum exactly to `parent_rows`.
 /// Uses largest-remainder (Hamilton) rounding.
@@ -117,14 +115,13 @@ fn distribute_rows(parent_rows: usize, dists: &[f64]) -> Vec<usize> {
 }
 
 /// Merge base schema with variant schema: variant fields override same-named base fields.
+/// Object fields are deep-merged (sub-fields are individually overridden rather than
+/// replacing the entire object), matching the semantics of boolean factoring.
 fn merge_variant_fields(base: &Schema, variant_data: &Schema) -> Schema {
+    use crate::expand_variants::merge_delta_into;
     let mut result = base.clone();
     for vfield in variant_data {
-        if let Some(existing) = result.iter_mut().find(|f| f.name == vfield.name) {
-            *existing = vfield.clone();
-        } else {
-            result.push(vfield.clone());
-        }
+        merge_delta_into(&mut result, vfield.clone());
     }
     result
 }
@@ -148,7 +145,7 @@ fn expand_variant_dataset(
     // apply_global_locales; variant fields are new and need the same treatment).
     let mut variant_fields = variant.data.clone();
     if let Some(ref loc) = effective_locale {
-        for f in &mut variant_fields { stamp_locale(f, loc); }
+        apply_locale_to_schema(&mut variant_fields, loc);
     }
 
     SyntheticDataset {
@@ -156,7 +153,6 @@ fn expand_variant_dataset(
         format: base.format.clone(),
         locale: effective_locale,
         rows: Some(rows),
-        skip: base.skip,
         output_file: Some(output_key.to_string()),
         includes: base.includes.clone(),
         data: merge_variant_fields(&base.data, &variant_fields),
@@ -191,7 +187,10 @@ pub fn build_plan(
             continue;
         };
 
-        if sibling_set.contains(path) {
+        // Pure siblings (no own sibling group) are generated inside their parent's step.
+        // Datasets that are *both* a sibling and a parent need their own step so their
+        // children are generated first and the result is available when the outer parent runs.
+        if sibling_set.contains(path) && !sibling_groups.contains_key(path) {
             track_shared(dataset, &mut shared_outputs, &mut seen_shared);
             continue;
         }
@@ -202,7 +201,8 @@ pub fn build_plan(
         // a single stable batch to pull columns from; variants produce N separate batches.
         if !dataset.variants.is_empty() {
             let output_key = dataset.output_file.clone().unwrap_or_else(|| dataset.name.clone());
-            let dists = resolve_variant_distributions(&dataset.variants);
+            let variant_dists: Vec<Option<f64>> = dataset.variants.iter().map(|v| v.distribution).collect();
+            let dists = resolve_distributions(&variant_dists);
             let row_counts_v = distribute_rows(row_counts[path], &dists);
 
             for (i, (variant, &variant_rows)) in dataset.variants.iter().zip(row_counts_v.iter()).enumerate() {
@@ -210,40 +210,45 @@ pub fn build_plan(
                 let concrete = expand_variant_dataset(dataset, variant, i, variant_rows, &output_key);
 
                 if let Some(siblings) = sibling_groups.get(path) {
-                    // Each sibling accumulates rows from N variant groups; ensure it has an
+                    // Each flat sibling accumulates rows from N variant groups; ensure it has an
                     // output_file so WriteSharedOutput fires once for the combined output.
-                    let adjusted_siblings: Vec<Sibling> = siblings.iter().map(|sib| {
+                    // Pool siblings (is_pool=true) have no standalone output — leave them as-is.
+                    let siblings_with_output: Vec<Sibling> = siblings.iter().map(|sib| {
                         let mut s = sib.clone();
-                        if s.dataset.output_file.is_none() {
+                        if s.dataset.output_file.is_none() && !s.is_pool {
                             s.dataset.output_file = Some(sib.dataset.name.clone());
                         }
                         s
                     }).collect();
-                    let segments = plan_segments(variant_rows, &adjusted_siblings, max_siblings)?;
-                    for sib in &adjusted_siblings {
+                    let segments = plan_segments(variant_rows, &siblings_with_output, max_siblings)?;
+                    for sib in &siblings_with_output {
                         track_shared(&sib.dataset, &mut shared_outputs, &mut seen_shared);
                     }
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
-                    let rich = has_rich_list(&concrete);
-                    steps.push(ExecutionStep::GenerateSiblingGroup {
-                        parent_path: virtual_path.clone(),
-                        parent: concrete.clone(),
-                        segments,
-                        siblings: adjusted_siblings,
-                        skip_parent_emit: rich,
+                    let vpath = virtual_path.clone();
+                    let c = Arc::new(concrete.clone());
+                    push_with_rich_list(&mut steps, &concrete, &virtual_path, |rich| {
+                        ExecutionStep::GenerateSiblingGroup {
+                            parent_path: vpath,
+                            parent: c,
+                            segments,
+                            siblings: siblings_with_output,
+                            skip_parent_emit: rich,
+                        }
                     });
-                    if rich { emit_rich_list_steps(&concrete, &virtual_path, &mut steps); }
                 } else {
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
-                    let rich = has_rich_list(&concrete);
-                    steps.push(ExecutionStep::GenerateDataset {
-                        path: virtual_path.clone(),
-                        dataset: concrete.clone(),
-                        rows: variant_rows,
-                        prefills: vec![],
-                        skip_emit: rich,
+                    let vpath = virtual_path.clone();
+                    let c = Arc::new(concrete.clone());
+                    push_with_rich_list(&mut steps, &concrete, &virtual_path, |rich| {
+                        ExecutionStep::GenerateDataset {
+                            path: vpath,
+                            dataset: c,
+                            rows: variant_rows,
+                            prefills: vec![],
+                            skip_emit: rich,
+                        }
                     });
-                    if rich { emit_rich_list_steps(&concrete, &virtual_path, &mut steps); }
                 }
             }
             continue;
@@ -255,32 +260,35 @@ pub fn build_plan(
                 track_shared(&sib.dataset, &mut shared_outputs, &mut seen_shared);
             }
             track_shared(dataset, &mut shared_outputs, &mut seen_shared);
-            let rich = has_rich_list(dataset);
-            steps.push(ExecutionStep::GenerateSiblingGroup {
-                parent_path: path.clone(),
-                parent: dataset.clone(),
-                segments,
-                siblings: siblings.clone(),
-                skip_parent_emit: rich,
+            let p = path.clone();
+            let d = Arc::new(dataset.clone());
+            let sibs = siblings.clone();
+            push_with_rich_list(&mut steps, dataset, path, |rich| {
+                ExecutionStep::GenerateSiblingGroup {
+                    parent_path: p,
+                    parent: d,
+                    segments,
+                    siblings: sibs,
+                    skip_parent_emit: rich,
+                }
             });
-            if rich {
-                emit_rich_list_steps(dataset, path, &mut steps);
-            }
             continue;
         }
 
         track_shared(dataset, &mut shared_outputs, &mut seen_shared);
-        let rich = has_rich_list(dataset);
-        steps.push(ExecutionStep::GenerateDataset {
-            path: path.clone(),
-            dataset: dataset.clone(),
-            rows: row_counts[path],
-            prefills: compute_prefills(path, datasets, &sibling_set),
-            skip_emit: rich,
+        let p = path.clone();
+        let d = Arc::new(dataset.clone());
+        let prefills = compute_prefills(path, datasets, &sibling_set);
+        let rows = row_counts[path];
+        push_with_rich_list(&mut steps, dataset, path, |rich| {
+            ExecutionStep::GenerateDataset {
+                path: p,
+                dataset: d,
+                rows,
+                prefills,
+                skip_emit: rich,
+            }
         });
-        if rich {
-            emit_rich_list_steps(dataset, path, &mut steps);
-        }
     }
 
     for (output_file, format) in shared_outputs {
@@ -290,13 +298,24 @@ pub fn build_plan(
     Ok(ExecutionPlan { steps })
 }
 
-fn has_rich_list(dataset: &SyntheticDataset) -> bool {
-    dataset.data.iter().any(|f| f.content.as_deref().is_some_and(|c| !c.includes.is_empty()))
+fn inner_flat_key(outer_path: &Path, field_name: &str) -> PathBuf {
+    internal_path(outer_path, &format!("{field_name}___flat"))
 }
 
-fn inner_flat_key(outer_path: &Path, field_name: &str) -> PathBuf {
-    let stem = outer_path.file_stem().unwrap_or_default().to_string_lossy();
-    outer_path.with_file_name(format!("{stem}___{field_name}___flat.internal"))
+/// Push a step plus any follow-on rich list steps if `dataset` has rich list fields.
+/// The `skip` flag on the step is set to `true` when rich list steps are needed so that
+/// expression evaluation and emit are deferred to `AssembleRichList`.
+fn push_with_rich_list(
+    steps: &mut Vec<ExecutionStep>,
+    dataset: &SyntheticDataset,
+    path: &Path,
+    make_step: impl FnOnce(bool) -> ExecutionStep,
+) {
+    let rich = dataset.data.iter().any(|f| f.is_rich_list());
+    steps.push(make_step(rich));
+    if rich {
+        emit_rich_list_steps(dataset, path, steps);
+    }
 }
 
 fn emit_rich_list_steps(
@@ -328,7 +347,7 @@ fn emit_rich_list_steps(
     if !flat_specs.is_empty() {
         steps.push(ExecutionStep::AssembleRichList {
             outer_path: path.to_path_buf(),
-            dataset: dataset.clone(),
+            dataset: Arc::new(dataset.clone()),
             flat_specs,
         });
     }
@@ -389,19 +408,64 @@ fn build_sibling_groups(
     datasets: &HashMap<PathBuf, SyntheticDataset>,
 ) -> HashMap<PathBuf, Vec<Sibling>> {
     let mut groups: HashMap<PathBuf, Vec<Sibling>> = HashMap::new();
-    for (sibling_path, dataset) in datasets {
+    for (outer_path, dataset) in datasets {
+        // Flat siblings: datasets that include a parent with a distribution.
         for include in &dataset.includes {
             let Some(d) = include.distribution else { continue };
-            let Some(parent_path) = resolve_include(sibling_path, &include.file) else { continue };
+            let Some(parent_path) = resolve_include(outer_path, &include.file) else { continue };
             groups.entry(parent_path).or_default().push(Sibling {
-                path: sibling_path.clone(),
+                path: outer_path.clone(),
                 dataset: dataset.clone(),
                 distribution: d,
-                include_ref: include.reference.clone(),
+                reference: include.reference.clone(),
+                is_pool: false,
             });
         }
+        // Pool siblings: rich-list fields whose content includes another dataset with a
+        // distribution. The pool represents the subset of the included dataset eligible
+        // for list sampling. Its constraints (from list content ref fields) are applied
+        // to the parent's generation rather than producing standalone rows.
+        collect_pool_siblings(outer_path, dataset, &mut groups);
     }
     groups
+}
+
+/// Scan `dataset`'s fields for list-content includes with a distribution and register a
+/// pool sibling for each. Pool siblings are keyed by the path of the included dataset.
+fn collect_pool_siblings(
+    outer_path: &Path,
+    dataset: &SyntheticDataset,
+    groups: &mut HashMap<PathBuf, Vec<Sibling>>,
+) {
+    for_each_content_include(&dataset.data, &mut |field, inc, item_fields| {
+        let Some(d) = inc.distribution else { return };
+        let Some(inc_path) = resolve_include(outer_path, &inc.file) else { return };
+        // Virtual path uniquely identifies this pool within the outer dataset.
+        let pool_path = pool_sibling_path(outer_path, &field.name);
+        // The pool "dataset" carries only the list-content item fields so that
+        // sibling_field_constraints can extract ref-based constraints from them.
+        let pool_dataset = SyntheticDataset {
+            name: format!("{}__{}_pool", dataset.name, field.name),
+            format: dataset.format.clone(),
+            output_file: None,
+            rows: None,
+            locale: dataset.locale.clone(),
+            includes: vec![],
+            data: item_fields.to_vec(),
+            variants: vec![],
+        };
+        groups.entry(inc_path).or_default().push(Sibling {
+            path: pool_path,
+            dataset: pool_dataset,
+            distribution: d,
+            reference: inc.reference.clone(),
+            is_pool: true,
+        });
+    });
+}
+
+fn pool_sibling_path(outer_path: &Path, field_name: &str) -> PathBuf {
+    internal_path(outer_path, &format!("{field_name}___pool"))
 }
 
 fn plan_row_counts(datasets: &HashMap<PathBuf, SyntheticDataset>) -> HashMap<PathBuf, usize> {
@@ -476,7 +540,6 @@ mod tests {
             name: "test".into(),
             format: Format::Csv,
             rows,
-            skip: false,
             output_file: None,
             locale: None,
             includes: vec![],

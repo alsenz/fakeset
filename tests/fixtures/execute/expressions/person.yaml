@@ -1,5 +1,6 @@
 name: person
 format: csv
+output_file: person
 rows: 5
 data:
   - name: age

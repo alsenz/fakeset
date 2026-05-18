@@ -1,5 +1,7 @@
 name: individuals
 format: parquet
+output_file: individuals
+rows: 1000
 data:
   - name: full_name
     type: string
@@ -7,6 +9,8 @@ data:
   - name: role
     type: string
     generator: profession
+  - name: status
+    type: string
   - name: email
     type: string
     generator: email

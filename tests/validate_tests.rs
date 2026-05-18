@@ -367,3 +367,50 @@ fn test_variant_valid_mixed_distributions_passes() {
     let datasets = load_all_datasets(&paths).expect("should load");
     validate(&datasets).expect("valid variant distribution should pass");
 }
+
+// ---------------------------------------------------------------------------
+// Field-local variant validation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_field_variant_empty_variants_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/field_variant_empty")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("empty variants list should error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("variant") && msg.contains("empty"),
+        "error should mention 'variant' and 'empty': {msg}"
+    );
+}
+
+#[test]
+fn test_field_variant_bad_distribution_sum_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/field_variant_bad_sum")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("distributions > 1.0 should error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("variant") || msg.contains("distribution"),
+        "error should mention 'variant' or 'distribution': {msg}"
+    );
+}
+
+#[test]
+fn test_field_variant_nested_variant_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/field_variant_nested_variant")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("nested type:variant inside a variant choice should error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("variant"),
+        "error should mention 'variant': {msg}"
+    );
+}
+
+#[test]
+fn test_valid_field_variant_passes() {
+    let paths = vec![PathBuf::from("tests/fixtures/execute/field_variants")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    validate(&datasets).expect("valid field variant config should pass validation");
+}

@@ -6,6 +6,8 @@ use crate::constraints::Merge;
 use crate::constraints::FieldConstraints;
 use crate::models::{resolve_include, split_ref, Field, Include, Locale, Range, SyntheticDataset};
 
+const MAX_REF_CHAIN_DEPTH: usize = 32;
+
 /// For every field carrying a `ref`, copy `field_type`, `schema`, and `content`
 /// from the referenced canonical field. The `ref_field` string is preserved so
 /// the executor can use it to wire up pre-filled column data.
@@ -170,7 +172,7 @@ fn resolve_to_base<'a>(
     all: &'a HashMap<PathBuf, SyntheticDataset>,
     depth: usize,
 ) -> Result<&'a Field> {
-    if depth > 32 {
+    if depth > MAX_REF_CHAIN_DEPTH {
         bail!("ref chain exceeds maximum depth — check for a circular reference");
     }
     let Some(ref ref_str) = field.ref_field else {
@@ -275,6 +277,13 @@ pub fn apply_global_locales(datasets: &mut HashMap<PathBuf, SyntheticDataset>) {
         for field in &mut dataset.data {
             stamp_locale(field, &global);
         }
+    }
+}
+
+/// Apply a locale to all fields in a schema slice (same rules as `apply_global_locales`).
+pub fn apply_locale_to_schema(fields: &mut [Field], locale: &Locale) {
+    for field in fields {
+        stamp_locale(field, locale);
     }
 }
 

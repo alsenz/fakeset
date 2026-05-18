@@ -1,5 +1,6 @@
 use fakeset::{
-    expressions::pull_down_expression_deps, graph::build_dag, load_all_datasets,
+    expand_variants::expand_field_variants, expressions::pull_down_expression_deps,
+    graph::build_dag, load_all_datasets,
     plan::{build_plan, ExecutionStep},
     rewrite::resolve_refs, validate::validate,
 };
@@ -19,6 +20,7 @@ fn plan_for(fixture: &str) -> Vec<ExecutionStep> {
     let dag = build_dag(&datasets).expect("dag");
     let datasets = pull_down_expression_deps(&datasets).expect("pull_down");
     validate(&datasets).expect("validate");
+    let datasets = expand_field_variants(datasets).expect("expand field variants");
     let resolved = resolve_refs(&datasets).expect("resolve");
     build_plan(&dag, &resolved, 16).expect("plan").steps
 }
@@ -28,12 +30,16 @@ fn plan_for(fixture: &str) -> Vec<ExecutionStep> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn flat_dataset_produces_single_generate_step() {
+fn flat_dataset_produces_generate_then_write_steps() {
     let steps = plan_for("tests/fixtures/execute/flat");
-    assert_eq!(steps.len(), 1);
+    assert_eq!(steps.len(), 2, "expected GenerateDataset + WriteSharedOutput");
     assert!(
         matches!(&steps[0], ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "person"),
         "expected GenerateDataset for person"
+    );
+    assert!(
+        matches!(&steps[1], ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "person"),
+        "expected WriteSharedOutput for person"
     );
 }
 
@@ -157,18 +163,21 @@ fn hidden_ref_field_wired_as_prefill() {
 #[test]
 fn rich_list_dataset_decomposes_into_inner_flat_and_assemble() {
     // events has a rich list field (attendees), people does not.
-    // Expected steps: GenerateDataset(people, skip_emit=false),
+    // Because events includes people with a distribution (pool sibling), people gets
+    // a GenerateSiblingGroup step (pool-rows-first ordering for GenerateInnerFlat).
+    // Expected steps: GenerateSiblingGroup(people, skip_parent_emit=false),
     //                 GenerateDataset(events, skip_emit=true),
     //                 GenerateInnerFlat(attendees),
     //                 AssembleRichList(events)
     let steps = plan_for("tests/fixtures/execute/rich_list");
 
-    // people: no rich list → skip_emit must be false
-    let people_step = find_step!(steps, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "people");
-    assert!(
-        matches!(people_step, Some(ExecutionStep::GenerateDataset { skip_emit: false, .. })),
-        "people has no rich list, skip_emit must be false"
-    );
+    // people: no rich list → must not be skip-emitted (GenerateDataset or GenerateSiblingGroup)
+    let people_not_skipped = steps.iter().any(|s| match s {
+        ExecutionStep::GenerateDataset { dataset, skip_emit: false, .. } => dataset.name == "people",
+        ExecutionStep::GenerateSiblingGroup { parent, skip_parent_emit: false, .. } => parent.name == "people",
+        _ => false,
+    });
+    assert!(people_not_skipped, "people has no rich list, must have a non-skipped generation step");
 
     // events: has rich list → skip_emit must be true
     let events_step = find_step!(steps, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "events");
@@ -317,4 +326,27 @@ fn variant_sibling_produces_sibling_groups_and_shared_outputs() {
 
     let write_count = steps.iter().filter(|s| matches!(s, ExecutionStep::WriteSharedOutput { .. })).count();
     assert_eq!(write_count, 2, "expected WriteSharedOutput for source and for subset");
+}
+
+#[test]
+fn field_variant_expands_to_correct_generate_steps() {
+    // orders.yaml: 120 rows, status(50/50) × tier(25/25/50) = 6 combinations.
+    // Expect 6 GenerateDataset steps + 1 WriteSharedOutput.
+    let steps = plan_for("tests/fixtures/execute/field_variants");
+
+    let variant_steps: Vec<_> = steps.iter().filter(|s| {
+        matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name.starts_with("orders__v"))
+    }).collect();
+    assert_eq!(variant_steps.len(), 6, "expected 6 variant GenerateDataset steps, got {}", variant_steps.len());
+
+    let write_steps: Vec<_> = steps.iter().filter(|s| {
+        matches!(s, ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "orders")
+    }).collect();
+    assert_eq!(write_steps.len(), 1, "expected exactly one WriteSharedOutput for 'orders'");
+
+    let total_rows: usize = steps.iter().filter_map(|s| match s {
+        ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name.starts_with("orders__v") => Some(rows),
+        _ => None,
+    }).sum();
+    assert_eq!(total_rows, 120, "variant row counts must sum to 120");
 }

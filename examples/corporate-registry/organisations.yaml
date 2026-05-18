@@ -1,5 +1,6 @@
 name: organisations
 format: parquet
+output_file: organisations
 rows: 100
 data:
   - name: org_id
@@ -29,8 +30,8 @@ data:
           type: string
           value: "director"
         - name: status
-          type: string
           value: "active"
+          ref: individual.status
         - name: name
           ref: individual.full_name
         - name: employer

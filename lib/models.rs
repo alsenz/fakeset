@@ -35,6 +35,19 @@ impl std::fmt::Display for Format {
     }
 }
 
+impl std::str::FromStr for Format {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "parquet" => Ok(Format::Parquet),
+            "csv"     => Ok(Format::Csv),
+            "json"    => Ok(Format::Json),
+            "jsonl"   => Ok(Format::Jsonl),
+            _ => Err(format!("unknown format '{s}'; expected one of: parquet, csv, json, jsonl")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldType {
@@ -45,20 +58,80 @@ pub enum FieldType {
     List,
     Date,
     DateTime,
+    /// A field whose value is drawn from one of several alternatives.
+    /// Expanded into global dataset variants by `expand_field_variants`
+    /// before execution; never reaches the generator.
+    Variant,
 }
 
 impl std::fmt::Display for FieldType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FieldType::Number => write!(f, "number"),
-            FieldType::Boolean => write!(f, "boolean"),
-            FieldType::String => write!(f, "string"),
-            FieldType::Object => write!(f, "object"),
-            FieldType::List => write!(f, "list"),
-            FieldType::Date => write!(f, "date"),
+            FieldType::Number   => write!(f, "number"),
+            FieldType::Boolean  => write!(f, "boolean"),
+            FieldType::String   => write!(f, "string"),
+            FieldType::Object   => write!(f, "object"),
+            FieldType::List     => write!(f, "list"),
+            FieldType::Date     => write!(f, "date"),
             FieldType::DateTime => write!(f, "date_time"),
+            FieldType::Variant  => write!(f, "variant"),
         }
     }
+}
+
+/// Arrow/Parquet datatype override for a field.
+/// When set, controls the Arrow schema type used for that field instead of the
+/// type inferred from `field_type`.  Applies during both schema construction and
+/// column generation (the generated values are cast to the target type).
+///
+/// Valid on any field, not just variants.  Useful for coercing `number` fields
+/// to specific integer or float widths, or for forcing a consistent type across
+/// variant choices that would otherwise produce mixed types.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ParquetConfig {
+    pub datatype: ParquetDatatype,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub enum ParquetDatatype {
+    #[serde(rename = "int8")]         Int8,
+    #[serde(rename = "int16")]        Int16,
+    #[serde(rename = "int32")]        Int32,
+    #[serde(rename = "int64")]        Int64,
+    #[serde(rename = "uint8")]        UInt8,
+    #[serde(rename = "uint16")]       UInt16,
+    #[serde(rename = "uint32")]       UInt32,
+    #[serde(rename = "uint64")]       UInt64,
+    #[serde(rename = "float32")]      Float32,
+    #[serde(rename = "float64")]      Float64,
+    #[serde(rename = "utf8")]         Utf8,
+    #[serde(rename = "boolean")]      Boolean,
+    #[serde(rename = "date32")]       Date32,
+    #[serde(rename = "timestamp_ms")] TimestampMs,
+    #[serde(rename = "timestamp_us")] TimestampUs,
+}
+
+/// One concrete alternative within a `type: variant` field.
+///
+/// Carries the field properties for this choice (type, generator, value, range,
+/// locale, parquet) plus an optional distribution weight.  Name is inherited from
+/// the parent field.  Nested `variants` and structural properties (`fields`,
+/// `content`, `expression`, `ref`) are not permitted inside a variant choice.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FieldVariant {
+    #[serde(rename = "type")]
+    pub field_type: Option<FieldType>,
+    pub generator: Option<Generator>,
+    pub locale: Option<Locale>,
+    pub range: Option<Range>,
+    pub value: Option<serde_yaml::Value>,
+    /// Parquet type override for this specific choice.  If absent, the outer
+    /// field's `parquet` annotation is used as a fallback.
+    pub parquet: Option<ParquetConfig>,
+    /// Fraction of this variant field's population allocated to this choice.
+    /// Free slots (None) share the remainder equally.  Must sum to ≤ 1.0;
+    /// if all are set they must sum to exactly 1.0.
+    pub distribution: Option<f64>,
 }
 
 /// Selects a specific fake-rs faker to drive value generation.
@@ -273,6 +346,14 @@ pub struct Field {
     pub fields: Vec<Field>,
     /// Element spec for list fields.
     pub content: Option<Box<ListContent>>,
+    /// For `type: variant` fields: the list of alternative field definitions.
+    /// Expanded into global dataset variants by `expand_field_variants` before execution.
+    /// Must be empty on all other field types.
+    #[serde(default)]
+    pub variants: Vec<FieldVariant>,
+    /// Parquet/Arrow datatype override.  When set, the field's Arrow schema uses
+    /// this type and generated values are cast to it.  Valid on any field type.
+    pub parquet: Option<ParquetConfig>,
     /// SQL expression evaluated against the batch after all other fields are generated.
     /// Variables must refer to fields defined above this one in the YAML (evaluation order).
     /// Mutually exclusive with `type`, `ref`, `generator`, `min`, `max`, and `value`.
@@ -284,6 +365,42 @@ pub struct Field {
     pub hidden: bool,
     /// Number of items per row for `list` type fields. Ignored on all other field types.
     pub count: Option<CountSpec>,
+    /// Decimal precision for `number` fields. Positive = decimal places; negative = round by
+    /// powers of 10 (e.g. -2 rounds to the nearest 100). Applied after generation.
+    /// Ignored on non-number fields.
+    pub precision: Option<i32>,
+}
+
+impl Field {
+    pub fn is_rich_list(&self) -> bool {
+        self.content.as_deref().is_some_and(|c| !c.includes.is_empty())
+    }
+}
+
+/// Fill in free-slot distributions: `None` entries share the remainder after fixed entries equally.
+pub fn resolve_distributions(dists: &[Option<f64>]) -> Vec<f64> {
+    let fixed_sum: f64 = dists.iter().filter_map(|d| *d).sum();
+    let n_free = dists.iter().filter(|d| d.is_none()).count();
+    let free_share = if n_free > 0 { (1.0 - fixed_sum) / n_free as f64 } else { 0.0 };
+    dists.iter().map(|d| d.unwrap_or(free_share)).collect()
+}
+
+/// Call `visitor(field, include, item_fields)` for every `content: {includes: [...]}` entry
+/// found by recursing through `fields`, then recursing into content item fields and object
+/// sub-fields.
+pub fn for_each_content_include<'a>(
+    fields: &'a [Field],
+    visitor: &mut impl FnMut(&'a Field, &'a Include, &'a [Field]),
+) {
+    for field in fields {
+        if let Some(content) = &field.content {
+            for inc in &content.includes {
+                visitor(field, inc, &content.item.fields);
+            }
+            for_each_content_include(&content.item.fields, visitor);
+        }
+        for_each_content_include(&field.fields, visitor);
+    }
 }
 
 /// Split a ref-field string of the form `"include_ref.field_name"` into its
@@ -364,9 +481,6 @@ pub struct SyntheticDataset {
     /// Explicit row count. Must not be set when any include specifies a
     /// `distribution` — in that case rows are derived from the parent size.
     pub rows: Option<usize>,
-    /// When true, this dataset is intermediate and its output is not written.
-    #[serde(default)]
-    pub skip: bool,
     /// Write output appended into this named file rather than a per-dataset
     /// file, allowing multiple combinatorial factor datasets to be unioned
     /// and randomly shuffled into one output.

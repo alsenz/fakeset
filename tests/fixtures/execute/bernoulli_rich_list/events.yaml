@@ -1,5 +1,6 @@
 name: events
 format: jsonl
+output_file: events
 rows: 10
 data:
   - name: title

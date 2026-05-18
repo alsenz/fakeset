@@ -2,8 +2,9 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::constraints::validate_field_constraints;
 use crate::expressions::extract_identifiers;
-use crate::models::{resolve_include, split_ref, Field, FieldType, Include, Schema, SyntheticDataset};
+use crate::models::{resolve_include, split_ref, Field, FieldType, FieldVariant, Include, Schema, SyntheticDataset};
 
 /// Validate all loaded datasets, returning any non-fatal warnings.
 /// Hard errors (e.g. `rows` set alongside `distribution`) are returned as `Err`.
@@ -139,32 +140,10 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         }
     }
 
-    // Constraint internal-consistency checks — apply regardless of whether `ref` is set,
-    // since they don't require knowing the resolved type.
+    // Constraint internal-consistency checks — apply regardless of whether `ref` is set.
+    validate_field_constraints(path, field)?;
     let range_min = field.range.as_ref().and_then(|r| r.min);
     let range_max = field.range.as_ref().and_then(|r| r.max);
-
-    if field.value.is_some() {
-        if field.generator.is_some() {
-            bail!(
-                "field '{path}': `value` and `generator` cannot both be set \
-                 — `value` emits a constant, making the generator redundant"
-            );
-        }
-        if range_min.is_some() || range_max.is_some() {
-            bail!(
-                "field '{path}': `value` and `range` cannot both be set \
-                 — `value` emits a constant, making bounds meaningless"
-            );
-        }
-    }
-    if let (Some(lo), Some(hi)) = (range_min, range_max) {
-        if lo > hi {
-            bail!(
-                "field '{path}': `range.min` ({lo}) must be less than or equal to `range.max` ({hi})"
-            );
-        }
-    }
 
     if field.locale.is_some() {
         match &field.generator {
@@ -187,6 +166,36 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         Some(t) => t,
         None => bail!("field '{path}': must have `type`, `ref`, or `expression`"),
     };
+
+    // Variant field: validate its choices and distribution, then stop.
+    if *field_type == FieldType::Variant {
+        if field.variants.is_empty() {
+            bail!("field '{path}': `type: variant` requires a non-empty `variants` list");
+        }
+        for (i, choice) in field.variants.iter().enumerate() {
+            validate_field_variant(&format!("{path}.variants[{i}]"), choice, warnings)?;
+        }
+        let fixed_sum: f64 = field.variants.iter().filter_map(|v| v.distribution).sum();
+        let n_free = field.variants.iter().filter(|v| v.distribution.is_none()).count();
+        if fixed_sum > 1.0 + 1e-9 {
+            bail!(
+                "field '{path}': variant distributions sum to {:.4} which exceeds 1.0",
+                fixed_sum
+            );
+        }
+        if n_free == 0 && (fixed_sum - 1.0).abs() > 1e-9 {
+            bail!(
+                "field '{path}': all variant distributions are explicit but sum to {:.4}, not 1.0",
+                fixed_sum
+            );
+        }
+        if field.variants.len() == 1 {
+            warnings.push(format!(
+                "warning: field '{path}' has only one variant choice — this is equivalent to a plain field"
+            ));
+        }
+        return Ok(());
+    }
 
     if !field.fields.is_empty() && *field_type != FieldType::Object {
         bail!(
@@ -331,21 +340,7 @@ fn validate_rich_content(
         }
 
         // Basic constraint checks.
-        let range_min = field.range.as_ref().and_then(|r| r.min);
-        let range_max = field.range.as_ref().and_then(|r| r.max);
-        if field.value.is_some() {
-            if field.generator.is_some() {
-                bail!("field '{fpath}': `value` and `generator` cannot both be set");
-            }
-            if range_min.is_some() || range_max.is_some() {
-                bail!("field '{fpath}': `value` and `range` cannot both be set");
-            }
-        }
-        if let (Some(lo), Some(hi)) = (range_min, range_max) {
-            if lo > hi {
-                bail!("field '{fpath}': `range.min` ({lo}) must be ≤ `range.max` ({hi})");
-            }
-        }
+        validate_field_constraints(&fpath, field)?;
         if field.locale.is_some() {
             match &field.generator {
                 None => bail!("field '{fpath}': `locale` requires `generator` to be set"),
@@ -361,6 +356,61 @@ fn validate_rich_content(
             }
         }
     }
+    Ok(())
+}
+
+fn validate_field_variant(path: &str, choice: &FieldVariant, warnings: &mut Vec<String>) -> Result<()> {
+    if let Some(ft) = &choice.field_type {
+        if *ft == FieldType::Variant {
+            bail!("field variant '{path}': nested `type: variant` is not supported");
+        }
+    }
+
+    if choice.value.is_some() {
+        if choice.generator.is_some() {
+            bail!("field variant '{path}': `value` and `generator` cannot both be set");
+        }
+        let has_range = choice.range.as_ref().map_or(false, |r| r.min.is_some() || r.max.is_some());
+        if has_range {
+            bail!("field variant '{path}': `value` and `range` cannot both be set");
+        }
+    }
+
+    if let Some(r) = &choice.range {
+        if let (Some(lo), Some(hi)) = (r.min, r.max) {
+            if lo > hi {
+                bail!("field variant '{path}': range.min ({lo}) must be ≤ range.max ({hi})");
+            }
+        }
+    }
+
+    if choice.locale.is_some() {
+        match &choice.generator {
+            None => bail!("field variant '{path}': `locale` requires `generator` to be set"),
+            Some(g) if !g.supports_locale() => bail!(
+                "field variant '{path}': generator `{g}` does not support locale selection"
+            ),
+            Some(_) => {}
+        }
+    }
+
+    if let (Some(g), Some(ft)) = (&choice.generator, &choice.field_type) {
+        if !g.valid_for(ft) {
+            bail!("field variant '{path}': generator `{g}` is not valid for type `{ft}`");
+        }
+    }
+
+    // Must be able to determine the concrete type at expansion time.
+    let can_infer_type = choice.field_type.is_some()
+        || choice.range.as_ref().map_or(false, |r| r.min.is_some() || r.max.is_some())
+        || choice.value.as_ref().map_or(false, |v| v.is_string() || v.is_number() || v.is_bool());
+    if !can_infer_type {
+        bail!(
+            "field variant '{path}': cannot determine type — set `type`, `value`, or `range`"
+        );
+    }
+
+    let _ = warnings; // reserved for future use
     Ok(())
 }
 

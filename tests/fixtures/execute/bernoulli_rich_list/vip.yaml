@@ -1,5 +1,6 @@
 name: vip
 format: jsonl
+output_file: vip
 includes:
   - file: events.yaml
     ref: events

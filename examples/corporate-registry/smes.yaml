@@ -1,5 +1,6 @@
 name: smes
 format: parquet
+output_file: smes
 includes:
   - file: organisations.yaml
     ref: organisations
@@ -14,6 +15,8 @@ data:
     ref: organisations.org_id
   - name: employee_count
     type: number
+    precision: 0
   - name: annual_revenue
     type: number
+    precision: 0
     generator: positive_decimal

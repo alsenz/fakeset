@@ -1,5 +1,6 @@
 name: grants
 format: parquet
+output_file: grants
 includes:
   - file: micro.yaml
     ref: micro_enterprises

@@ -1,5 +1,6 @@
 name: small_enterprises
 format: parquet
+output_file: small_enterprises
 includes:
   - file: smes.yaml
     ref: smes
@@ -12,11 +13,13 @@ data:
     value: "small"
   - name: employee_count
     type: number
+    precision: 0
     range:
       min: 10
       max: 49
   - name: annual_revenue
     type: number
+    precision: 0
     range:
       min: 2000000
       max: 10000000

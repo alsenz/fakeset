@@ -4,7 +4,6 @@ use arrow::buffer::OffsetBuffer;
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use fake::Fake;
 use parquet::arrow::ArrowWriter;
@@ -14,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::constraints::FieldConstraints;
-use crate::generator::{field_to_arrow, generate_column, is_rich_list, sample_count, schema_to_arrow};
+use crate::generator::{generate_column, sample_count};
+use crate::schema::{field_to_arrow, schema_to_arrow};
 use crate::models::{split_ref, CountSpec, Field, Format, Include, Range, Schema, SyntheticDataset};
 use crate::plan::{ExecutionPlan, ExecutionStep, PrefillSource};
 use crate::segment::{Segment, Sibling};
@@ -27,32 +27,34 @@ use crate::segment::{Segment, Sibling};
 pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
-    let ctx = SessionContext::new();
     let mut computed: HashMap<PathBuf, RecordBatch> = HashMap::new();
+    // Tracks datasets that were generated *as a parent* in their own GenerateSiblingGroup step.
+    // Only these are eligible for reuse when they appear as a sibling in a later step.
+    // Datasets generated *as siblings* are not reusable across separate variant groups.
+    let mut parent_computed: HashSet<PathBuf> = HashSet::new();
     let mut shared: HashMap<String, (Format, Vec<RecordBatch>)> = HashMap::new();
 
     for step in &plan.steps {
         match step {
             ExecutionStep::GenerateDataset { path, dataset, rows, prefills, skip_emit } => {
                 let prefill_map = resolve_prefills(prefills, &computed);
-                let batch = generate_batch(&dataset.data, *rows, &prefill_map, &HashMap::new())?;
+                let batch = generate_prefilled_batch(&dataset.data, *rows, &prefill_map)?;
                 if *skip_emit {
                     // Scalar-only intermediate; AssembleRichList adds list columns and emits.
                     computed.insert(path.clone(), batch);
                 } else {
-                    let batch = evaluate_expressions(batch, dataset, &ctx).await?;
-                    let output = filter_hidden_columns(batch.clone(), &dataset.data)?;
+                    let batch = evaluate_expressions(batch, dataset.as_ref()).await?;
+                    let output = filter_hidden_columns(batch.clone(), &dataset.data).await?;
                     computed.insert(path.clone(), batch);
-                    emit_batch(output, &dataset.name, &dataset.format, dataset.skip,
-                        &dataset.output_file, &mut shared, output_dir)?;
+                    emit_batch(output, &dataset.format, &dataset.output_file, &mut shared)?;
                 }
             }
             ExecutionStep::GenerateSiblingGroup {
                 parent_path, parent, segments, siblings, skip_parent_emit,
             } => {
                 execute_sibling_group(
-                    parent_path, parent, segments, siblings, *skip_parent_emit,
-                    &ctx, &mut computed, &mut shared, output_dir,
+                    parent_path, parent.as_ref(), segments, siblings, *skip_parent_emit,
+                    &mut computed, &mut parent_computed, &mut shared,
                 ).await?;
             }
             ExecutionStep::GenerateInnerFlat {
@@ -69,14 +71,15 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
             }
             ExecutionStep::AssembleRichList { outer_path, dataset, flat_specs } => {
                 execute_assemble_rich_list(
-                    outer_path, dataset, flat_specs,
-                    &ctx, &mut computed, &mut shared, output_dir,
+                    outer_path, dataset.as_ref(), flat_specs,
+                    &mut computed, &mut shared,
                 ).await?;
             }
             ExecutionStep::WriteSharedOutput { output_file, format } => {
                 let Some((_, batches)) = shared.get(output_file) else { continue };
-                if !batches.is_empty() {
-                    let combined = union_and_shuffle(batches.clone(), output_file, &ctx).await?;
+                let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                if total_rows > 0 {
+                    let combined = union_and_shuffle(batches.clone(), output_file).await?;
                     write_output(&combined, output_file, format, output_dir)?;
                 }
             }
@@ -115,88 +118,233 @@ async fn execute_sibling_group(
     segments: &[Segment],
     siblings: &[Sibling],
     skip_parent_emit: bool,
-    ctx: &SessionContext,
     computed: &mut HashMap<PathBuf, RecordBatch>,
+    parent_computed: &mut HashSet<PathBuf>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
-    output_dir: &Path,
 ) -> Result<()> {
-    let mut parent_batches: Vec<RecordBatch> = Vec::new();
+    let pool_sibling_paths: HashSet<PathBuf> = siblings.iter()
+        .filter(|s| s.is_pool)
+        .map(|s| s.path.clone())
+        .collect();
+    let has_pool_siblings = !pool_sibling_paths.is_empty();
+
+    // pool_parent_batches: rows from segments that contain at least one pool sibling.
+    // These are placed before the shuffled non-pool rows so that GenerateInnerFlat's
+    // distribution-based pool_size index correctly selects pool members.
+    let mut pool_parent_batches: Vec<RecordBatch> = Vec::new();
+    let mut nonpool_parent_batches: Vec<RecordBatch> = Vec::new();
     let mut sibling_buffers: HashMap<PathBuf, Vec<RecordBatch>> = HashMap::new();
 
     for seg in segments {
         if seg.rows == 0 {
             continue;
         }
-        let parent_seg =
-            generate_batch(&dataset.data, seg.rows, &HashMap::new(), &seg.field_constraints)?;
-        parent_batches.push(parent_seg.clone());
 
-        for sib_path in &seg.siblings {
-            let sib = siblings.iter().find(|s| s.path == *sib_path).unwrap();
-            sibling_buffers
-                .entry(sib_path.clone())
-                .or_default()
-                .push(generate_sibling_batch(sib, &parent_seg)?);
+        let seg_has_pool = seg.siblings.iter().any(|sp| pool_sibling_paths.contains(sp));
+
+        if seg.siblings.is_empty() {
+            // Parent-only segment: no child rows to inherit — generate fresh.
+            let parent_seg = generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?;
+            nonpool_parent_batches.push(parent_seg);
+        } else {
+            // Pool siblings contribute constraints to the segment but produce no standalone
+            // batches. Separate them from real (flat) siblings before generating children.
+            let real_sib_paths: Vec<&PathBuf> = seg.siblings.iter()
+                .filter(|sp| !pool_sibling_paths.contains(*sp))
+                .collect();
+
+            // Children are preceding: generate each real sibling first, then grow the
+            // parent outward from those already-solved rows (UNION ALL semantics).
+            //
+            // If a sibling was itself a parent with its own sibling group, it is already
+            // in `computed` — use that batch directly rather than regenerating it, and
+            // suppress re-emission below.
+            let mut child_batches: Vec<(&Sibling, RecordBatch)> = Vec::new();
+            for sib_path in &real_sib_paths {
+                let sib = siblings.iter().find(|s| &s.path == *sib_path).unwrap();
+                if parent_computed.contains(&sib.path) {
+                    // Generated as a parent in its own prior step — reuse that batch.
+                    let precomputed = computed[&sib.path].clone();
+                    child_batches.push((sib, precomputed));
+                } else {
+                    // Apply segment constraints to the sibling so that co-varying fields
+                    // (e.g. status) receive the same constrained value as the parent.
+                    let child_batch = generate_fresh_batch(
+                        &sib.dataset.data, seg.rows, &seg.field_constraints,
+                    )?;
+                    sibling_buffers.entry(sib.path.clone()).or_default().push(child_batch.clone());
+                    child_batches.push((sib, child_batch));
+                }
+            }
+
+            let parent_seg = if child_batches.is_empty() {
+                // Pool-only segment: all siblings are pool siblings; no real children.
+                generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?
+            } else {
+                grow_parent_from_children(
+                    &dataset.data, &child_batches, &seg.field_constraints,
+                ).await?
+            };
+
+            if seg_has_pool {
+                pool_parent_batches.push(parent_seg);
+            } else {
+                nonpool_parent_batches.push(parent_seg);
+            }
         }
     }
 
-    let parent_shuffled =
-        combine_and_shuffle(parent_batches, &dataset.data, &dataset.name, ctx).await?;
+    // Pool-rows-first: pool members occupy the leading positions in the combined parent
+    // batch so that GenerateInnerFlat's distribution-based pool_size index selects them.
+    let parent_shuffled = if has_pool_siblings && !pool_parent_batches.is_empty() {
+        combine_pool_first(pool_parent_batches, nonpool_parent_batches, &dataset.data, &dataset.name).await?
+    } else {
+        let mut all = pool_parent_batches;
+        all.extend(nonpool_parent_batches);
+        combine_and_shuffle(all, &dataset.data, &dataset.name).await?
+    };
+
     if skip_parent_emit {
         // Scalar-only intermediate; AssembleRichList adds list columns, evaluates
         // expressions, and emits.
         computed.insert(path.to_path_buf(), parent_shuffled);
     } else {
-        let parent_shuffled = evaluate_expressions(parent_shuffled, dataset, ctx).await?;
-        let parent_output = filter_hidden_columns(parent_shuffled.clone(), &dataset.data)?;
+        let parent_shuffled = evaluate_expressions(parent_shuffled, dataset).await?;
+        let parent_output = filter_hidden_columns(parent_shuffled.clone(), &dataset.data).await?;
         computed.insert(path.to_path_buf(), parent_shuffled);
-        emit_batch(parent_output, &dataset.name, &dataset.format, dataset.skip,
-            &dataset.output_file, shared, output_dir)?;
+        emit_batch(parent_output, &dataset.format, &dataset.output_file, shared)?;
     }
+    parent_computed.insert(path.to_path_buf());
 
     for sib in siblings {
+        // Pool siblings have no standalone output — skip entirely.
+        if sib.is_pool {
+            continue;
+        }
+        // Siblings that were themselves parents in a prior step are already emitted; skip.
+        if parent_computed.contains(&sib.path) {
+            continue;
+        }
         let sib_shuffled = combine_and_shuffle(
             sibling_buffers.remove(&sib.path).unwrap_or_default(),
             &sib.dataset.data,
             &sib.dataset.name,
-            ctx,
         ).await?;
-        let sib_shuffled = evaluate_expressions(sib_shuffled, &sib.dataset, ctx).await?;
-        let sib_output = filter_hidden_columns(sib_shuffled.clone(), &sib.dataset.data)?;
+        let sib_shuffled = evaluate_expressions(sib_shuffled, &sib.dataset).await?;
+        let sib_output = filter_hidden_columns(sib_shuffled.clone(), &sib.dataset.data).await?;
         computed.insert(sib.path.clone(), sib_shuffled);
-        emit_batch(sib_output, &sib.dataset.name, &sib.dataset.format, sib.dataset.skip,
-            &sib.dataset.output_file, shared, output_dir)?;
+        emit_batch(sib_output, &sib.dataset.format, &sib.dataset.output_file, shared)?;
     }
 
     Ok(())
 }
 
-/// Generate a sibling's batch for one segment.
-/// Fields that ref back to the parent are projected from `parent_seg`;
-/// all other fields are generated fresh.
-fn generate_sibling_batch(sibling: &Sibling, parent_seg: &RecordBatch) -> Result<RecordBatch> {
-    let prefix = format!("{}.", sibling.include_ref);
-    let arrow_schema = Arc::new(schema_to_arrow(&sibling.dataset.data));
-    let n = parent_seg.num_rows();
+/// Grow the parent batch for one segment from the already-generated child rows.
+///
+/// Expressed as a DataFusion JOIN: a skeleton batch (fresh-generated rule-3 columns +
+/// `_row_idx`) is LEFT-JOINed with each child batch (also prepended with `_row_idx`).
+/// The SELECT clause names exactly which source each parent field comes from.
+///
+/// Per parent field, first match across children wins:
+/// 1. Child has `ref: <include_ref>.<parent_field>` → child column aliased to parent name.
+/// 2. Child has a field of the same name as the parent field (no cross-schema ref) →
+///    child column taken directly.
+/// 3. Neither → generated fresh into the skeleton and pulled from there.
+async fn grow_parent_from_children(
+    parent_schema: &Schema,
+    child_batches: &[(&Sibling, RecordBatch)],
+    field_constraints: &HashMap<String, FieldConstraints>,
+) -> Result<RecordBatch> {
+    let n = child_batches.first()
+        .expect("grow_parent_from_children requires non-empty child_batches")
+        .1.num_rows();
 
-    let columns = sibling
-        .dataset
-        .data
-        .iter()
-        .filter(|field| field.expression.is_none() && !is_rich_list(field))
-        .map(|field| {
-            if let Some(ref ref_str) = field.ref_field {
-                if let Some(parent_field) = ref_str.strip_prefix(&prefix) {
-                    if let Ok(col_idx) = parent_seg.schema().index_of(parent_field) {
-                        return Ok(parent_seg.column(col_idx).clone());
-                    }
+    // Map parent field name → (child alias "c0"/"c1"/…, child column name).
+    // or_insert preserves first-child-wins semantics.
+    let mut sources: HashMap<String, (String, String)> = HashMap::new();
+    for (ci, (sib, child_batch)) in child_batches.iter().enumerate() {
+        let alias = format!("c{ci}");
+        let prefix = format!("{}.", sib.reference);
+        for child_field in &sib.dataset.data {
+            if child_batch.schema().index_of(&child_field.name).is_err() { continue; }
+            // Rule 1: cross-schema ref — child's ref points back to a parent field by name.
+            if let Some(ref_str) = &child_field.ref_field {
+                if let Some(parent_col) = ref_str.strip_prefix(&prefix) {
+                    sources.entry(parent_col.to_string())
+                        .or_insert_with(|| (alias.clone(), child_field.name.clone()));
+                    continue;
                 }
             }
-            generate_column(field, n, &[])
-        })
-        .collect::<Result<Vec<_>>>()?;
+            // Rule 2: same-name field, not a cross-ref pointing elsewhere.
+            let is_cross_ref = child_field.ref_field.as_ref()
+                .map_or(false, |r| r.starts_with(&prefix));
+            if !is_cross_ref && parent_schema.iter().any(|pf| pf.name == child_field.name) {
+                sources.entry(child_field.name.clone())
+                    .or_insert_with(|| (alias.clone(), child_field.name.clone()));
+            }
+        }
+    }
 
-    Ok(RecordBatch::try_new(arrow_schema, columns)?)
+    // Active parent fields (skip expressions and rich-list placeholders).
+    let active: Vec<&Field> = parent_schema.iter()
+        .filter(|f| f.expression.is_none() && !f.is_rich_list())
+        .collect();
+
+    // Build skeleton batch: _row_idx column + all rule-3 (fresh) columns.
+    let idx: ArrayRef = Arc::new(UInt32Array::from_iter_values(0..n as u32));
+    let mut skel_fields = vec![ArrowField::new("_row_idx", DataType::UInt32, false)];
+    let mut skel_cols: Vec<ArrayRef> = vec![idx];
+    for f in &active {
+        if sources.contains_key(f.name.as_str()) { continue; }
+        let effective = field_constraints.get(f.name.as_str()).map(|fc| apply_constraints(f, fc));
+        skel_cols.push(generate_column(effective.as_ref().unwrap_or(f), n, &[])?);
+        skel_fields.push(field_to_arrow(f));
+    }
+    let skel = RecordBatch::try_new(Arc::new(ArrowSchema::new(skel_fields)), skel_cols)?;
+
+    // Register all batches in a fresh context.
+    let ctx = SessionContext::new();
+    ctx.register_batch("skel", skel)?;
+    for (ci, (_, child_batch)) in child_batches.iter().enumerate() {
+        ctx.register_batch(&format!("c{ci}"), prepend_row_index(child_batch)?)?;
+    }
+
+    // SELECT clause: one expression per active parent field.
+    let select: String = active.iter().map(|f| {
+        if let Some((alias, child_col)) = sources.get(f.name.as_str()) {
+            format!(r#"{alias}."{child_col}" AS "{}""#, f.name)
+        } else {
+            format!(r#"skel."{0}" AS "{0}""#, f.name)
+        }
+    }).collect::<Vec<_>>().join(", ");
+
+    // LEFT JOIN chain on row index gives positional correspondence.
+    let joins: String = (0..child_batches.len())
+        .map(|ci| format!("LEFT JOIN c{ci} ON skel._row_idx = c{ci}._row_idx"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let sql = if select.is_empty() {
+        "SELECT * FROM skel".to_string()
+    } else {
+        format!("SELECT {select} FROM skel {joins}")
+    };
+
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    let schema = batches.first().map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(schema_to_arrow(parent_schema)));
+    Ok(concat_batches(&schema, &batches)?)
+}
+
+/// Prepend a `_row_idx` column (0..n) to a batch so it can be JOIN-keyed positionally.
+fn prepend_row_index(batch: &RecordBatch) -> Result<RecordBatch> {
+    let idx: ArrayRef = Arc::new(UInt32Array::from_iter_values(0..batch.num_rows() as u32));
+    let mut fields: Vec<Arc<ArrowField>> =
+        vec![Arc::new(ArrowField::new("_row_idx", DataType::UInt32, false))];
+    fields.extend(batch.schema().fields().iter().cloned());
+    let mut cols: Vec<ArrayRef> = vec![idx];
+    cols.extend(batch.columns().iter().cloned());
+    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -283,10 +431,8 @@ async fn execute_assemble_rich_list(
     outer_path: &PathBuf,
     dataset: &SyntheticDataset,
     flat_specs: &[(String, PathBuf)],
-    ctx: &SessionContext,
     computed: &mut HashMap<PathBuf, RecordBatch>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
-    output_dir: &Path,
 ) -> Result<()> {
     let mut batch = computed.get(outer_path).ok_or_else(|| {
         anyhow!("assemble rich list '{}': outer batch not yet computed", dataset.name)
@@ -330,17 +476,32 @@ async fn execute_assemble_rich_list(
         batch = add_column(batch, list_arrow_field, list_col)?;
     }
 
-    let batch = evaluate_expressions(batch, dataset, ctx).await?;
-    let output = filter_hidden_columns(batch.clone(), &dataset.data)?;
+    let batch = evaluate_expressions(batch, dataset).await?;
+    let output = filter_hidden_columns(batch.clone(), &dataset.data).await?;
     computed.insert(outer_path.clone(), batch);
-    emit_batch(output, &dataset.name, &dataset.format, dataset.skip,
-        &dataset.output_file, shared, output_dir)?;
+    emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Batch generation
 // ---------------------------------------------------------------------------
+
+fn generate_fresh_batch(
+    schema: &Schema,
+    rows: usize,
+    overrides: &HashMap<String, FieldConstraints>,
+) -> Result<RecordBatch> {
+    generate_batch(schema, rows, &HashMap::new(), overrides)
+}
+
+fn generate_prefilled_batch(
+    schema: &Schema,
+    rows: usize,
+    prefills: &HashMap<String, Vec<ArrayRef>>,
+) -> Result<RecordBatch> {
+    generate_batch(schema, rows, prefills, &HashMap::new())
+}
 
 /// Generate a batch for `schema`. Fields in `overrides` have their constraints
 /// replaced before generation; fields in `prefills` prepend pre-computed values.
@@ -353,7 +514,7 @@ fn generate_batch(
     let arrow_schema = Arc::new(schema_to_arrow(schema));
     let columns = schema
         .iter()
-        .filter(|f| f.expression.is_none() && !is_rich_list(f))
+        .filter(|f| f.expression.is_none() && !f.is_rich_list())
         .map(|f| {
             let prefix = prefills.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
             let effective = overrides.get(&f.name).map(|fc| apply_constraints(f, fc));
@@ -380,68 +541,56 @@ fn apply_constraints(field: &Field, fc: &FieldConstraints) -> Field {
 // Shuffling and emission
 // ---------------------------------------------------------------------------
 
-async fn combine_and_shuffle(
-    batches: Vec<RecordBatch>,
-    schema: &Schema,
-    name: &str,
-    ctx: &SessionContext,
-) -> Result<RecordBatch> {
+async fn combine_and_shuffle(batches: Vec<RecordBatch>, schema: &Schema, name: &str) -> Result<RecordBatch> {
     if batches.is_empty() {
         return generate_batch(schema, 0, &HashMap::new(), &HashMap::new());
     }
-    union_and_shuffle(batches, name, ctx).await
+    union_and_shuffle(batches, name).await
 }
 
-fn sql_safe_name(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
-/// Load all batches into a single MemTable (one partition each), then shuffle with SQL.
-async fn union_and_shuffle(
-    batches: Vec<RecordBatch>,
-    name: &str,
-    ctx: &SessionContext,
-) -> Result<RecordBatch> {
-    let safe = sql_safe_name(name);
-    let tname = format!("_shuffle_{safe}");
-    let schema = batches.first()
+/// Concatenate all batches and shuffle via DataFusion `ORDER BY random()`.
+/// Zero-row inputs are returned immediately to avoid DataFusion empty-result issues.
+async fn union_and_shuffle(batches: Vec<RecordBatch>, name: &str) -> Result<RecordBatch> {
+    let arrow_schema = batches.first()
         .ok_or_else(|| anyhow!("union_and_shuffle: no batches for '{name}'"))?.schema();
-    let partitions: Vec<Vec<RecordBatch>> = batches.into_iter().map(|b| vec![b]).collect();
-    let table = MemTable::try_new(schema, partitions)?;
-    ctx.deregister_table(&tname).ok();
-    ctx.register_table(&tname, Arc::new(table))?;
-    let result_batches = ctx.sql(&format!("SELECT * FROM {tname} ORDER BY random()"))
-        .await?.collect().await?;
-    ctx.deregister_table(&tname).ok();
-    let schema = result_batches.first()
-        .map(|b| b.schema())
-        .ok_or_else(|| anyhow!("union_and_shuffle: no output for '{name}'"))?;
-    Ok(concat_batches(&schema, &result_batches)?)
+    let combined = concat_batches(&arrow_schema, &batches)?;
+    if combined.num_rows() == 0 {
+        return Ok(combined);
+    }
+    let ctx = SessionContext::new();
+    let df = ctx.read_batch(combined)?;
+    let shuffled = df.sort(vec![datafusion::functions::expr_fn::random().sort(true, true)])?
+        .collect().await?;
+    let schema = shuffled.first().map(|b| b.schema()).unwrap_or(arrow_schema);
+    Ok(concat_batches(&schema, &shuffled)?)
+}
+
+/// Prepend pool rows (unshuffled) before shuffled non-pool rows. Pool rows must appear
+/// first so that GenerateInnerFlat's pool_size index correctly identifies them.
+async fn combine_pool_first(
+    pool_batches: Vec<RecordBatch>,
+    nonpool_batches: Vec<RecordBatch>,
+    schema: &Schema,
+    name: &str,
+) -> Result<RecordBatch> {
+    let shuffled_nonpool = combine_and_shuffle(nonpool_batches, schema, name).await?;
+    let arrow_schema = Arc::new(schema_to_arrow(schema));
+    let pool_combined = concat_batches(&arrow_schema, &pool_batches)?;
+    Ok(concat_batches(&pool_combined.schema(), &[pool_combined, shuffled_nonpool])?)
 }
 
 fn emit_batch(
     batch: RecordBatch,
-    name: &str,
     format: &Format,
-    skip: bool,
     output_file: &Option<String>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
-    output_dir: &Path,
 ) -> Result<()> {
-    if skip {
-        return Ok(());
-    }
-    if let Some(of) = output_file {
-        shared
-            .entry(of.clone())
-            .or_insert_with(|| (format.clone(), Vec::new()))
-            .1
-            .push(batch);
-    } else {
-        write_output(&batch, name, format, output_dir)?;
-    }
+    let Some(of) = output_file else { return Ok(()) };
+    shared
+        .entry(of.clone())
+        .or_insert_with(|| (format.clone(), Vec::new()))
+        .1
+        .push(batch);
     Ok(())
 }
 
@@ -463,7 +612,6 @@ fn add_column(batch: RecordBatch, field: ArrowField, col: ArrayRef) -> Result<Re
 async fn evaluate_expressions(
     batch: RecordBatch,
     dataset: &SyntheticDataset,
-    ctx: &SessionContext,
 ) -> Result<RecordBatch> {
     let expr_fields: Vec<_> = dataset.data.iter()
         .filter(|f| f.expression.is_some())
@@ -473,16 +621,15 @@ async fn evaluate_expressions(
         return Ok(batch);
     }
 
-    let safe_name = sql_safe_name(&dataset.name);
-    let src = format!("_src_{safe_name}");
-
-    ctx.deregister_table(&src).ok();
-    ctx.register_batch(&src, batch)?;
+    // Fresh context per call — table name "src" is stable and the context is dropped
+    // at function exit, so there is no registration lifecycle to manage.
+    let ctx = SessionContext::new();
+    ctx.register_batch("src", batch)?;
 
     let mut ctes = Vec::new();
-    let mut prev = src.clone();
+    let mut prev = "src".to_string();
     for (i, field) in expr_fields.iter().enumerate() {
-        let step = format!("_expr_{safe_name}_{i}");
+        let step = format!("step{i}");
         let expr = field.expression.as_ref().unwrap();
         ctes.push(format!(
             "{step} AS (SELECT *, {expr} AS \"{fname}\" FROM {prev})",
@@ -495,8 +642,6 @@ async fn evaluate_expressions(
     let df = ctx.sql(&sql).await?;
     let batches = df.collect().await?;
 
-    ctx.deregister_table(&src).ok();
-
     let schema = batches.first()
         .map(|b| b.schema())
         .ok_or_else(|| anyhow!("expression evaluation returned no rows"))?;
@@ -506,26 +651,29 @@ async fn evaluate_expressions(
 /// Remove columns marked `hidden` from a batch before writing output.
 /// The full batch (including hidden columns) is kept in `computed` for prefill
 /// wiring; only the filtered batch is written to output.
-fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordBatch> {
+async fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordBatch> {
+    if !fields.iter().any(|f| f.hidden) {
+        return Ok(batch);
+    }
+
     let hidden: HashSet<&str> = fields.iter()
         .filter(|f| f.hidden)
         .map(|f| f.name.as_str())
         .collect();
 
-    if hidden.is_empty() {
-        return Ok(batch);
-    }
-
-    let schema = batch.schema();
-    let (kept_fields, kept_cols): (Vec<_>, Vec<_>) = schema
+    let ctx = SessionContext::new();
+    let df = ctx.read_batch(batch)?;
+    let visible: Vec<datafusion::prelude::Expr> = df.schema()
         .fields()
         .iter()
-        .zip(batch.columns())
-        .filter(|(f, _)| !hidden.contains(f.name().as_str()))
-        .map(|(f, c)| (f.clone(), c.clone()))
-        .unzip();
+        .filter(|af| !hidden.contains(af.name().as_str()))
+        .map(|af| datafusion::prelude::col(af.name()))
+        .collect();
 
-    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(kept_fields)), kept_cols)?)
+    let batches = df.select(visible)?.collect().await?;
+    let schema = batches.first().map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(ArrowSchema::empty()));
+    Ok(concat_batches(&schema, &batches)?)
 }
 
 // ---------------------------------------------------------------------------

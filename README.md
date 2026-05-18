@@ -27,12 +27,12 @@ The rule is: **parents are subsequent, children are preceding.**  Siblings may e
 
 An `include` is a *constraint specialisation*, not a data dependency.  A child
 defines a more-constrained subset of its parent's population.  The hierarchy is
-a hierarchy of ever-narrowing constraints, not a hierarchy of datasets.  Rows
-are grown iteratively from the leaves of the constraint graph: the most
-constrained datasets (children, deepest leaves) are generated first, and each
-level is grown outward from those already-solved populations, so consistency
-across all outputs is guaranteed by construction rather than enforced after the
-fact.
+a hierarchy of ever-narrowing constraints, not a hierarchy of datasets.
+Generation flows leaf-to-root through the constraint hierarchy: the most
+constrained datasets (children, deepest leaves) are generated first, then each
+parent's population is completed by expanding from those already-solved child
+rows — so consistency across all outputs is guaranteed by construction rather
+than enforced after the fact.
 
 **Example — insurance fraud:**
 - `fraudulent_policies.yaml` *includes* `policies.yaml` at a 5% distribution.
@@ -44,9 +44,6 @@ fact.
 
 When writing definition files, think of `includes` as constraint specialisation:
 "I am a more constrained subset of my parent's population."
-
-Datasets marked `skip: true` are treated as intermediates: their data is
-generated and made available to dependants, but no output file is written.
 
 ### Sibling segmentation
 
@@ -67,22 +64,24 @@ distribution: 0.05   # on top-level includes: marginal row-membership probabilit
 distribution: 0.5    # on content includes:   fraction of the include pool to sample from
 ```
 
-The two uses of `distribution` are syntactically identical but semantically
-distinct: the top-level form drives IPF-based row partitioning; the content
-form limits the sampling pool for inner list items.
+Both forms drive the same IPF-based segmentation, sizing the sibling's share
+of the parent population.  The distinction is in what the segment contributes:
+a top-level sibling writes its rows as a standalone output file; a content pool
+sibling places qualifying rows at the front of the parent batch for list-item
+sampling but produces no output file of its own.
 
 ## YAML schema
 
 ```yaml
 name: policies           # table name; also used as the output filename
-format: parquet          # parquet | csv
-rows: 1000               # default 100
-skip: false              # set true to suppress output for intermediate datasets
+format: parquet          # parquet | csv | json | jsonl
+output_file: policies    # override output filename (default: name)
+rows: 1000               # explicit row count — omit when using distribution (mutually exclusive)
 
 includes:                # datasets this file depends on
   - file: customers.yaml # path relative to this file
-    ref: customers       # name used to reference it inside this dataset
-    distribution: 0.3    # optional: fraction of parent rows (for sibling segmentation)
+    ref: customers       # name used to reference fields inside this dataset
+    distribution: 0.3    # fraction of parent rows; implies row count — omit rows above
 
 data:                    # flat list of field definitions
   - name: id
@@ -104,7 +103,9 @@ data:                    # flat list of field definitions
     type: list
     count: {min: 1, max: 5}
     content:
+      name: item
       type: string
+      generator: word
   - name: events          # rich list — items are structs drawn from an included dataset
     type: list
     count: {min: 0, max: 3}
@@ -112,14 +113,15 @@ data:                    # flat list of field definitions
       includes:
         - file: events.yaml
           ref: event
-      fields:             # struct fields for each list item
+          distribution: 0.5   # fraction of event rows eligible for sampling
+      fields:                 # struct fields for each list item
         - name: event_id
-          ref: event.id   # sourced from the included dataset
+          ref: event.id       # sourced from the included dataset
         - name: label
-          type: string    # generated fresh per item
+          type: string        # generated fresh per item
 ```
 
-Supported field types: `number`, `boolean`, `string`, `object`, `list`.
+Supported field types: `number`, `boolean`, `string`, `object`, `list`, `date`, `date_time`, `variant`.
 
 ## Dependencies
 
@@ -159,8 +161,9 @@ fakeset definitions/ extra.yaml --output ./generated
 fakeset --help
 ```
 
-Each non-skipped dataset produces one output file under the output directory
-(default: `./output`), named `<dataset-name>.<format>`.
+Each dataset with an `output_file` (or name, as default) produces one output
+file under the output directory (default: `./output`), named
+`<output_file>.<format>`.
 
 ## Examples
 

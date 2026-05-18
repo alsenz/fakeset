@@ -1,5 +1,6 @@
 name: dogs
 format: csv
+output_file: dogs
 includes:
   - file: base.yaml
     ref: b

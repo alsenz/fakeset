@@ -1,5 +1,6 @@
 name: records
 format: jsonl
+output_file: records
 rows: 5
 data:
   - name: record_id

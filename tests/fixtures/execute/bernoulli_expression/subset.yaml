@@ -1,5 +1,6 @@
 name: subset
 format: csv
+output_file: subset
 includes:
   - file: parent.yaml
     ref: p

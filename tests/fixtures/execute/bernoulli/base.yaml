@@ -1,5 +1,6 @@
 name: base
 format: csv
+output_file: base
 rows: 6
 data:
   - name: id

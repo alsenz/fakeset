@@ -4,28 +4,13 @@ use petgraph::graph::DiGraph;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::models::{resolve_include, Field, Include, SyntheticDataset};
+use crate::models::{for_each_content_include, resolve_include, SyntheticDataset};
 
 #[derive(Debug)]
 pub struct DatasetGraph {
     pub graph: DiGraph<PathBuf, ()>,
 }
 
-/// Collect all `Include` entries declared inside `content: {includes: [...]}` blocks,
-/// scanning recursively through nested object and list fields.
-fn collect_list_content_includes(fields: &[Field]) -> Vec<&Include> {
-    let mut result = Vec::new();
-    for field in fields {
-        if let Some(content) = &field.content {
-            if !content.includes.is_empty() {
-                result.extend(&content.includes);
-                result.extend(collect_list_content_includes(&content.item.fields));
-            }
-        }
-        result.extend(collect_list_content_includes(&field.fields));
-    }
-    result
-}
 
 /// Build the DAG that drives execution order.
 ///
@@ -76,7 +61,9 @@ pub fn build_dag(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<Datase
         // List-content includes: data dependency — the included dataset must be computed
         // BEFORE this dataset (opposite order to constraint includes). Add a reversed edge
         // so topo visits the includee (data provider) before the includer (data consumer).
-        for include in collect_list_content_includes(&dataset.data) {
+        let mut content_includes = Vec::new();
+        for_each_content_include(&dataset.data, &mut |_field, inc, _item_fields| content_includes.push(inc.clone()));
+        for include in &content_includes {
             let canonical = resolve_include(path, &include.file).ok_or_else(|| {
                 anyhow!(
                     "{}: list-content included file not found: {}",

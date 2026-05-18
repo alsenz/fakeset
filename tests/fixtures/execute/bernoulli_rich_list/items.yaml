@@ -1,5 +1,6 @@
 name: items
 format: jsonl
+output_file: items
 rows: 20
 data:
   - name: label

@@ -1,0 +1,8 @@
+name: bad
+format: csv
+output_file: bad
+rows: 10
+data:
+  - name: status
+    type: variant
+    variants: []

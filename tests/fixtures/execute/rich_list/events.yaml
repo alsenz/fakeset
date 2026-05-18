@@ -1,5 +1,6 @@
 name: events
 format: jsonl
+output_file: events
 rows: 5
 data:
   - name: event_id

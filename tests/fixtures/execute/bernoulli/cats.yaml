@@ -1,5 +1,6 @@
 name: cats
 format: csv
+output_file: cats
 includes:
   - file: base.yaml
     ref: b

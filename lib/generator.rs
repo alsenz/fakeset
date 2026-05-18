@@ -4,12 +4,13 @@ use arrow::array::{
     TimestampMicrosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::compute::concat;
-use arrow::datatypes::{DataType, Field as ArrowField, TimeUnit};
+use arrow::compute::{cast, concat};
+use arrow::datatypes::{DataType, Field as ArrowField};
 use fake::{Fake, Faker};
 use std::sync::Arc;
 
-use crate::models::{CountSpec, Field, FieldType, Generator, Locale, Schema};
+use crate::models::{CountSpec, Field, FieldType, Generator, Locale};
+use crate::schema::{field_to_arrow, parquet_datatype_to_arrow};
 
 /// Dispatch a locale-aware faker to the right fake-rs locale struct.
 /// All 14 fake-rs locales are supported for every faker; locale data that
@@ -54,54 +55,6 @@ macro_rules! locale_fake {
 }
 
 // ---------------------------------------------------------------------------
-// Schema → Arrow
-// ---------------------------------------------------------------------------
-
-pub fn schema_to_arrow(schema: &Schema) -> arrow::datatypes::Schema {
-    arrow::datatypes::Schema::new(
-        schema.iter()
-            .filter(|f| f.expression.is_none() && !is_rich_list(f))
-            .map(field_to_arrow)
-            .collect::<Vec<_>>(),
-    )
-}
-
-pub fn is_rich_list(field: &Field) -> bool {
-    field.content.as_deref().is_some_and(|c| !c.includes.is_empty())
-}
-
-pub fn field_to_arrow(field: &Field) -> ArrowField {
-    let ft = field
-        .field_type
-        .as_ref()
-        .expect("field_type unresolved; call resolve_refs before executing");
-    let dt = match ft {
-        FieldType::Number   => DataType::Float64,
-        FieldType::Boolean  => DataType::Boolean,
-        FieldType::String   => DataType::Utf8,
-        FieldType::Date     => DataType::Date32,
-        FieldType::DateTime => DataType::Timestamp(TimeUnit::Microsecond, None),
-        FieldType::Object => {
-            let sub: Vec<ArrowField> = field.fields.iter().map(field_to_arrow).collect();
-            DataType::Struct(sub.into())
-        }
-        FieldType::List => {
-            let item_dt = match field.content.as_deref() {
-                None => DataType::Utf8,
-                Some(c) if c.includes.is_empty() => field_to_arrow(&c.item).data_type().clone(),
-                Some(c) => {
-                    let sub: Vec<ArrowField> = c.item.fields.iter().map(field_to_arrow).collect();
-                    DataType::Struct(sub.into())
-                }
-            };
-            DataType::List(Arc::new(ArrowField::new("item", item_dt, true)))
-        }
-    };
-    let name = if field.name.is_empty() { "item" } else { &field.name };
-    ArrowField::new(name, dt, true)
-}
-
-// ---------------------------------------------------------------------------
 // Column generation
 // ---------------------------------------------------------------------------
 
@@ -119,6 +72,25 @@ pub fn sample_count(spec: &CountSpec) -> usize {
 }
 
 pub fn generate_column(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Result<ArrayRef> {
+    let mut col = generate_column_raw(field, rows, prefix)?;
+    if let (Some(precision), Some(FieldType::Number)) = (field.precision, &field.field_type) {
+        let factor = 10f64.powi(precision);
+        let arr = col.as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| anyhow!("precision: expected Float64 column for number field '{}'", field.name))?;
+        col = Arc::new(Float64Array::from(
+            arr.values().iter().map(|&v| (v * factor).round() / factor).collect::<Vec<_>>(),
+        ));
+    }
+    if let Some(ref pcfg) = field.parquet {
+        let target = parquet_datatype_to_arrow(&pcfg.datatype);
+        if col.data_type() != &target {
+            return Ok(cast(&col, &target)?);
+        }
+    }
+    Ok(col)
+}
+
+fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Result<ArrayRef> {
     let prefix_len: usize = prefix.iter().map(|a| a.len()).sum();
     let n = rows.saturating_sub(prefix_len);
 
@@ -166,6 +138,9 @@ pub fn generate_column(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
         )),
         FieldType::Object => {
             bail!("object field generation not yet implemented (field: '{}')", field.name)
+        }
+        FieldType::Variant => {
+            bail!("variant field '{}' must be expanded before execution; call expand_field_variants first", field.name)
         }
         FieldType::List => {
             match field.content.as_deref() {
@@ -265,8 +240,8 @@ fn constant_column(ft: &FieldType, val: &serde_yaml::Value, n: usize) -> Result<
                 .map_err(|e| anyhow!("invalid date_time value '{s}': {e}"))?;
             Ok(Arc::new(TimestampMicrosecondArray::from(vec![dt.timestamp_micros(); n])))
         }
-        FieldType::Object | FieldType::List => {
-            bail!("constant `value` is not supported for object/list fields")
+        FieldType::Object | FieldType::List | FieldType::Variant => {
+            bail!("constant `value` is not supported for object/list/variant fields")
         }
     }
 }

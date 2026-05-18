@@ -1,5 +1,6 @@
 name: outer
 format: jsonl
+output_file: outer
 rows: 10
 data:
   - name: id

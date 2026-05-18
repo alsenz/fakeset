@@ -1,5 +1,6 @@
 name: directors
 format: parquet
+output_file: directors
 includes:
   - file: individuals.yaml
     ref: individual

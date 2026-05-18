@@ -1,5 +1,6 @@
 name: derived
 format: csv
+output_file: derived
 includes:
   - file: source.yaml
     ref: src

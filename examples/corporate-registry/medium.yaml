@@ -1,5 +1,6 @@
 name: medium_enterprises
 format: parquet
+output_file: medium_enterprises
 includes:
   - file: smes.yaml
     ref: smes
@@ -12,11 +13,13 @@ data:
     value: "medium"
   - name: employee_count
     type: number
+    precision: 0
     range:
       min: 50
       max: 249
   - name: annual_revenue
     type: number
+    precision: 0
     range:
       min: 10000000
       max: 50000000

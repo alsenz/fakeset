@@ -1,5 +1,6 @@
 name: person
 format: jsonl
+output_file: person
 rows: 5
 data:
   - name: id

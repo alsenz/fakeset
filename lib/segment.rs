@@ -21,7 +21,12 @@ pub struct Sibling {
     /// Fraction of the parent's population this sibling represents.
     pub distribution: f64,
     /// The `ref:` name from the include declaration pointing to the parent.
-    pub include_ref: String,
+    pub reference: String,
+    /// True for rich-list pool siblings (created from `content: {includes: [...]}` fields).
+    /// Pool siblings do not generate standalone batches — they only contribute field
+    /// constraints to the parent's segment generation, and their rows must be placed
+    /// first in the parent batch so `GenerateInnerFlat`'s pool_size index is correct.
+    pub is_pool: bool,
 }
 
 /// A planned generation segment produced by Bernoulli factoring.
@@ -139,9 +144,29 @@ pub fn plan_segments(parent_rows: usize, siblings: &[Sibling], max_siblings: usi
         accumulated_weight += weights[mask];
         feasible.insert(mask, constraints);
     }
+    // Force-include every singleton mask (one sibling bit set) that survived
+    // conflict pruning, regardless of the budget threshold.
+    //
+    // Budget pruning uses raw Bernoulli weights, which catastrophically
+    // underestimate post-IPF contribution for mutually-exclusive siblings:
+    // a 4% sibling alongside a 95% peer has raw weight ≈ 0.2% (conditioned on
+    // "not in the 95% segment"), but its actual post-IPF marginal is 4%.
+    // Joint masks (2+ siblings) can still be budget-pruned — they have many
+    // alternatives and Bernoulli rounding will drop near-zero ones anyway.
+    for i in 0..n {
+        let mask = 1usize << i;
+        if weights[mask] > 0.0 {
+            feasible.entry(mask).or_insert_with(|| {
+                merge_segment_constraints(mask, siblings, n).unwrap_or_default()
+            });
+        }
+    }
     // Zero weights for budget-pruned masks so IPF doesn't count them.
+    // Singletons re-added above are in feasible and must not be zeroed.
     for &mask in &sorted_masks[cut_idx..] {
-        weights[mask] = 0.0;
+        if !feasible.contains_key(&mask) {
+            weights[mask] = 0.0;
+        }
     }
 
     // --- IPF over sparse feasible set ---
@@ -299,8 +324,8 @@ fn merge_segment_constraints(
 /// via its ref fields. The ref field string has the form `include_ref.field_name`;
 /// we filter by the sibling's known `include_ref` and return constraints keyed
 /// by the parent field name.
-fn sibling_field_constraints(sibling: &Sibling) -> HashMap<String, FieldConstraints> {
-    let prefix = format!("{}.", sibling.include_ref);
+pub(crate) fn sibling_field_constraints(sibling: &Sibling) -> HashMap<String, FieldConstraints> {
+    let prefix = format!("{}.", sibling.reference);
     let mut map = HashMap::new();
     for field in &sibling.dataset.data {
         if let Some(ref ref_str) = field.ref_field {
@@ -342,7 +367,6 @@ mod tests {
                 name: path.to_string(),
                 format: Format::Parquet,
                 rows: None,
-                skip: false,
                 output_file: None,
                 locale: None,
                 includes: vec![],
@@ -350,7 +374,8 @@ mod tests {
                 variants: vec![],
             },
             distribution,
-            include_ref: "parent_ref".to_string(),
+            reference: "parent_ref".to_string(),
+            is_pool: false,
         }
     }
 
