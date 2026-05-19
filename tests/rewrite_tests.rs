@@ -130,7 +130,7 @@ fn test_ref_to_expression_field_errors_at_rewrite() {
 }
 
 #[test]
-fn test_resolve_refs_for_rich_list_content_field() {
+fn test_resolve_refs_for_nested_include_content_field() {
     // events.attendees content has:
     //   name: ref: person.full_name  (include-scoped — type inherited from people.full_name: string)
     //   event_title: type: string, ref: title  (outer-scoped — left as-is)

@@ -35,12 +35,12 @@ pub fn resolve_refs(
                     field.clone()
                 };
 
-                // Resolve include-scoped refs inside rich list content.
+                // Resolve include-scoped refs inside nested include content.
                 if let Some(content) = &field.content {
                     if !content.includes.is_empty() {
                         let content_includes = content.includes.clone();
                         let new_content_fields: Vec<Field> = content.item.fields.iter()
-                            .map(|cf| resolve_rich_content_field(path, datasets, cf, &content_includes))
+                            .map(|cf| resolve_nested_include_content_field(path, datasets, cf, &content_includes))
                             .collect::<Result<_>>()?;
                         if let Some(ref mut c) = out.content {
                             c.item.fields = new_content_fields;
@@ -194,7 +194,7 @@ fn resolve_to_base<'a>(
     resolve_to_base(next_field, next_ds, &inc_path, all, depth + 1)
 }
 
-/// Resolve a single field inside a rich list content block.
+/// Resolve a single field inside a nested include content block.
 ///
 /// - **Include-scoped ref** (`ref: include_ref.field`): copies `field_type` and nested schema
 ///   from the target field in the included dataset, merging any local constraints.
@@ -202,7 +202,7 @@ fn resolve_to_base<'a>(
 ///   — the field already carries an explicit `type` (validated) and the executor will stamp
 ///   the value from the outer row at generation time.
 /// - **No ref**: left unchanged.
-fn resolve_rich_content_field(
+fn resolve_nested_include_content_field(
     dataset_path: &Path,
     all: &HashMap<PathBuf, SyntheticDataset>,
     field: &Field,
@@ -223,7 +223,7 @@ fn resolve_rich_content_field(
 
     let include_path = resolve_include(dataset_path, &include.file).ok_or_else(|| {
         anyhow!(
-            "rich list field '{}': cannot resolve include '{}'",
+            "nested include field '{}': cannot resolve include '{}'",
             field.name, include.file
         )
     })?;
@@ -233,14 +233,14 @@ fn resolve_rich_content_field(
         .and_then(|ds| ds.data.iter().find(|f| f.name == target_name))
         .ok_or_else(|| {
             anyhow!(
-                "rich list field '{}': target field '{}' not found in '{}'",
+                "nested include field '{}': target field '{}' not found in '{}'",
                 field.name, target_name, include.file
             )
         })?;
 
     let merged = FieldConstraints::from(field).merge(&FieldConstraints::from(target)).ok_or_else(|| {
         anyhow!(
-            "rich list field '{}': local constraints conflict with target '{}'",
+            "nested include field '{}': local constraints conflict with target '{}'",
             field.name, target_name
         )
     })?;

@@ -106,7 +106,7 @@ data:                    # flat list of field definitions
       name: item
       type: string
       generator: word
-  - name: events          # rich list — items are structs drawn from an included dataset
+  - name: events          # nested include — items are structs drawn from an included dataset
     type: list
     count: {min: 0, max: 3}
     content:

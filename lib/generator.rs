@@ -161,7 +161,7 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
                 }
                 Some(_) => {
                     bail!(
-                        "rich list field '{}' must be generated via GenerateInnerFlat / AssembleRichList",
+                        "nested include field '{}' must be generated via GenerateInnerFlat / AssembleNestedInclude",
                         field.name
                     )
                 }

@@ -281,12 +281,12 @@ fn validate_rich_content(
 ) -> Result<()> {
     for field in data {
         if field.name.is_empty() {
-            bail!("rich list content at '{path}': a field is missing a `name`");
+            bail!("nested include content at '{path}': a field is missing a `name`");
         }
         let fpath = format!("{path}.{}", field.name);
 
         if field.expression.is_some() {
-            bail!("field '{fpath}': `expression` is not supported inside rich list content");
+            bail!("field '{fpath}': `expression` is not supported inside nested include content");
         }
 
         if let Some(ref ref_str) = field.ref_field {

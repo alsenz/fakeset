@@ -395,10 +395,10 @@ async fn test_list_field_generates_arrays() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// 13. Bernoulli parent with rich list field
+// 13. Bernoulli parent with nested include field
 //
 // events (rows:10) is a Bernoulli parent of vip (dist:0.5) and has a
-// rich list field `picks` drawn from items (rows:20).
+// nested include field `picks` drawn from items (rows:20).
 //
 // Expected:
 //   items.jsonl  — 20 rows (simple pool)
@@ -407,7 +407,7 @@ async fn test_list_field_generates_arrays() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_bernoulli_rich_list_parent_assembles_correctly() {
+async fn test_bernoulli_nested_include_parent_assembles_correctly() {
     let out = run("tests/fixtures/execute/bernoulli_rich_list").await;
 
     assert_eq!(jsonl_rows(&out, "items").len(), 20, "items should have 20 rows");
@@ -438,16 +438,16 @@ async fn test_bernoulli_rich_list_parent_assembles_correctly() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Plain fields inside rich list content
+// 14. Plain fields inside nested include content
 //
-// records (rows:5) has a rich list `entries` with:
+// records (rows:5) has a nested include `entries` with:
 //   - tag   (include-scoped from pool)
 //   - badge (plain generated: string/word)
 //   - score (plain generated: number 0–10)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_plain_fields_in_rich_list_content() {
+async fn test_plain_fields_in_nested_include_content() {
     let out = run("tests/fixtures/execute/rich_list_plain").await;
 
     let rows = jsonl_rows(&out, "records");
@@ -516,11 +516,11 @@ async fn test_count_normal_produces_variable_length_lists() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. Rich list content — include-scoped and outer-scoped refs
+// 12. Nested include content — include-scoped and outer-scoped refs
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_rich_list_include_and_outer_scoped_refs() {
+async fn test_nested_include_refs() {
     let out = run("tests/fixtures/execute/rich_list").await;
     let event_rows = jsonl_rows(&out, "events");
 

@@ -22,7 +22,7 @@ pub struct Sibling {
     pub distribution: f64,
     /// The `ref:` name from the include declaration pointing to the parent.
     pub reference: String,
-    /// True for rich-list pool siblings (created from `content: {includes: [...]}` fields).
+    /// True for nested-include pool siblings (created from `content: {includes: [...]}` fields).
     /// Pool siblings do not generate standalone batches — they only contribute field
     /// constraints to the parent's segment generation, and their rows must be placed
     /// first in the parent batch so `GenerateInnerFlat`'s pool_size index is correct.

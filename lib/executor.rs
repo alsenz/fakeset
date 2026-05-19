@@ -40,7 +40,7 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                 let prefill_map = resolve_prefills(prefills, &computed);
                 let batch = generate_prefilled_batch(&dataset.data, *rows, &prefill_map)?;
                 if *skip_emit {
-                    // Scalar-only intermediate; AssembleRichList adds list columns and emits.
+                    // Scalar-only intermediate; AssembleNestedInclude adds list columns and emits.
                     computed.insert(path.clone(), batch);
                 } else {
                     let batch = evaluate_expressions(batch, dataset.as_ref()).await?;
@@ -69,8 +69,8 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                     &mut computed,
                 )?;
             }
-            ExecutionStep::AssembleRichList { outer_path, dataset, flat_specs } => {
-                execute_assemble_rich_list(
+            ExecutionStep::AssembleNestedInclude { outer_path, dataset, flat_specs } => {
+                execute_assemble_nested_include(
                     outer_path, dataset.as_ref(), flat_specs,
                     &mut computed, &mut shared,
                 ).await?;
@@ -205,7 +205,7 @@ async fn execute_sibling_group(
     };
 
     if skip_parent_emit {
-        // Scalar-only intermediate; AssembleRichList adds list columns, evaluates
+        // Scalar-only intermediate; AssembleNestedInclude adds list columns, evaluates
         // expressions, and emits.
         computed.insert(path.to_path_buf(), parent_shuffled);
     } else {
@@ -285,9 +285,9 @@ async fn grow_parent_from_children(
         }
     }
 
-    // Active parent fields (skip expressions and rich-list placeholders).
+    // Active parent fields (skip expressions and nested-include placeholders).
     let active: Vec<&Field> = parent_schema.iter()
-        .filter(|f| f.expression.is_none() && !f.is_rich_list())
+        .filter(|f| f.expression.is_none() && !f.is_nested_include())
         .collect();
 
     // Build skeleton batch: _row_idx column + all rule-3 (fresh) columns.
@@ -348,10 +348,10 @@ fn prepend_row_index(batch: &RecordBatch) -> Result<RecordBatch> {
 }
 
 // ---------------------------------------------------------------------------
-// Rich list generation
+// Nested include generation
 // ---------------------------------------------------------------------------
 
-/// Build the flat intermediate table for one rich list field.
+/// Build the flat intermediate table for one nested include field.
 ///
 /// Produces a `RecordBatch` with `_outer_idx: UInt32` (which outer row each
 /// item belongs to) plus one column per inner field, stored in `computed[flat_key]`.
@@ -427,7 +427,7 @@ fn execute_inner_flat(
 
 /// Fold the inner flat tables produced by `execute_inner_flat` back into the
 /// outer batch as `ListArray` columns, then evaluate expressions and emit.
-async fn execute_assemble_rich_list(
+async fn execute_assemble_nested_include(
     outer_path: &PathBuf,
     dataset: &SyntheticDataset,
     flat_specs: &[(String, PathBuf)],
@@ -435,12 +435,12 @@ async fn execute_assemble_rich_list(
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
     let mut batch = computed.get(outer_path).ok_or_else(|| {
-        anyhow!("assemble rich list '{}': outer batch not yet computed", dataset.name)
+        anyhow!("assemble nested include '{}': outer batch not yet computed", dataset.name)
     })?.clone();
 
     for (field_name, flat_key) in flat_specs {
         let inner = computed.get(flat_key).ok_or_else(|| {
-            anyhow!("assemble rich list '{}': inner flat for '{field_name}' not yet computed", dataset.name)
+            anyhow!("assemble nested include '{}': inner flat for '{field_name}' not yet computed", dataset.name)
         })?.clone();
 
         let outer_n = batch.num_rows();
@@ -514,7 +514,7 @@ fn generate_batch(
     let arrow_schema = Arc::new(schema_to_arrow(schema));
     let columns = schema
         .iter()
-        .filter(|f| f.expression.is_none() && !f.is_rich_list())
+        .filter(|f| f.expression.is_none() && !f.is_nested_include())
         .map(|f| {
             let prefix = prefills.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
             let effective = overrides.get(&f.name).map(|fc| apply_constraints(f, fc));

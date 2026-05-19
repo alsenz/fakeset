@@ -333,8 +333,8 @@ fn test_rich_content_expression_in_content_errors() {
         "error should mention 'expression': {msg}"
     );
     assert!(
-        msg.contains("rich list"),
-        "error should mention 'rich list': {msg}"
+        msg.contains("nested include"),
+        "error should mention 'nested include': {msg}"
     );
 }
 

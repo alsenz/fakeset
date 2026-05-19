@@ -180,12 +180,12 @@ fn print_plan(plan: &ExecutionPlan) {
                     i + 1, outer, list_field_name, inc, count_label, inc, dist, flat
                 );
             }
-            ExecutionStep::AssembleRichList { outer_path, dataset, flat_specs } => {
+            ExecutionStep::AssembleNestedInclude { outer_path, dataset, flat_specs } => {
                 let outer = outer_path.file_stem()
                     .and_then(|s| s.to_str()).unwrap_or("?");
                 let fields: Vec<&str> = flat_specs.iter().map(|(n, _)| n.as_str()).collect();
                 println!(
-                    "[{}] assemble rich list: {} ← [{}] ({})",
+                    "[{}] assemble nested include: {} ← [{}] ({})",
                     i + 1, outer, fields.join(", "), dataset.format
                 );
             }
@@ -339,7 +339,7 @@ fn print_field(field: &fakeset::models::Field, indent: usize) {
             print_field(&c.item, indent + 2);
         }
         Some(c) => {
-            println!("{pad}  [rich list content]");
+            println!("{pad}  [nested include content]");
             for inc in &c.includes {
                 let dist = inc.distribution
                     .map(|d| format!(" dist:{:.0}%", d * 100.0))

@@ -2,7 +2,7 @@
 
 ## What this repo is
 
-A declarative, DAG-structured synthetic dataset generator. Users write YAML schemas; fakeset generates Parquet/CSV/JSON/JSONL output. The core challenge is producing referentially consistent data across a graph of related datasets — solved by generating the most-constrained datasets first and expanding outward.
+A declarative, DAG-structured synthetic dataset generator. Users write YAML schemas; fakeset generates Parquet/CSV/JSON/JSONL output. The core challenge is producing referentially consistent data across a graph of related datasets — solved by generating children (the more-constrained datasets) first, then assembling each parent's rows from those already-solved child rows.
 
 ## Build and test
 
@@ -33,16 +33,16 @@ These terms have precise meanings in this codebase — use them consistently.
 | **subsequent** (subsequent-by-execution) | Generated after. Parents are always subsequent. |
 | **sibling group** | A parent together with all its siblings; planned as a unit via segmentation. |
 | **segment** | One subset of a parent's rows that belongs to a particular combination of siblings. |
-| **pool sibling** | A sibling arising from a rich-list `content: {includes: [...]}` field — contributes constraints to the parent's segments but produces no standalone output file. |
-| **rich list** | A `list` field whose items are structs drawn from an included dataset (as opposed to a simple scalar list). |
-| **inner flat** | The intermediate flat `RecordBatch` (with `_outer_idx`) produced for one rich list field before assembly into `ListArray` columns. |
+| **pool sibling** | A sibling arising from a nested-include `content: {includes: [...]}` field — contributes constraints to the parent's segments but produces no standalone output file. |
+| **nested include** | A `list` field whose items are structs drawn from an included dataset (as opposed to a simple scalar list). |
+| **inner flat** | The intermediate flat `RecordBatch` (with `_outer_idx`) produced for one nested include field before assembly into `ListArray` columns. |
 | **prefill** | A column pre-populated from an already-computed child batch into the parent's batch, wiring up ref fields so they are never regenerated. |
 
 ## Core architectural tenet
 
 **Children are generated first; parents are expanded from them.**
 
-An `include` is a *constraint specialisation*, not a data dependency. A child is a more-constrained subset of its parent's population. The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so the deepest leaves (most constrained) are always generated before their parents. Each parent's rows are then grown outward from the already-solved child rows — consistency is guaranteed by construction.
+An `include` is a *constraint specialisation*, not a data dependency. A child is a more-constrained subset of its parent's population. The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so the deepest leaves (most constrained) are always generated before their parents. Each parent's rows are then assembled from those already-solved child rows — inheriting constrained columns directly and generating fresh values for the rest — so consistency is guaranteed by construction, not enforced after the fact.
 
 When a parent field matches a child's field (by ref-wiring or same name), the child's column is inherited directly. Fields with no child source are generated fresh. This logic lives in `executor.rs::grow_parent_from_children`, which expresses it as a DataFusion LEFT JOIN on `_row_idx`.
 
@@ -65,7 +65,7 @@ Each run follows this fixed sequence:
 ```
 load YAML files
   → build_dag          (petgraph DAG, topo-sort, cycle detection)
-  → pull_down_expression_deps  (hoist expression-referenced fields above their expression)
+  → pull_down_expression_deps  (inject hidden ref fields for expression variables declared only in an included parent)
   → validate           (structural checks, ref validity, constraint consistency)
   → expand_field_variants      (variant fields → concrete global variants)
   → resolve_refs       (copy field_type/schema from ref targets; merge constraints)
@@ -78,8 +78,8 @@ load YAML files
 
 - `GenerateDataset` — simple dataset, no siblings.
 - `GenerateSiblingGroup` — parent + siblings planned together via segmentation.
-- `GenerateInnerFlat` — flat intermediate for one rich-list field.
-- `AssembleRichList` — fold inner-flat batches into `ListArray` columns, evaluate expressions, emit.
+- `GenerateInnerFlat` — flat intermediate for one nested include field.
+- `AssembleNestedInclude` — fold inner-flat batches into `ListArray` columns, evaluate expressions, emit.
 - `WriteSharedOutput` — union + shuffle all accumulated batches for a shared output file, write once.
 
 ## Module map
@@ -111,11 +111,13 @@ DataFusion is used for query-engine operations, not as a storage layer:
 
 Each function creates its own `SessionContext::new()` — there is no shared context threaded through the executor.
 
+Anything expressible as a SQL string can also be constructed programmatically via DataFusion's `Expr` / `LogicalPlan` / `DataFrame` API. Prefer the programmatic API for new work: it is type-safe, composable, and avoids string-formatting bugs. SQL strings are acceptable for cases where the query structure is fixed and the readability benefit is clear (e.g. the CTE chain in `evaluate_expressions`).
+
 ## Key conventions
 
 - **`Arc<SyntheticDataset>`** in `ExecutionStep` — datasets are shared by reference across steps; clone the Arc, not the dataset.
 - **`output/` is gitignored** — generated data never lands in version control.
-- **No comments explaining what code does** — names carry meaning; comments only explain non-obvious *why* (hidden constraints, invariants, workarounds).
+- **Doc comments welcome** — `///` comments documenting public functions, structs, and fields are encouraged. Inline comments should only explain non-obvious *why* (hidden constraints, invariants, workarounds) — not *what* the code does, which well-named identifiers already convey.
 - **No `sql_safe_name`** — DataFusion column names are double-quoted in SQL strings (`"field_name"`), so arbitrary field names are safe without sanitisation.
 - **`_row_idx` sentinel** — a `UInt32` 0..n column prepended to batches for positional JOIN keying inside `grow_parent_from_children`; stripped from all outputs.
 - **Pool rows come first** — when a parent has pool siblings, their rows occupy the leading positions in the combined batch so `GenerateInnerFlat`'s `pool_size` index correctly identifies eligible rows.
@@ -130,3 +132,15 @@ Each function creates its own `SessionContext::new()` — there is no shared con
 - **DF4** — write output via DataFusion `DataSink`; needs care around single-file vs partitioned output.
 - **T1** — unit tests for `generate_column` per field type.
 - **branch-and-bound segment enumeration** — replace the dense 2^N weight pass in `plan_segments` with an O(K·N) lattice traversal for large sibling groups.
+
+## Future work (needs planning)
+
+- **REL** - model relationships induced by nested lists
+- **REL-1** - allow nested includes to ref outer fields *and* included fields and ensure they are consistent (the same) in the final outputs
+- **REPO** - allow definitions to be imported and included from remote github repositories
+- **IMPORT** - allow imports from pre-existing files and database connections
+- **CONVENIENCE (CNV-1)** - field and excluded (field) wildcards on includes to default define fields from includes as refs
+- **COMPARISONS (CMP-1)** - comparison with synth library
+- **CMP-2** - comparison with Synthetic Data Vault (SDV) (python library)
+- **EX-1** an insurance dataset example
+- **DATA-QUALITY (DQ)** - final execution stage post-processing the generated output to fake data quality issues-  default field values, corruptions, null fields, typos, inconsistent id keys, formatting errors etc.

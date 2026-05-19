@@ -28,8 +28,8 @@ pub struct PrefillSource {
 #[derive(Debug)]
 pub enum ExecutionStep {
     /// Generate one dataset, optionally pre-filling ref columns from already-computed batches.
-    /// When `skip_emit` is true the dataset has rich list fields: the scalar batch is stored
-    /// in `computed` for `GenerateInnerFlat` to read, and `AssembleRichList` does the emit.
+    /// When `skip_emit` is true the dataset has nested include fields: the scalar batch is stored
+    /// in `computed` for `GenerateInnerFlat` to read, and `AssembleNestedInclude` does the emit.
     GenerateDataset {
         path: PathBuf,
         dataset: Arc<SyntheticDataset>,
@@ -38,8 +38,8 @@ pub enum ExecutionStep {
         skip_emit: bool,
     },
     /// Generate a segmented parent and fan row segments out to siblings.
-    /// When `skip_parent_emit` is true the parent has rich list fields: expressions and emit
-    /// are deferred to `AssembleRichList`; only the shuffled scalar batch is stored in
+    /// When `skip_parent_emit` is true the parent has nested include fields: expressions and emit
+    /// are deferred to `AssembleNestedInclude`; only the shuffled scalar batch is stored in
     /// `computed`.
     GenerateSiblingGroup {
         parent_path: PathBuf,
@@ -48,7 +48,7 @@ pub enum ExecutionStep {
         siblings: Vec<Sibling>,
         skip_parent_emit: bool,
     },
-    /// Generate the flat intermediate for one rich list field.
+    /// Generate the flat intermediate for one nested include field.
     ///
     /// Produces a RecordBatch stored in `computed[flat_key]` with:
     ///   - `_outer_idx: UInt32` — which outer row this item belongs to
@@ -64,12 +64,12 @@ pub enum ExecutionStep {
         include_path: PathBuf,
         include_distribution: Option<f64>,
     },
-    /// Assemble rich list columns into the outer batch and emit.
+    /// Assemble nested include columns into the outer batch and emit.
     ///
     /// Reads the scalar outer batch and each inner-flat from `computed`, builds one
     /// `ListArray` per spec, appends them to the outer batch, evaluates expressions,
     /// filters hidden columns, and writes output.
-    AssembleRichList {
+    AssembleNestedInclude {
         outer_path: PathBuf,
         dataset: Arc<SyntheticDataset>,
         flat_specs: Vec<(String, PathBuf)>,
@@ -227,7 +227,7 @@ pub fn build_plan(
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
-                    push_with_rich_list(&mut steps, &concrete, &virtual_path, |rich| {
+                    push_with_nested_include(&mut steps, &concrete, &virtual_path, |rich| {
                         ExecutionStep::GenerateSiblingGroup {
                             parent_path: vpath,
                             parent: c,
@@ -240,7 +240,7 @@ pub fn build_plan(
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
-                    push_with_rich_list(&mut steps, &concrete, &virtual_path, |rich| {
+                    push_with_nested_include(&mut steps, &concrete, &virtual_path, |rich| {
                         ExecutionStep::GenerateDataset {
                             path: vpath,
                             dataset: c,
@@ -263,7 +263,7 @@ pub fn build_plan(
             let p = path.clone();
             let d = Arc::new(dataset.clone());
             let sibs = siblings.clone();
-            push_with_rich_list(&mut steps, dataset, path, |rich| {
+            push_with_nested_include(&mut steps, dataset, path, |rich| {
                 ExecutionStep::GenerateSiblingGroup {
                     parent_path: p,
                     parent: d,
@@ -280,7 +280,7 @@ pub fn build_plan(
         let d = Arc::new(dataset.clone());
         let prefills = compute_prefills(path, datasets, &sibling_set);
         let rows = row_counts[path];
-        push_with_rich_list(&mut steps, dataset, path, |rich| {
+        push_with_nested_include(&mut steps, dataset, path, |rich| {
             ExecutionStep::GenerateDataset {
                 path: p,
                 dataset: d,
@@ -302,23 +302,23 @@ fn inner_flat_key(outer_path: &Path, field_name: &str) -> PathBuf {
     internal_path(outer_path, &format!("{field_name}___flat"))
 }
 
-/// Push a step plus any follow-on rich list steps if `dataset` has rich list fields.
-/// The `skip` flag on the step is set to `true` when rich list steps are needed so that
-/// expression evaluation and emit are deferred to `AssembleRichList`.
-fn push_with_rich_list(
+/// Push a step plus any follow-on nested include steps if `dataset` has nested include fields.
+/// The `skip` flag on the step is set to `true` when nested include steps are needed so that
+/// expression evaluation and emit are deferred to `AssembleNestedInclude`.
+fn push_with_nested_include(
     steps: &mut Vec<ExecutionStep>,
     dataset: &SyntheticDataset,
     path: &Path,
     make_step: impl FnOnce(bool) -> ExecutionStep,
 ) {
-    let rich = dataset.data.iter().any(|f| f.is_rich_list());
+    let rich = dataset.data.iter().any(|f| f.is_nested_include());
     steps.push(make_step(rich));
     if rich {
-        emit_rich_list_steps(dataset, path, steps);
+        emit_nested_include_steps(dataset, path, steps);
     }
 }
 
-fn emit_rich_list_steps(
+fn emit_nested_include_steps(
     dataset: &SyntheticDataset,
     path: &Path,
     steps: &mut Vec<ExecutionStep>,
@@ -345,7 +345,7 @@ fn emit_rich_list_steps(
         flat_specs.push((field.name.clone(), flat_key));
     }
     if !flat_specs.is_empty() {
-        steps.push(ExecutionStep::AssembleRichList {
+        steps.push(ExecutionStep::AssembleNestedInclude {
             outer_path: path.to_path_buf(),
             dataset: Arc::new(dataset.clone()),
             flat_specs,
@@ -421,7 +421,7 @@ fn build_sibling_groups(
                 is_pool: false,
             });
         }
-        // Pool siblings: rich-list fields whose content includes another dataset with a
+        // Pool siblings: nested-include fields whose content includes another dataset with a
         // distribution. The pool represents the subset of the included dataset eligible
         // for list sampling. Its constraints (from list content ref fields) are applied
         // to the parent's generation rather than producing standalone rows.

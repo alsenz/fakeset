@@ -12,7 +12,7 @@ fn test_basic_valid_dag() {
 
 #[test]
 fn test_list_content_include_orders_provider_before_consumer() {
-    // events.yaml has a rich list field whose content includes people.yaml.
+    // events.yaml has a nested include field whose content includes people.yaml.
     // The DAG must add a data-dependency edge that makes people a predecessor of events,
     // so the topo sort visits people before events.
     let paths = vec![PathBuf::from("tests/fixtures/execute/rich_list")];

@@ -157,33 +157,33 @@ fn hidden_ref_field_wired_as_prefill() {
 }
 
 // ---------------------------------------------------------------------------
-// Rich list plan decomposition
+// Nested include plan decomposition
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rich_list_dataset_decomposes_into_inner_flat_and_assemble() {
-    // events has a rich list field (attendees), people does not.
+fn nested_include_dataset_decomposes_into_inner_flat_and_assemble() {
+    // events has a nested include field (attendees), people does not.
     // Because events includes people with a distribution (pool sibling), people gets
     // a GenerateSiblingGroup step (pool-rows-first ordering for GenerateInnerFlat).
     // Expected steps: GenerateSiblingGroup(people, skip_parent_emit=false),
     //                 GenerateDataset(events, skip_emit=true),
     //                 GenerateInnerFlat(attendees),
-    //                 AssembleRichList(events)
+    //                 AssembleNestedInclude(events)
     let steps = plan_for("tests/fixtures/execute/rich_list");
 
-    // people: no rich list → must not be skip-emitted (GenerateDataset or GenerateSiblingGroup)
+    // people: no nested include → must not be skip-emitted (GenerateDataset or GenerateSiblingGroup)
     let people_not_skipped = steps.iter().any(|s| match s {
         ExecutionStep::GenerateDataset { dataset, skip_emit: false, .. } => dataset.name == "people",
         ExecutionStep::GenerateSiblingGroup { parent, skip_parent_emit: false, .. } => parent.name == "people",
         _ => false,
     });
-    assert!(people_not_skipped, "people has no rich list, must have a non-skipped generation step");
+    assert!(people_not_skipped, "people has no nested include, must have a non-skipped generation step");
 
-    // events: has rich list → skip_emit must be true
+    // events: has nested include → skip_emit must be true
     let events_step = find_step!(steps, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "events");
     assert!(
         matches!(events_step, Some(ExecutionStep::GenerateDataset { skip_emit: true, .. })),
-        "events has a rich list field, skip_emit must be true"
+        "events has a nested include field, skip_emit must be true"
     );
 
     // GenerateInnerFlat for attendees must be present
@@ -192,32 +192,32 @@ fn rich_list_dataset_decomposes_into_inner_flat_and_assemble() {
         "expected GenerateInnerFlat step for 'attendees'"
     );
 
-    // AssembleRichList for events must be present
+    // AssembleNestedInclude for events must be present
     assert!(
-        find_step!(steps, ExecutionStep::AssembleRichList { dataset, .. } if dataset.name == "events").is_some(),
-        "expected AssembleRichList step for 'events'"
+        find_step!(steps, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "events").is_some(),
+        "expected AssembleNestedInclude step for 'events'"
     );
 
-    // GenerateInnerFlat must come immediately before AssembleRichList
+    // GenerateInnerFlat must come before AssembleNestedInclude
     let flat_pos = steps.iter().position(|s| {
         matches!(s, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "attendees")
     }).expect("GenerateInnerFlat not found");
     let assemble_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::AssembleRichList { dataset, .. } if dataset.name == "events")
-    }).expect("AssembleRichList not found");
+        matches!(s, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "events")
+    }).expect("AssembleNestedInclude not found");
     assert!(
         flat_pos < assemble_pos,
-        "GenerateInnerFlat must precede AssembleRichList (flat={flat_pos}, assemble={assemble_pos})"
+        "GenerateInnerFlat must precede AssembleNestedInclude (flat={flat_pos}, assemble={assemble_pos})"
     );
 }
 
 #[test]
-fn bernoulli_rich_list_parent_has_skip_parent_emit() {
+fn bernoulli_nested_include_parent_has_skip_parent_emit() {
     // events is both a Bernoulli parent (vip is its sibling at dist:0.5) and has
-    // a rich list field (picks). It must produce:
+    // a nested include field (picks). It must produce:
     //   GenerateSiblingGroup(events, skip_parent_emit=true)
     //   GenerateInnerFlat(picks)
-    //   AssembleRichList(events)
+    //   AssembleNestedInclude(events)
     let steps = plan_for("tests/fixtures/execute/bernoulli_rich_list");
 
     let group_step = find_step!(
@@ -225,7 +225,7 @@ fn bernoulli_rich_list_parent_has_skip_parent_emit() {
     );
     assert!(
         matches!(group_step, Some(ExecutionStep::GenerateSiblingGroup { skip_parent_emit: true, .. })),
-        "events has a rich list field, skip_parent_emit must be true"
+        "events has a nested include field, skip_parent_emit must be true"
     );
 
     assert!(
@@ -233,8 +233,8 @@ fn bernoulli_rich_list_parent_has_skip_parent_emit() {
         "expected GenerateInnerFlat for 'picks'"
     );
     assert!(
-        find_step!(steps, ExecutionStep::AssembleRichList { dataset, .. } if dataset.name == "events").is_some(),
-        "expected AssembleRichList for 'events'"
+        find_step!(steps, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "events").is_some(),
+        "expected AssembleNestedInclude for 'events'"
     );
 
     // GenerateSiblingGroup must come before GenerateInnerFlat

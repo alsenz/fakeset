@@ -6,7 +6,7 @@ use crate::models::{Field, FieldType, ParquetDatatype, Schema};
 pub fn schema_to_arrow(schema: &Schema) -> arrow::datatypes::Schema {
     arrow::datatypes::Schema::new(
         schema.iter()
-            .filter(|f| f.expression.is_none() && !f.is_rich_list())
+            .filter(|f| f.expression.is_none() && !f.is_nested_include())
             .map(field_to_arrow)
             .collect::<Vec<_>>(),
     )

@@ -372,7 +372,7 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn is_rich_list(&self) -> bool {
+    pub fn is_nested_include(&self) -> bool {
         self.content.as_deref().is_some_and(|c| !c.includes.is_empty())
     }
 }
@@ -423,17 +423,17 @@ pub(crate) fn resolve_include(dataset_path: &Path, file: &str) -> Option<PathBuf
 
 /// Element spec for a `list` type field: a [`Field`] plus an optional set of includes.
 ///
-/// When `includes` is non-empty this is a **rich list**: each list item is a struct whose
+/// When `includes` is non-empty this is a **nested include**: each list item is a struct whose
 /// fields may be sourced from an included dataset (include-scoped ref: `ref: include_ref.field`)
 /// or from the enclosing outer row (outer-scoped ref: `ref: field`). Include-scoped field names
-/// live under `fields:`; the rich-list pipeline (GenerateInnerFlat / AssembleRichList) handles
-/// generation and assembly.
+/// live under `fields:`; the nested-include pipeline (GenerateInnerFlat / AssembleNestedInclude)
+/// handles generation and assembly.
 ///
 /// When `includes` is empty this is a **simple list**: items are generated directly from the
 /// `item` field spec, exactly as a plain field would be.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListContent {
-    /// When non-empty, marks this as a rich list. Each entry names a dataset
+    /// When non-empty, marks this as a nested include. Each entry names a dataset
     /// whose rows supply values for include-scoped ref fields (`ref: include_ref.field`).
     /// Set `distribution` on an include to narrow the sampled subset.
     #[serde(default)]
