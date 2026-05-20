@@ -33,9 +33,9 @@ These terms have precise meanings in this codebase — use them consistently.
 | **subsequent** (subsequent-by-execution) | Generated after. Parents are always subsequent. |
 | **sibling group** | A parent together with all its siblings; planned as a unit via segmentation. |
 | **segment** | One subset of a parent's rows that belongs to a particular combination of siblings. |
-| **pool sibling** | A sibling arising from a nested-include `content: {includes: [...]}` field — contributes constraints to the parent's segments but produces no standalone output file. |
+| **pool sibling** | A sibling arising from a nested-include `content: {include: {...}}` field — contributes constraints to the parent's segments but produces no standalone output file. |
 | **nested include** | A `list` field whose items are structs drawn from an included dataset (as opposed to a simple scalar list). |
-| **inner flat** | The intermediate flat `RecordBatch` (with `_outer_idx`) produced for one nested include field before assembly into `ListArray` columns. |
+| **inner flat** | The intermediate flat `RecordBatch` (with `_slot_idx`) produced for one nested include field before assembly into `ListArray` columns. |
 | **prefill** | A column pre-populated from an already-computed child batch into the parent's batch, wiring up ref fields so they are never regenerated. |
 
 ## Core architectural tenet
@@ -48,7 +48,7 @@ When a parent field matches a child's field (by ref-wiring or same name), the ch
 
 ## Sibling segmentation
 
-When two or more siblings each declare a `distribution` on a common parent, their rows must be partitioned consistently. This is the exponential-explosion problem: N siblings → 2^N possible membership subsets.
+When two or more datasets include the same parent they become siblings and their rows must be partitioned consistently. All siblings participate — including those with `ratio: 1.0` (every parent row) — because their field constraints must enter conflict pruning jointly. This is the exponential-explosion problem: N siblings → 2^N possible membership subsets.
 
 `segment.rs::plan_segments` controls the explosion with three steps:
 
@@ -87,7 +87,7 @@ load YAML files
 | Module | Responsibility |
 |--------|---------------|
 | `lib.rs` | Public API: `load_all_datasets`, YAML discovery |
-| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, `for_each_content_include` |
+| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Couple`, `ContentInclude`, `Schema`, …). Also `resolve_ratios`, `for_each_content_include` |
 | `graph.rs` | `build_dag` — petgraph DAG construction and topo-sort |
 | `validate.rs` | Schema validation: structural rules, ref checks, expression ordering |
 | `expand_variants.rs` | Expand `type: variant` fields into concrete global `variants:` entries |
@@ -120,14 +120,27 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 - **Doc comments welcome** — `///` comments documenting public functions, structs, and fields are encouraged. Inline comments should only explain non-obvious *why* (hidden constraints, invariants, workarounds) — not *what* the code does, which well-named identifiers already convey.
 - **No `sql_safe_name`** — DataFusion column names are double-quoted in SQL strings (`"field_name"`), so arbitrary field names are safe without sanitisation.
 - **`_row_idx` sentinel** — a `UInt32` 0..n column prepended to batches for positional JOIN keying inside `grow_parent_from_children`; stripped from all outputs.
-- **Pool rows come first** — when a parent has pool siblings, their rows occupy the leading positions in the combined batch so `GenerateInnerFlat`'s `pool_size` index correctly identifies eligible rows.
+- **`_slot_idx` sentinel** *(MULT-1 addition; renames `_outer_idx`)* — a `UInt32` driver-parent slot index present in all child/inner-flat batches. In nested include lists: which outer row each item belongs to (used by `AssembleNestedInclude`). In top-level cardinality: which parent-row slot each multiplied child row belongs to. Both are the same concept — unified in MULT-1. Retained in `computed` for grandchild access; stripped from emitted output by `filter_hidden_columns`.
+- **`_pool_idx` sentinel** *(MULT-1 addition)* — a `UInt32` column in inner flat batches recording which pool row was sampled (index into the eligible pool slice). Persisted in MULT-1 for MULT-2's collect-to-pool mechanism.
+- **Pool rows come first** — when a parent has pool siblings, their rows occupy the leading positions in the combined batch so `GenerateInnerFlat`'s `pool_size` index correctly identifies eligible rows. This positional convention applies only to the current non-collect path; MULT-2's collect path uses an explicit pool batch parameter instead.
 
 ## Known flaky test
 
 `segment::tests::conflicting_constants_zeroed_and_redistributed` — Bernoulli rounding in `plan_segments` is stochastic; when run in parallel with the full suite it occasionally hits a rounding edge that produces 101 rows instead of 100. Passes reliably in isolation (`cargo test conflicting_constants`). Pre-existing; not introduced by recent changes.
 
-## Planned next steps (from memory)
+## Feature specs
 
+Full design specs and implementation plans live in `specs/`:
+
+| File | Status |
+|------|--------|
+| `specs/MULT-1.md` | Specced + implementation plan ready — **implement next** |
+| `specs/MULT-2.md` | Specced + high-level implementation plan |
+| `specs/MULT-3.md` | Specced (no implementation plan yet) |
+
+## Planned next steps
+
+- **MULT-1** — include cardinality (`includes:` → `include:`, `distribution` → `ratio`, `count`/`multiplicity` → `cardinality` on `content.include`; `_outer_idx` → `_slot_idx` unification; `_pool_idx` in inner flat; top-level slot expansion). Full staged plan in `specs/MULT-1.md`.
 - **DF5** — make `execute_inner_flat` async; use DataFusion to shuffle and limit the pool batch before Arrow-based with-replacement sampling.
 - **DF4** — write output via DataFusion `DataSink`; needs care around single-file vs partitioned output.
 - **T1** — unit tests for `generate_column` per field type.
@@ -135,12 +148,13 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 
 ## Future work (needs planning)
 
-- **REL** - model relationships induced by nested lists
-- **REL-1** - allow nested includes to ref outer fields *and* included fields and ensure they are consistent (the same) in the final outputs
-- **REPO** - allow definitions to be imported and included from remote github repositories
-- **IMPORT** - allow imports from pre-existing files and database connections
-- **CONVENIENCE (CNV-1)** - field and excluded (field) wildcards on includes to default define fields from includes as refs
-- **COMPARISONS (CMP-1)** - comparison with synth library
-- **CMP-2** - comparison with Synthetic Data Vault (SDV) (python library)
-- **EX-1** an insurance dataset example
-- **DATA-QUALITY (DQ)** - final execution stage post-processing the generated output to fake data quality issues-  default field values, corruptions, null fields, typos, inconsistent id keys, formatting errors etc.
+- **MULT-2** — cross-include reducers, collect-to-pool, `_slot_idx` hierarchy propagation. High-level plan in `specs/MULT-2.md`; detailed stages deferred until MULT-1 is merged.
+- **MULT-3** — include convenience helpers (`fields` wildcard, `project_field`, `hidden`). Spec in `specs/MULT-3.md`.
+- **REL** — model relationships induced by nested lists
+- **REPO** — allow definitions to be imported and included from remote GitHub repositories
+- **IMPORT** — allow imports from pre-existing files and database connections
+- **CNV-1** — field and excluded (field) wildcards on includes to default-define fields from includes as refs
+- **CMP-1** — comparison with synth library
+- **CMP-2** — comparison with Synthetic Data Vault (SDV) (python library)
+- **EX-1** — an insurance dataset example
+- **DQ** — data quality: final execution stage post-processing the generated output to introduce realistic data quality issues (null fields, typos, inconsistent ID keys, formatting errors, etc.). Row duplication (data-entry clones) is expressed separately via a top-level `quality: {inflation: 0.05}` stanza, not via include machinery — this keeps the include model semantically clean.

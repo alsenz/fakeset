@@ -6,8 +6,8 @@ Loosely inspired by [synth](https://github.com/getsynth/synth).
 ## Overview
 
 You describe your datasets as YAML files.  Each file declares a name, an output
-format, a schema (the shape of the rows), and optionally a list of *includes* —
-other dataset files that this one depends on.  `fakeset` resolves the includes
+format, a schema (the shape of the rows), and optionally an *include* —
+another dataset file that this one depends on.  `fakeset` resolves the includes
 into a directed acyclic graph (DAG), validates it for cycles, and then executes
 the plan in dependency order using [Apache DataFusion](https://datafusion.apache.org).
 
@@ -35,22 +35,23 @@ rows — so consistency across all outputs is guaranteed by construction rather
 than enforced after the fact.
 
 **Example — insurance fraud:**
-- `fraudulent_policies.yaml` *includes* `policies.yaml` at a 5% distribution.
+- `fraudulent_policies.yaml` *includes* `policies.yaml` at a 5% ratio.
   It is a child: more constrained — policies that open and close very quickly (a
   known fraud signal).  It is generated first (preceding).
 - `policies.yaml` is the parent: the broader, less constrained population.  Its
   output naturally contains the correctly proportioned fraudulent cohort because
   the constraints were solved at the child level first (subsequent).
 
-When writing definition files, think of `includes` as constraint specialisation:
+When writing definition files, think of `include` as constraint specialisation:
 "I am a more constrained subset of my parent's population."
 
 ### Sibling segmentation
 
-When two or more datasets include the same parent and each declares a
-`distribution`, they become *siblings* of that parent.  The executor uses
-**sibling segmentation** to partition the parent's rows: each sibling gets a
-segment whose size matches its declared marginal membership probability.
+When two or more datasets include the same parent they become *siblings* of
+that parent.  The executor uses **sibling segmentation** to partition the
+parent's rows: each sibling gets a segment whose size matches its declared
+marginal `ratio`.  All siblings participate — even those with `ratio: 1.0`,
+whose field constraints must enter conflict pruning jointly with their siblings'.
 
 Under the hood, `fakeset` starts from a product-independence prior (each
 sibling's membership is an independent Bernoulli trial), then applies
@@ -59,16 +60,24 @@ This makes sibling segmentation correct for both independent-overlap cases
 (e.g. two optional flags) and mutually exclusive categorical cases (e.g.
 small/medium/large company tiers whose fractions sum to 1).
 
-```
-distribution: 0.05   # on top-level includes: marginal row-membership probability
-distribution: 0.5    # on content includes:   fraction of the include pool to sample from
+```yaml
+include:
+  file: customers.yaml
+  ratio: 0.05   # marginal row-membership probability (Bernoulli)
 ```
 
-Both forms drive the same IPF-based segmentation, sizing the sibling's share
-of the parent population.  The distinction is in what the segment contributes:
-a top-level sibling writes its rows as a standalone output file; a content pool
-sibling places qualifying rows at the front of the parent batch for list-item
-sampling but produces no output file of its own.
+```yaml
+content:
+  include:
+    file: events.yaml
+    ratio: 0.5       # fraction of the include pool eligible for sampling
+    cardinality: {min: 1, max: 4}   # items drawn per outer row
+```
+
+The distinction is in what the segment contributes: a top-level sibling writes
+its rows as a standalone output file; a `content.include` pool sibling places
+qualifying rows at the front of the parent batch for list-item sampling but
+produces no output file of its own.
 
 ## YAML schema
 
@@ -76,12 +85,12 @@ sampling but produces no output file of its own.
 name: policies           # table name; also used as the output filename
 format: parquet          # parquet | csv | json | jsonl
 output_file: policies    # override output filename (default: name)
-rows: 1000               # explicit row count — omit when using distribution (mutually exclusive)
+rows: 1000               # explicit row count — omit when using ratio (mutually exclusive)
 
-includes:                # datasets this file depends on
-  - file: customers.yaml # path relative to this file
-    ref: customers       # name used to reference fields inside this dataset
-    distribution: 0.3    # fraction of parent rows; implies row count — omit rows above
+include:                 # parent dataset this file is a constrained subset of
+  file: customers.yaml   # path relative to this file
+  ref: customers         # name used to reference fields inside this dataset
+  ratio: 0.3             # fraction of parent rows in this child; implies row count
 
 data:                    # flat list of field definitions
   - name: id
@@ -108,17 +117,17 @@ data:                    # flat list of field definitions
       generator: word
   - name: events          # nested include — items are structs drawn from an included dataset
     type: list
-    count: {min: 0, max: 3}
     content:
-      includes:
-        - file: events.yaml
-          ref: event
-          distribution: 0.5   # fraction of event rows eligible for sampling
-      fields:                 # struct fields for each list item
+      include:
+        file: events.yaml
+        ref: event
+        ratio: 0.5                  # fraction of event rows eligible for sampling
+        cardinality: {min: 0, max: 3}   # items drawn per outer row
+      fields:                       # struct fields for each list item
         - name: event_id
-          ref: event.id       # sourced from the included dataset
+          refs: event.id            # sourced from the included dataset
         - name: label
-          type: string        # generated fresh per item
+          type: string              # generated fresh per item
 ```
 
 Supported field types: `number`, `boolean`, `string`, `object`, `list`, `date`, `date_time`, `variant`.
