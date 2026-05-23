@@ -1,0 +1,9 @@
+name: derived
+format: csv
+include:
+  file: source.yaml
+  ref: source
+  ratio: 1.0
+  exclude:
+    - id
+data: []

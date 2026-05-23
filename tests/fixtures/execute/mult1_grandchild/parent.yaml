@@ -1,0 +1,10 @@
+name: parent
+format: csv
+output_file: parent
+include:
+  file: grandparent.yaml
+  ref: gp
+  cardinality: 3
+data:
+  - name: gp_id
+    ref: gp.id

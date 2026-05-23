@@ -1,0 +1,6 @@
+name: base
+format: parquet
+rows: 100
+data:
+  - name: val
+    type: number

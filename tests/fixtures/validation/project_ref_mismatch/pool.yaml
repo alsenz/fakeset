@@ -1,0 +1,7 @@
+name: pool
+format: csv
+rows: 5
+data:
+  - name: label
+    type: string
+    generator: word

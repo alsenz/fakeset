@@ -9,7 +9,7 @@ A declarative, DAG-structured synthetic dataset generator. Users write YAML sche
 ```bash
 cargo build                  # debug
 cargo build --release        # release binary → target/release/fakeset
-cargo test                   # all unit + integration tests (~142 tests)
+cargo test                   # all unit + integration tests (~173 tests)
 cargo check                  # fast type-check without linking
 ```
 
@@ -33,18 +33,28 @@ These terms have precise meanings in this codebase — use them consistently.
 | **subsequent** (subsequent-by-execution) | Generated after. Parents are always subsequent. |
 | **sibling group** | A parent together with all its siblings; planned as a unit via segmentation. |
 | **segment** | One subset of a parent's rows that belongs to a particular combination of siblings. |
-| **pool sibling** | A sibling arising from a nested-include `content: {include: {...}}` field — contributes constraints to the parent's segments but produces no standalone output file. |
+| **pool sibling** | A sibling arising from a nested-include `content: {group: <ref>}` field — contributes constraints to the parent's segments but produces no standalone output file. |
 | **nested include** | A `list` field whose items are structs drawn from an included dataset (as opposed to a simple scalar list). |
-| **inner flat** | The intermediate flat `RecordBatch` (with `_slot_idx`) produced for one nested include field before assembly into `ListArray` columns. |
+| **inner flat** | The intermediate flat `RecordBatch` (with `_slot_idx` and `_pool_idx`) produced for one nested include field before assembly into `ListArray` columns. Each row is one **atom**. |
+| **atom** | One joint (outer-slot, pool-slot) pairing in an inner flat batch. Atoms are the most-constrained nodes in the lattice; they are fully generated before either the outer or the pool dataset is assembled. |
+| **pool slot** | One row in the pre-solved pool-slot batch (`pool_slots` in `computed`). Pool pre-generation materialises pushed-down constraint solutions — one row per eligible pool slot — so that atom generation can draw consistent pool-scoped values without regenerating them per atom. |
 | **prefill** | A column pre-populated from an already-computed child batch into the parent's batch, wiring up ref fields so they are never regenerated. |
 
 ## Core architectural tenet
 
-**Children are generated first; parents are expanded from them.**
+**Children by inclusion AND by linking are always executed first; parents and pool datasets are assembled from them.**
 
-An `include` is a *constraint specialisation*, not a data dependency. A child is a more-constrained subset of its parent's population. The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so the deepest leaves (most constrained) are always generated before their parents. Each parent's rows are then assembled from those already-solved child rows — inheriting constrained columns directly and generating fresh values for the rest — so consistency is guaranteed by construction, not enforced after the fact.
+An `include` is a *constraint specialisation*, not a data dependency. A child is a more-constrained subset of its parent's population. A `link` introduces a pool partner — a dataset sampled per atom row — which is also more constrained than the junction or outer dataset that draws from it. In both cases the tenet holds: all child/linked datasets are fully generated before the outer or parent dataset is assembled from their rows.
 
-When a parent field matches a child's field (by ref-wiring or same name), the child's column is inherited directly. Fields with no child source are generated fresh. This logic lives in `executor.rs::grow_parent_from_children`, which expresses it as a DataFusion LEFT JOIN on `_row_idx`.
+The datasets form a **lattice of joint atoms**. The algorithm has two symmetric phases:
+
+1. **Push down** — field definitions, type constraints, and ref bindings propagate *down* the lattice toward the most-constrained leaf nodes (atoms). Pool pre-generation materialises pushed-down pool-slot constraint solutions — one pre-solved row per eligible pool slot — so that atoms can draw consistent pool-scoped values without regenerating them per atom. This is not executing the pool dataset; it is pre-solving the constraints that atoms inherit from it.
+
+2. **Accumulate up** — generated atom values propagate *up* the lattice toward parents and pool nodes. For include relationships this is `grow_parent_from_children` (DataFusion LEFT JOIN on `_row_idx`). For collect bindings (MULT-2) this is `CollectToPool` — the symmetric operation that accumulates atom-level values back into pool-node fields.
+
+The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so the deepest leaves (most constrained) are always generated before their parents. When a parent field matches a child's field (by ref-wiring or same name), the child's column is inherited directly; fields with no child source are generated fresh. This logic lives in `executor.rs::grow_parent_from_children`.
+
+*Theoretical note:* all generator invocations could conceptually happen in parallel — the algorithm's serialisation is purely a scheduling constraint imposed by the prefill lattice. The interesting work is resolving which pre-solved values propagate to which nodes and in what order.
 
 ## Sibling segmentation
 
@@ -65,13 +75,13 @@ Each run follows this fixed sequence:
 ```
 load YAML files
   → build_dag          (petgraph DAG, topo-sort, cycle detection)
-  → pull_down_expression_deps  (inject hidden ref fields for expression variables declared only in an included parent)
+  → pull_down_expression_deps  (push hidden ref fields DOWN the lattice: inject expression deps declared only in an included parent)
   → validate           (structural checks, ref validity, constraint consistency)
   → expand_field_variants      (variant fields → concrete global variants)
-  → resolve_refs       (copy field_type/schema from ref targets; merge constraints)
+  → resolve_refs       (push field types and merged constraints DOWN the lattice to child/ref targets)
   → apply_global_locales       (stamp locale onto locale-aware fields)
-  → build_plan         (resolve row counts, sibling groups, prefill wiring → ExecutionPlan)
-  → execute            (interpret steps in order, write output files)
+  → build_plan         (resolve row counts, sibling groups, prefill wiring, collect targets → ExecutionPlan)
+  → execute            (generate atoms leaf-first; accumulate values UP the lattice; write output files)
 ```
 
 `build_plan` produces a flat list of `ExecutionStep` variants:
@@ -87,7 +97,7 @@ load YAML files
 | Module | Responsibility |
 |--------|---------------|
 | `lib.rs` | Public API: `load_all_datasets`, YAML discovery |
-| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Couple`, `ContentInclude`, `Schema`, …). Also `resolve_ratios`, `for_each_content_include` |
+| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, the nested-include visitor, and lattice-traversal helpers |
 | `graph.rs` | `build_dag` — petgraph DAG construction and topo-sort |
 | `validate.rs` | Schema validation: structural rules, ref checks, expression ordering |
 | `expand_variants.rs` | Expand `type: variant` fields into concrete global `variants:` entries |
@@ -122,7 +132,7 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 - **`_row_idx` sentinel** — a `UInt32` 0..n column prepended to batches for positional JOIN keying inside `grow_parent_from_children`; stripped from all outputs.
 - **`_slot_idx` sentinel** *(MULT-1 addition; renames `_outer_idx`)* — a `UInt32` driver-parent slot index present in all child/inner-flat batches. In nested include lists: which outer row each item belongs to (used by `AssembleNestedInclude`). In top-level cardinality: which parent-row slot each multiplied child row belongs to. Both are the same concept — unified in MULT-1. Retained in `computed` for grandchild access; stripped from emitted output by `filter_hidden_columns`.
 - **`_pool_idx` sentinel** *(MULT-1 addition)* — a `UInt32` column in inner flat batches recording which pool row was sampled (index into the eligible pool slice). Persisted in MULT-1 for MULT-2's collect-to-pool mechanism.
-- **Pool rows come first** — when a parent has pool siblings, their rows occupy the leading positions in the combined batch so `GenerateInnerFlat`'s `pool_size` index correctly identifies eligible rows. This positional convention applies only to the current non-collect path; MULT-2's collect path uses an explicit pool batch parameter instead.
+- **Pool rows come first** — when a parent has pool siblings, their rows occupy the leading positions in the combined batch so `GenerateInnerFlat`'s `n_eligible_slots` boundary correctly identifies eligible pool slots. This positional convention applies only to the current non-collect path; MULT-2's collect path uses an explicit pool batch parameter instead.
 
 ## Known flaky test
 
@@ -134,22 +144,21 @@ Full design specs and implementation plans live in `specs/`:
 
 | File | Status |
 |------|--------|
-| `specs/MULT-1.md` | Specced + implementation plan ready — **implement next** |
-| `specs/MULT-2.md` | Specced + high-level implementation plan |
-| `specs/MULT-3.md` | Specced (no implementation plan yet) |
+| `specs/done/MULT-1.md` | **Complete** — implemented and merged |
+| `specs/done/MULT-2a.md` | **Complete** — implemented and merged |
+| `specs/done/MULT-2.md` | **Complete** — implemented and merged |
+| `specs/done/MULT-3.md` | **Complete** — implemented and merged |
+| `specs/REFRAME-1.md` | In-progress lattice reframing spec |
+| `specs/JOINT-REFRAME-1.md` | Forward-looking lattice-framing inspiration spec |
 
 ## Planned next steps
 
-- **MULT-1** — include cardinality (`includes:` → `include:`, `distribution` → `ratio`, `count`/`multiplicity` → `cardinality` on `content.include`; `_outer_idx` → `_slot_idx` unification; `_pool_idx` in inner flat; top-level slot expansion). Full staged plan in `specs/MULT-1.md`.
 - **DF5** — make `execute_inner_flat` async; use DataFusion to shuffle and limit the pool batch before Arrow-based with-replacement sampling.
 - **DF4** — write output via DataFusion `DataSink`; needs care around single-file vs partitioned output.
 - **T1** — unit tests for `generate_column` per field type.
 - **branch-and-bound segment enumeration** — replace the dense 2^N weight pass in `plan_segments` with an O(K·N) lattice traversal for large sibling groups.
 
 ## Future work (needs planning)
-
-- **MULT-2** — cross-include reducers, collect-to-pool, `_slot_idx` hierarchy propagation. High-level plan in `specs/MULT-2.md`; detailed stages deferred until MULT-1 is merged.
-- **MULT-3** — include convenience helpers (`fields` wildcard, `project_field`, `hidden`). Spec in `specs/MULT-3.md`.
 - **REL** — model relationships induced by nested lists
 - **REPO** — allow definitions to be imported and included from remote GitHub repositories
 - **IMPORT** — allow imports from pre-existing files and database connections

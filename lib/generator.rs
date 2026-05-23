@@ -150,7 +150,7 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
                     let child_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
                     Arc::new(ListArray::new(child_field, offsets, child, None))
                 }
-                Some(c) if c.includes.is_empty() => {
+                Some(c) if c.group.is_none() => {
                     let count_spec = field.count.as_ref().cloned().unwrap_or(CountSpec::Fixed(1));
                     let counts: Vec<usize> = (0..n).map(|_| sample_count(&count_spec)).collect();
                     let total: usize = counts.iter().sum();

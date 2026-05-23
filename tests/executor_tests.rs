@@ -1,7 +1,9 @@
 use fakeset::{
     executor::execute, expand_variants::expand_field_variants,
     expressions::pull_down_expression_deps, graph::build_dag,
-    load_all_datasets, plan::build_plan, rewrite::resolve_refs, validate::validate,
+    load_all_datasets, plan::build_plan,
+    rewrite::{expand_include_fields, resolve_refs},
+    validate::validate,
 };
 use std::path::{Path, PathBuf};
 
@@ -24,6 +26,7 @@ async fn run(fixture: &str) -> PathBuf {
         eprintln!("warn: {w}");
     }
     let datasets = expand_field_variants(datasets).expect("expand field variants");
+    let datasets = expand_include_fields(&datasets).expect("expand include fields");
     let resolved = resolve_refs(&datasets).expect("resolve refs");
     let plan = build_plan(&dag, &resolved, 16).expect("build plan");
     execute(&plan, &out).await.expect("execute");
@@ -408,7 +411,7 @@ async fn test_list_field_generates_arrays() {
 
 #[tokio::test]
 async fn test_bernoulli_nested_include_parent_assembles_correctly() {
-    let out = run("tests/fixtures/execute/bernoulli_rich_list").await;
+    let out = run("tests/fixtures/execute/bernoulli_link_content").await;
 
     assert_eq!(jsonl_rows(&out, "items").len(), 20, "items should have 20 rows");
 
@@ -448,7 +451,7 @@ async fn test_bernoulli_nested_include_parent_assembles_correctly() {
 
 #[tokio::test]
 async fn test_plain_fields_in_nested_include_content() {
-    let out = run("tests/fixtures/execute/rich_list_plain").await;
+    let out = run("tests/fixtures/execute/link_content_plain").await;
 
     let rows = jsonl_rows(&out, "records");
     assert_eq!(rows.len(), 5, "records should have 5 rows");
@@ -505,6 +508,10 @@ async fn test_count_normal_produces_variable_length_lists() {
 
     for row in &rows {
         let samples = row["samples"].as_array().expect("samples should be an array");
+        assert!(
+            !samples.is_empty(),
+            "_pool_idx sampling should produce at least one item per outer row"
+        );
         for s in samples {
             let val = s["val"].as_f64().expect("val should be a number");
             assert!(
@@ -521,7 +528,7 @@ async fn test_count_normal_produces_variable_length_lists() {
 
 #[tokio::test]
 async fn test_nested_include_refs() {
-    let out = run("tests/fixtures/execute/rich_list").await;
+    let out = run("tests/fixtures/execute/link_content").await;
     let event_rows = jsonl_rows(&out, "events");
 
     assert_eq!(event_rows.len(), 5, "events should have 5 rows");
@@ -600,4 +607,462 @@ async fn test_field_variants_produce_correct_row_count_and_combinations() {
     assert!(tiers.contains(&"gold".to_string()), "expected 'gold' tier");
     assert!(tiers.contains(&"silver".to_string()), "expected 'silver' tier");
     assert!(tiers.contains(&"bronze".to_string()), "expected 'bronze' tier");
+}
+
+// ---------------------------------------------------------------------------
+// MULT-1 top-level cardinality tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_mult1_fixed_row_count() {
+    // parent: 10 rows. child: cardinality: 2. Expected child rows: 10 × 2 = 20.
+    let out = run("tests/fixtures/execute/mult1_fixed").await;
+    assert_eq!(csv_rows(&out, "parent"), 10, "parent should have 10 rows");
+    assert_eq!(csv_rows(&out, "child"), 20, "child should have 10 × cardinality:2 = 20 rows");
+}
+
+#[tokio::test]
+async fn test_mult1_range_row_bounds() {
+    // parent: 10 rows. child: cardinality: {min: 1, max: 3}. Expected child rows: 10..=30.
+    let out = run("tests/fixtures/execute/mult1_range").await;
+    let rows = csv_rows(&out, "child");
+    assert!(
+        (10..=30).contains(&rows),
+        "child row count should be in [10, 30] for cardinality min:1 max:3 × 10 parent rows; got {rows}"
+    );
+}
+
+#[tokio::test]
+async fn test_mult1_ref_field_consistency() {
+    // child has label: value: "child" — a constant constraint that must apply to all
+    // M_n rows generated per slot, not just the canonical one.
+    let out = run("tests/fixtures/execute/mult1_fixed").await;
+    let labels = csv_column(&out, "child", "label");
+    assert_eq!(labels.len(), 20, "child should have 20 rows");
+    assert!(
+        labels.iter().all(|v| v == "child"),
+        "all 20 child rows should have label='child'; got: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_mult1_fresh_field_varies() {
+    // child has fresh: generator: word — independently generated for each of the 20 rows.
+    // With 20 random words it is overwhelmingly likely that at least 2 are distinct.
+    let out = run("tests/fixtures/execute/mult1_fixed").await;
+    let words = csv_column(&out, "child", "fresh");
+    assert_eq!(words.len(), 20, "child should have 20 rows");
+    let distinct: std::collections::HashSet<_> = words.iter().collect();
+    assert!(
+        distinct.len() > 1,
+        "fresh field should vary across expanded rows; got only: {distinct:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_mult1_combined_ratio_card() {
+    // parent: 10 rows. child: ratio: 0.5, cardinality: 2.
+    // Expected child rows: 10 × 0.5 × 2 = 10 (exact — ratio:0.5 selects 5 slots, each × 2).
+    let out = run("tests/fixtures/execute/mult1_ratio_card").await;
+    assert_eq!(csv_rows(&out, "child"), 10, "child should have 10 × 0.5 × cardinality:2 = 10 rows");
+}
+
+#[tokio::test]
+async fn test_mult1_grandchild_sees_full_batch() {
+    // grandparent: 5 rows. parent: cardinality: 3 → 15 rows. child: ratio: 1.0 → 15 rows.
+    // The grandchild (child) should see all 15 expanded parent rows, not just 5.
+    // Regression: when parent is parent_computed with cardinality, grandparent must still
+    // get its declared row count (5), not the parent's expanded count (15).
+    let out = run("tests/fixtures/execute/mult1_grandchild").await;
+    assert_eq!(csv_rows(&out, "grandparent"), 5, "grandparent should have 5 rows");
+    assert_eq!(csv_rows(&out, "parent"), 15, "parent should have 5 × cardinality:3 = 15 rows");
+    assert_eq!(csv_rows(&out, "child"), 15, "child should have 5 grandparent × cardinality:3 = 15 rows");
+}
+
+// ---------------------------------------------------------------------------
+// _slot_idx and _pool_idx sentinel tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_inner_flat_slot_idx() {
+    // link_content: events (5 rows) has an attendees list (1–4 items per row).
+    // Items are assembled from inner flat batches keyed by _slot_idx.
+    // The outer-scoped ref event_title must match the enclosing row's title,
+    // proving _slot_idx correctly assigns each item to its outer row.
+    let out = run("tests/fixtures/execute/link_content").await;
+    let rows = jsonl_rows(&out, "events");
+    assert_eq!(rows.len(), 5, "events should have 5 rows");
+    for row in &rows {
+        let title = row["title"].as_str().expect("title should be a string");
+        let attendees = row["attendees"].as_array().expect("attendees should be an array");
+        assert!(
+            (1..=4).contains(&attendees.len()),
+            "_slot_idx must produce 1–4 attendees per event; got {}",
+            attendees.len()
+        );
+        for a in attendees {
+            let at = a["event_title"].as_str().expect("event_title should be a string");
+            assert_eq!(
+                at, title,
+                "_slot_idx must assign this item to its enclosing event; event_title mismatch"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MULT-2 Stage 5 — Nested-include collect-to-pool (Case 2)
+//
+// wards_doctors: 3 wards, 5 doctors.
+// Each ward has an `on_call_doctors` list (cardinality 2) drawn from doctors via _pool_idx.
+// CollectToPool accumulates doctor_name into doctors.on_call_wards.
+// The total count of ward references across all doctors equals the total atom count
+// (3 wards × 2 atoms each = 6 atoms total).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_nested_include_collect_to_pool() {
+    let out = run("tests/fixtures/execute/wards_doctors").await;
+
+    let doctors = jsonl_rows(&out, "doctors");
+    assert_eq!(doctors.len(), 5, "doctors should have 5 rows");
+
+    // Every doctor must have an on_call_wards field that is a list.
+    for doc in &doctors {
+        let wards = doc["on_call_wards"].as_array()
+            .unwrap_or_else(|| panic!("doctors.on_call_wards should be a list; got: {doc}"));
+        for w in wards {
+            assert!(w.as_str().is_some(), "each on_call_wards entry should be a string; got: {w}");
+        }
+    }
+
+    // Total on_call_wards entries across all doctors equals total atoms (3 wards × 2 = 6).
+    let total_ward_refs: usize = doctors.iter()
+        .map(|d| d["on_call_wards"].as_array().map_or(0, |a| a.len()))
+        .sum();
+    assert_eq!(
+        total_ward_refs, 6,
+        "total on_call_wards entries should equal 3 wards × cardinality 2 = 6; got {total_ward_refs}"
+    );
+
+    let wards = jsonl_rows(&out, "wards");
+    assert_eq!(wards.len(), 3, "wards should have 3 rows");
+
+    for ward in &wards {
+        let docs = ward["on_call_doctors"].as_array()
+            .unwrap_or_else(|| panic!("wards.on_call_doctors should be a list; got: {ward}"));
+        assert_eq!(docs.len(), 2, "each ward should have exactly 2 on-call doctors (cardinality 2)");
+        for d in docs {
+            let name = d["doctor_name"].as_str()
+                .unwrap_or_else(|| panic!("on_call_doctors item should have doctor_name; got: {d}"));
+            assert!(!name.is_empty(), "doctor_name should be non-empty");
+        }
+    }
+
+    // Sentinels must not appear in output.
+    for ward in &wards {
+        assert!(ward.get("_slot_idx").is_none(), "_slot_idx must not appear in wards output");
+        assert!(ward.get("_pool_idx").is_none(), "_pool_idx must not appear in wards output");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MULT-2 Stage 7 — Scalar reducers (sum, max, min, take_first)
+//
+// scalar_reduce: scoreboard (3 rows), plays (9 rows, score: value: 5).
+// plays binds score → board.total/sum, board.high/max, board.low/min, board.first/take_first.
+//
+// With score always 5:
+//   - sum(all scoreboard.total) = 9 × 5 = 45  (conservation law)
+//   - each scoreboard.high ∈ {0, 5}  (0 = no plays assigned; 5 = at least one play)
+//   - each scoreboard.low ∈ {0, 5}   (same reasoning)
+//   - each scoreboard.first ∈ {0, 5} (same)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_scalar_reducers_sum_max_min_take_first() {
+    let out = run("tests/fixtures/execute/scalar_reduce").await;
+
+    let plays = jsonl_rows(&out, "plays");
+    assert_eq!(plays.len(), 9, "plays should have 9 rows");
+
+    let boards = jsonl_rows(&out, "scoreboard");
+    assert_eq!(boards.len(), 3, "scoreboard should have 3 rows");
+
+    // Conservation: sum of all totals equals 9 plays × score 5.
+    let grand_total: f64 = boards.iter()
+        .map(|b| b["total"].as_f64().expect("total should be a number"))
+        .sum();
+    assert!(
+        (grand_total - 45.0).abs() < 0.001,
+        "sum of all scoreboard.total should be 9 × 5 = 45; got {grand_total}"
+    );
+
+    for (i, board) in boards.iter().enumerate() {
+        let high = board["high"].as_f64().expect("high should be a number");
+        assert!(
+            high == 0.0 || high == 5.0,
+            "scoreboard[{i}].high should be 0 (no plays) or 5 (all plays score 5); got {high}"
+        );
+
+        let low = board["low"].as_f64().expect("low should be a number");
+        assert!(
+            low == 0.0 || low == 5.0,
+            "scoreboard[{i}].low should be 0 (no plays) or 5 (all plays score 5); got {low}"
+        );
+
+        let first = board["first"].as_f64().expect("first should be a number");
+        assert!(
+            first == 0.0 || first == 5.0,
+            "scoreboard[{i}].first should be 0 (no plays) or 5 (all plays score 5); got {first}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MULT-2 Stage 6 — reinforcement: 0 (without-replacement sampling)
+//
+// no_replacement: pool (5 rows), outer (4 rows).
+// link: cardinality: 3, reinforcement: 0.
+// Each outer row must have exactly 3 items, all with distinct pool_ids.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_reinforcement_zero_no_duplicate_pool_rows() {
+    let out = run("tests/fixtures/execute/no_replacement").await;
+
+    let rows = jsonl_rows(&out, "outer");
+    assert_eq!(rows.len(), 4, "outer should have 4 rows");
+
+    for (i, row) in rows.iter().enumerate() {
+        let items = row["items"].as_array()
+            .unwrap_or_else(|| panic!("outer[{i}].items should be a list; got: {row}"));
+        assert_eq!(
+            items.len(), 3,
+            "outer[{i}] should have exactly 3 items (cardinality: 3); got {}",
+            items.len()
+        );
+
+        let ids: Vec<&str> = items.iter()
+            .map(|item| item["pool_id"].as_str().expect("pool_id should be a string"))
+            .collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(), ids.len(),
+            "outer[{i}]: reinforcement:0 must produce no duplicate pool_ids within one row; got: {ids:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MULT-2 Stage 4 — Junction link collect-to-pool
+//
+// directorships: 5 individuals, 5 organisations, 5 directorships.
+// Each directorship is assigned to one organisation (_pool_idx).
+// CollectToPool accumulates director_name into organisations.directors.
+// Organisations with zero directorships get default: [] (empty list).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_junction_collect_to_pool() {
+    let out = run("tests/fixtures/execute/directorships").await;
+
+    let orgs = jsonl_rows(&out, "organisations");
+    assert_eq!(orgs.len(), 5, "organisations should have 5 rows");
+
+    // Every org must have a directors field that is a list (possibly empty).
+    for org in &orgs {
+        let dirs = org["directors"].as_array()
+            .unwrap_or_else(|| panic!("organisations.directors should be a list; got: {org}"));
+        // Each entry should be a string (a director name).
+        for d in dirs {
+            assert!(d.as_str().is_some(), "each director entry should be a string; got: {d}");
+        }
+    }
+
+    // Total director entries across all organisations equals the number of directorships.
+    let total_directors: usize = orgs.iter()
+        .map(|org| org["directors"].as_array().map_or(0, |a| a.len()))
+        .sum();
+    assert_eq!(
+        total_directors, 5,
+        "total director entries should equal the number of directorships (5); got {total_directors}"
+    );
+
+    let directorships = jsonl_rows(&out, "directorships");
+    assert_eq!(directorships.len(), 5, "directorships should have 5 rows");
+
+    // _pool_idx sentinel must not leak into output.
+    for row in &directorships {
+        assert!(row.get("_pool_idx").is_none(), "_pool_idx must not appear in directorships output");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// project: single-field projection from a linked list
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_project_produces_scalar_list() {
+    let out = run("tests/fixtures/execute/project_list").await;
+
+    let events = jsonl_rows(&out, "events");
+    assert_eq!(events.len(), 3, "events should have 3 rows");
+
+    for row in &events {
+        let attendees = row["attendees"].as_array().expect("attendees should be a list");
+        assert_eq!(attendees.len(), 2, "cardinality: 2 → exactly 2 attendees per event");
+
+        for attendee in attendees {
+            // project: person.full_name → list items are strings, not structs.
+            assert!(
+                attendee.is_string(),
+                "attendee list items should be strings (projected), got: {attendee:?}"
+            );
+            assert!(!attendee.as_str().unwrap().is_empty(), "projected name should be non-empty");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// include.fields wildcard expansion
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_include_fields_wildcard_driver() {
+    let out = run("tests/fixtures/execute/include_fields_wildcard").await;
+
+    let derived = csv_rows(&out, "derived");
+    assert_eq!(derived, 5, "derived should have 5 rows (ratio 1.0)");
+
+    // Wildcard expansion should have injected both source fields as refs.
+    let ids = csv_column(&out, "derived", "id");
+    let names = csv_column(&out, "derived", "full_name");
+    assert_eq!(ids.len(), 5, "derived should have 'id' column with 5 values");
+    assert_eq!(names.len(), 5, "derived should have 'full_name' column with 5 values");
+    assert!(ids.iter().all(|v| !v.is_empty()), "all id values should be non-empty");
+    assert!(names.iter().all(|v| !v.is_empty()), "all full_name values should be non-empty");
+}
+
+#[tokio::test]
+async fn test_include_fields_wildcard_list_link() {
+    let out = run("tests/fixtures/execute/include_fields_list_link").await;
+
+    let events = jsonl_rows(&out, "events");
+    assert_eq!(events.len(), 3, "events should have 3 rows");
+
+    for row in &events {
+        let picks = row["picks"].as_array().expect("picks should be a list");
+        assert_eq!(picks.len(), 2, "each event should have 2 picks (cardinality: 2)");
+        for pick in picks {
+            // Wildcard expansion should have injected item_name and item_code as ref fields.
+            let item_name = pick["item_name"].as_str().expect("pick should have item_name");
+            let item_code = pick["item_code"].as_str().expect("pick should have item_code");
+            assert!(!item_name.is_empty(), "item_name should be non-empty");
+            assert!(!item_code.is_empty(), "item_code should be non-empty");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_include_fields_exclude() {
+    let out = run("tests/fixtures/execute/include_fields_exclude").await;
+
+    let derived = csv_rows(&out, "derived");
+    assert_eq!(derived, 4, "derived should have 4 rows");
+
+    // full_name and age should be present (not excluded).
+    let names = csv_column(&out, "derived", "full_name");
+    let ages = csv_column(&out, "derived", "age");
+    assert_eq!(names.len(), 4);
+    assert_eq!(ages.len(), 4);
+
+    // internal_id must not appear (excluded by exclude: [internal_id]).
+    let path = out.join("derived.csv");
+    let content = std::fs::read_to_string(&path).expect("derived.csv");
+    let header = content.lines().next().expect("header");
+    assert!(
+        !header.split(',').any(|h| h.trim_matches('"') == "internal_id"),
+        "internal_id should not appear in derived output (was excluded); header: {header}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// hidden: field suppression
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_hidden_plain_field_excluded_from_output() {
+    let out = run("tests/fixtures/execute/hidden_plain").await;
+
+    let rows = csv_rows(&out, "person");
+    assert_eq!(rows, 5, "person should have 5 rows");
+
+    let path = out.join("person.csv");
+    let content = std::fs::read_to_string(&path).expect("person.csv");
+    let header = content.lines().next().expect("header");
+    let col_names: Vec<&str> = header.split(',').map(|h| h.trim_matches('"')).collect();
+
+    assert!(col_names.contains(&"id"), "id should be present; header: {header}");
+    assert!(col_names.contains(&"label"), "label should be present; header: {header}");
+    assert!(
+        !col_names.contains(&"internal_key"),
+        "internal_key (hidden: true) must not appear in output; header: {header}"
+    );
+}
+
+#[tokio::test]
+async fn test_hidden_expression_dep_excluded_but_expression_evaluates() {
+    let out = run("tests/fixtures/execute/hidden_expression_dep").await;
+
+    let rows = csv_rows(&out, "records");
+    assert_eq!(rows, 4, "records should have 4 rows");
+
+    let path = out.join("records.csv");
+    let content = std::fs::read_to_string(&path).expect("records.csv");
+    let header = content.lines().next().expect("header");
+    let col_names: Vec<&str> = header.split(',').map(|h| h.trim_matches('"')).collect();
+
+    assert!(col_names.contains(&"last_name"), "last_name should be present; header: {header}");
+    assert!(col_names.contains(&"display"), "display should be present; header: {header}");
+    assert!(
+        !col_names.contains(&"first_name"),
+        "first_name (hidden: true) must not appear in output; header: {header}"
+    );
+
+    // The expression `first_name || ' ' || last_name` should have produced non-empty display values.
+    let displays = csv_column(&out, "records", "display");
+    assert!(displays.iter().all(|v| v.contains(' ')),
+        "display values should contain a space (first_name + last_name); got: {displays:?}");
+}
+
+#[tokio::test]
+async fn test_hidden_collect_binding_excluded_but_collect_fires() {
+    let out = run("tests/fixtures/execute/hidden_collect_binding").await;
+
+    let outer_rows = jsonl_rows(&out, "outer");
+    assert_eq!(outer_rows.len(), 3, "outer should have 3 rows");
+
+    // pool_ref is hidden: true — it must not appear in item structs.
+    for row in &outer_rows {
+        let items = row["items"].as_array().expect("items should be a list");
+        assert_eq!(items.len(), 2, "cardinality: 2 → 2 items per outer row");
+        for item in items {
+            assert!(item.get("pool_ref").is_none(),
+                "pool_ref (hidden: true) must not appear in item struct; got: {item:?}");
+            let label = item["label"].as_str().expect("label should be present in item");
+            assert!(!label.is_empty(), "label should be non-empty");
+        }
+    }
+
+    // The collect binding should have fired: pool.seen_in must contain collected values.
+    let pool_rows = jsonl_rows(&out, "pool");
+    assert_eq!(pool_rows.len(), 4, "pool should have 4 rows");
+    let total_seen: usize = pool_rows.iter()
+        .map(|r| r["seen_in"].as_array().map_or(0, |a| a.len()))
+        .sum();
+    assert!(total_seen > 0,
+        "collect binding should have fired; pool.seen_in should be non-empty across rows");
+    assert_eq!(total_seen, 6,
+        "3 outer rows × 2 atoms = 6 total collected entries; got {total_seen}");
 }

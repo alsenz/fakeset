@@ -1,0 +1,13 @@
+name: organisations
+format: jsonl
+output_file: organisations
+rows: 5
+data:
+  - name: org_name
+    type: string
+    generator: company_name
+  - name: directors
+    type: list
+    content:
+      type: string
+    default: []

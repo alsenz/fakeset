@@ -1,0 +1,20 @@
+name: scoreboard
+format: jsonl
+output_file: scoreboard
+rows: 3
+data:
+  - name: team_name
+    type: string
+    generator: word
+  - name: total
+    type: number
+    default: 0
+  - name: high
+    type: number
+    default: 0
+  - name: low
+    type: number
+    default: 0
+  - name: first
+    type: number
+    default: 0

@@ -1,0 +1,7 @@
+name: source
+format: parquet
+rows: 20
+data:
+  - name: label
+    type: string
+    generator: word

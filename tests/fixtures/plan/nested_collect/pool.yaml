@@ -1,0 +1,12 @@
+name: pool
+format: csv
+rows: 5
+data:
+  - name: item_name
+    type: string
+    generator: name
+  - name: collected_labels
+    type: list
+    content:
+      type: string
+    default: []

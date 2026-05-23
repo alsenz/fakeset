@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::models::{resolve_include, Field, SyntheticDataset};
+use crate::models::{resolve_include, Field, RefsSpec, SyntheticDataset};
 
 /// Extract all identifier tokens from a SQL expression string.
 /// Returns every word-like token; callers filter against known field names.
@@ -52,7 +52,7 @@ pub fn pull_down_expression_deps(
                     1 => {
                         hidden.push(Field {
                             name: ident.to_string(),
-                            ref_field: Some(format!("{}.{}", matches[0], ident)),
+                            refs: Some(RefsSpec::Single(format!("{}.{}", matches[0], ident))),
                             hidden: true,
                             ..Default::default()
                         });
@@ -96,7 +96,7 @@ fn include_refs_containing(
     name: &str,
 ) -> Vec<String> {
     let mut refs = Vec::new();
-    for include in &dataset.includes {
+    for include in dataset.include.iter() {
         let Some(inc_path) = resolve_include(path, &include.file) else { continue };
         let Some(inc_ds) = all.get(&inc_path) else { continue };
         if inc_ds.data.iter().any(|f| f.name == name) {

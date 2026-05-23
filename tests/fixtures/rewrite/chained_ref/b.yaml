@@ -1,8 +1,8 @@
 name: b
 format: parquet
-includes:
-  - file: a.yaml
-    ref: a_ref
+include:
+  file: a.yaml
+  ref: a_ref
 data:
   - name: id
     ref: a_ref.id

@@ -1,9 +1,9 @@
 name: a
 format: parquet
-includes:
-  - file: b.yaml
-    ref: b_data
-    distribution: 0.5
+include:
+  file: b.yaml
+  ref: b_data
+  ratio: 0.5
 data:
   - name: employee_id
     ref: b_data.employee_id

@@ -1,0 +1,8 @@
+name: pool
+format: jsonl
+output_file: pool
+rows: 5
+data:
+  - name: pool_id
+    type: string
+    generator: uuid

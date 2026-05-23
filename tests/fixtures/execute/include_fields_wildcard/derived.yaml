@@ -1,0 +1,10 @@
+name: derived
+format: csv
+output_file: derived
+include:
+  file: source.yaml
+  ref: source
+  ratio: 1.0
+  fields:
+    - "*"
+data: []

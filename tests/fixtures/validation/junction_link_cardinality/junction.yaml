@@ -1,0 +1,10 @@
+name: junction
+format: csv
+rows: 5
+links:
+  - file: pool.yaml
+    ref: pool
+    cardinality: 2  # error: junction links must not set cardinality
+data:
+  - name: pool_id
+    ref: pool.id

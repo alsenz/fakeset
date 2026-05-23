@@ -1,8 +1,8 @@
 name: derived
 format: csv
-includes:
-  - file: base.yaml
-    ref: b
+include:
+  file: base.yaml
+  ref: b
 data:
   - name: full_name
     ref: b.full_name

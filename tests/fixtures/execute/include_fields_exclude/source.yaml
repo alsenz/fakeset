@@ -1,0 +1,16 @@
+name: source
+format: csv
+output_file: source
+rows: 4
+data:
+  - name: full_name
+    type: string
+    generator: name
+  - name: internal_id
+    type: string
+    generator: uuid
+  - name: age
+    type: number
+    range:
+      min: 18
+      max: 80

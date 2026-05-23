@@ -1,0 +1,13 @@
+name: outer
+format: csv
+rows: 3
+links:
+  - file: pool.yaml
+    ref: pool
+    cardinality: 2
+data:
+  - name: items
+    type: list
+    content:
+      group: pool
+      project: wrong_ref.label

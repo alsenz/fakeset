@@ -1,0 +1,14 @@
+name: records
+format: csv
+output_file: records
+rows: 4
+data:
+  - name: first_name
+    type: string
+    generator: first_name
+    hidden: true
+  - name: last_name
+    type: string
+    generator: last_name
+  - name: display
+    expression: "first_name || ' ' || last_name"

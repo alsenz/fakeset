@@ -4,7 +4,7 @@ use petgraph::graph::DiGraph;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::models::{for_each_content_include, resolve_include, SyntheticDataset};
+use crate::models::{resolve_include, SyntheticDataset};
 
 #[derive(Debug)]
 pub struct DatasetGraph {
@@ -38,7 +38,7 @@ pub fn build_dag(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<Datase
 
         // Constraint includes: child → parent edge. Children (more constrained) are
         // preceding — the edge makes the child a predecessor so topo visits it first.
-        for include in &dataset.includes {
+        for include in dataset.include.iter() {
             let canonical = resolve_include(path, &include.file).ok_or_else(|| {
                 anyhow!(
                     "{}: included file not found: {}",
@@ -58,27 +58,25 @@ pub fn build_dag(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<Datase
             }
         }
 
-        // List-content includes: data dependency — the included dataset must be computed
-        // BEFORE this dataset (opposite order to constraint includes). Add a reversed edge
-        // so topo visits the includee (data provider) before the includer (data consumer).
-        let mut content_includes = Vec::new();
-        for_each_content_include(&dataset.data, &mut |_field, inc, _item_fields| content_includes.push(inc.clone()));
-        for include in &content_includes {
-            let canonical = resolve_include(path, &include.file).ok_or_else(|| {
+        // Links (list links and junction links): data dependency — the linked dataset must be
+        // computed BEFORE this dataset. Add a reversed edge so topo visits the linked dataset
+        // (data provider) before this dataset (data consumer).
+        for link in &dataset.links {
+            let canonical = resolve_include(path, &link.file).ok_or_else(|| {
                 anyhow!(
-                    "{}: list-content included file not found: {}",
+                    "{}: linked file not found: {}",
                     path.display(),
-                    include.file
+                    link.file
                 )
             })?;
             let to = node_indices.get(&canonical).ok_or_else(|| {
                 anyhow!(
-                    "{}: list-content include '{}' was not part of the traversal",
+                    "{}: link '{}' was not part of the traversal",
                     path.display(),
                     canonical.display()
                 )
             })?;
-            // Edge direction reversed: includee → includer (includee is the predecessor).
+            // Edge direction reversed: linked dataset → this dataset (linked is the predecessor).
             if !graph.contains_edge(*to, from) {
                 graph.add_edge(*to, from, ());
             }

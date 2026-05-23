@@ -2,7 +2,8 @@ use fakeset::{
     expand_variants::expand_field_variants, expressions::pull_down_expression_deps,
     graph::build_dag, load_all_datasets,
     plan::{build_plan, ExecutionStep},
-    rewrite::resolve_refs, validate::validate,
+    rewrite::{expand_include_fields, resolve_refs},
+    validate::validate,
 };
 // Shorthand used in several assertions below.
 macro_rules! find_step {
@@ -21,8 +22,23 @@ fn plan_for(fixture: &str) -> Vec<ExecutionStep> {
     let datasets = pull_down_expression_deps(&datasets).expect("pull_down");
     validate(&datasets).expect("validate");
     let datasets = expand_field_variants(datasets).expect("expand field variants");
+    let datasets = expand_include_fields(&datasets).expect("expand include fields");
     let resolved = resolve_refs(&datasets).expect("resolve");
     build_plan(&dag, &resolved, 16).expect("plan").steps
+}
+
+fn plan_err_for(fixture: &str) -> anyhow::Error {
+    let datasets = load_all_datasets(&[PathBuf::from(fixture)]).expect("load");
+    let dag = build_dag(&datasets).expect("dag");
+    let datasets = pull_down_expression_deps(&datasets).expect("pull_down");
+    validate(&datasets).expect("validate");
+    let datasets = expand_field_variants(datasets).expect("expand field variants");
+    let datasets = expand_include_fields(&datasets).expect("expand include fields");
+    let resolved = resolve_refs(&datasets).expect("resolve");
+    match build_plan(&dag, &resolved, 16) {
+        Ok(_) => panic!("expected plan error but build_plan succeeded"),
+        Err(e) => e,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,44 +131,42 @@ fn distribution_drives_parent_segment_row_counts() {
 
 #[test]
 fn ref_field_wired_as_prefill_on_includee() {
-    // ref_wiring: derived includes source (no distribution), derived.id refs src.id.
-    // source runs second (includee), so its GenerateDataset step should carry a
-    // PrefillSource that pulls id from derived's batch.
+    // ref_wiring: derived includes source with no explicit ratio (defaults to 1.0).
+    // Since Stage 5, all children are registered as siblings unconditionally, so
+    // source gets a GenerateSiblingGroup step with derived as its sibling.
+    // The actual ref-field wiring (derived.id → source.id) is verified by the
+    // executor test test_ref_wiring_propagates_column_values.
     let steps = plan_for("tests/fixtures/execute/ref_wiring");
-    let source_step = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, prefills, .. } if dataset.name == "source" => {
-            Some(prefills)
+    let sibling_group = steps.iter().find_map(|s| match s {
+        ExecutionStep::GenerateSiblingGroup { parent, siblings, .. } if parent.name == "source" => {
+            Some(siblings)
         }
         _ => None,
     });
-    let prefills = source_step.expect("GenerateDataset step for 'source' not found");
-
+    let siblings = sibling_group.expect("GenerateSiblingGroup step for 'source' not found");
     assert!(
-        !prefills.is_empty(),
-        "source should have at least one prefill from derived's ref field"
-    );
-    assert!(
-        prefills.iter().any(|p| p.into_column == "id" && p.from_column == "id"),
-        "prefill should wire derived.id → source.id; got: {prefills:?}"
+        siblings.iter().any(|s| s.dataset.name == "derived"),
+        "derived should appear as a sibling of source; got: {siblings:?}"
     );
 }
 
 #[test]
 fn hidden_ref_field_wired_as_prefill() {
     // expression_pulldown: derived has expression "age * 2" referencing source.age,
-    // which is pulled down as a hidden ref field. source should receive age as a
-    // prefill from derived's batch.
+    // pulled down as a hidden ref field. Since Stage 5, derived is registered as a
+    // sibling of source unconditionally, so source gets GenerateSiblingGroup.
+    // The actual hidden-field wiring is verified by the executor tests.
     let steps = plan_for("tests/fixtures/execute/expression_pulldown");
-    let source_prefills = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, prefills, .. } if dataset.name == "source" => {
-            Some(prefills)
+    let sibling_group = steps.iter().find_map(|s| match s {
+        ExecutionStep::GenerateSiblingGroup { parent, siblings, .. } if parent.name == "source" => {
+            Some(siblings)
         }
         _ => None,
     });
-    let prefills = source_prefills.expect("GenerateDataset step for 'source' not found");
+    let siblings = sibling_group.expect("GenerateSiblingGroup step for 'source' not found");
     assert!(
-        prefills.iter().any(|p| p.into_column == "age" && p.from_column == "age"),
-        "hidden 'age' ref should be wired as a prefill from derived into source; got: {prefills:?}"
+        siblings.iter().any(|s| s.dataset.name == "derived"),
+        "derived should appear as a sibling of source; got: {siblings:?}"
     );
 }
 
@@ -169,7 +183,7 @@ fn nested_include_dataset_decomposes_into_inner_flat_and_assemble() {
     //                 GenerateDataset(events, skip_emit=true),
     //                 GenerateInnerFlat(attendees),
     //                 AssembleNestedInclude(events)
-    let steps = plan_for("tests/fixtures/execute/rich_list");
+    let steps = plan_for("tests/fixtures/execute/link_content");
 
     // people: no nested include → must not be skip-emitted (GenerateDataset or GenerateSiblingGroup)
     let people_not_skipped = steps.iter().any(|s| match s {
@@ -218,7 +232,7 @@ fn bernoulli_nested_include_parent_has_skip_parent_emit() {
     //   GenerateSiblingGroup(events, skip_parent_emit=true)
     //   GenerateInnerFlat(picks)
     //   AssembleNestedInclude(events)
-    let steps = plan_for("tests/fixtures/execute/bernoulli_rich_list");
+    let steps = plan_for("tests/fixtures/execute/bernoulli_link_content");
 
     let group_step = find_step!(
         steps, ExecutionStep::GenerateSiblingGroup { parent, .. } if parent.name == "events"
@@ -349,4 +363,106 @@ fn field_variant_expands_to_correct_generate_steps() {
         _ => None,
     }).sum();
     assert_eq!(total_rows, 120, "variant row counts must sum to 120");
+}
+
+// ---------------------------------------------------------------------------
+// MULT-2 Stage 3: collect target pre-scan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nested_include_collect_produces_correct_step_sequence() {
+    // pool: plain dataset (rows: 5) with a collect-target list field.
+    // outer: nested-include dataset; content field has refs: [pool.item_name, {bind: pool.collected_labels, reducer: collect}].
+    //
+    // Expected step order:
+    //   GenerateDataset[pool, skip_emit=true]   ← collect target, file write deferred
+    //   GenerateDataset[outer, skip_emit=true]  ← has nested include fields
+    //   GenerateInnerFlat[items]
+    //   CollectToPool[items.item → pool.collected_labels]
+    //   EmitDataset[pool]
+    //   AssembleNestedInclude[outer]
+    let steps = plan_for("tests/fixtures/plan/nested_collect");
+
+    // pool must be generated with skip_emit/skip_parent_emit=true (it is a collect target).
+    // It may appear as GenerateDataset or GenerateSiblingGroup (pool siblings are registered
+    // against it), so we accept either — the key invariant is that file write is deferred.
+    let pool_skips_emit = steps.iter().any(|s| match s {
+        ExecutionStep::GenerateDataset { dataset, skip_emit: true, .. } => dataset.name == "pool",
+        ExecutionStep::GenerateSiblingGroup { parent, skip_parent_emit: true, .. } => parent.name == "pool",
+        _ => false,
+    });
+    assert!(pool_skips_emit, "pool is a collect target — file write must be deferred (skip_emit/skip_parent_emit=true)");
+
+    // GenerateInnerFlat for 'items' must be present
+    assert!(
+        find_step!(steps, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "items").is_some(),
+        "expected GenerateInnerFlat step for 'items'"
+    );
+
+    // CollectToPool must be present targeting pool.collected_labels
+    let collect_step = find_step!(
+        steps,
+        ExecutionStep::CollectToPool { source_field, pool_field, .. }
+        if source_field == "item" && pool_field == "collected_labels"
+    );
+    assert!(collect_step.is_some(), "expected CollectToPool for item → pool.collected_labels");
+
+    // EmitDataset for pool must be present
+    assert!(
+        find_step!(steps, ExecutionStep::EmitDataset { dataset, .. } if dataset.name == "pool").is_some(),
+        "expected EmitDataset step for 'pool'"
+    );
+
+    // AssembleNestedInclude for outer must be present
+    assert!(
+        find_step!(steps, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "outer").is_some(),
+        "expected AssembleNestedInclude for 'outer'"
+    );
+
+    // Ordering: GenerateInnerFlat → CollectToPool → EmitDataset[pool] → AssembleNestedInclude
+    let flat_pos = steps.iter().position(|s| {
+        matches!(s, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "items")
+    }).expect("GenerateInnerFlat not found");
+    let collect_pos = steps.iter().position(|s| {
+        matches!(s, ExecutionStep::CollectToPool { pool_field, .. } if pool_field == "collected_labels")
+    }).expect("CollectToPool not found");
+    let emit_pos = steps.iter().position(|s| {
+        matches!(s, ExecutionStep::EmitDataset { dataset, .. } if dataset.name == "pool")
+    }).expect("EmitDataset[pool] not found");
+    let assemble_pos = steps.iter().position(|s| {
+        matches!(s, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "outer")
+    }).expect("AssembleNestedInclude not found");
+
+    assert!(flat_pos < collect_pos, "GenerateInnerFlat must precede CollectToPool");
+    assert!(collect_pos < emit_pos,  "CollectToPool must precede EmitDataset[pool]");
+    assert!(emit_pos < assemble_pos, "EmitDataset[pool] must precede AssembleNestedInclude");
+}
+
+// ---------------------------------------------------------------------------
+// MULT-2 Stage 9: plan-level error checks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn case2_collect_with_jointly_segmented_pool_errors() {
+    // case2_collect_joint_segment: outer links pool (collect binding) and flat_sibling
+    // includes pool with ratio:0.5. pool is therefore jointly segmented with flat_sibling
+    // (a non-pool sibling), which violates the v1 Case 2 restriction.
+    let err = plan_err_for("tests/fixtures/plan/case2_collect_joint_segment");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("jointly segmented") || msg.contains("not supported"),
+        "error should mention joint segmentation restriction; got: {msg}"
+    );
+}
+
+#[test]
+fn reinforcement_zero_exceeding_pool_errors() {
+    // reinforcement_zero_infeasible: outer links pool (3 rows) with reinforcement:0 and
+    // cardinality:5. max_cardinality (5) > eligible pool size (3) → planning error.
+    let err = plan_err_for("tests/fixtures/plan/reinforcement_zero_infeasible");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reinforcement") && (msg.contains("eligible") || msg.contains("cardinality")),
+        "error should mention reinforcement and eligible pool size; got: {msg}"
+    );
 }

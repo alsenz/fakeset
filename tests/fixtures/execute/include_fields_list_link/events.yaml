@@ -1,0 +1,18 @@
+name: events
+format: jsonl
+output_file: events
+rows: 3
+links:
+  - file: items.yaml
+    ref: item
+    cardinality: 2
+    fields:
+      - "*"
+data:
+  - name: event_id
+    type: string
+    generator: uuid
+  - name: picks
+    type: list
+    content:
+      group: item

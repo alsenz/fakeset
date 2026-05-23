@@ -1,0 +1,10 @@
+name: source
+format: csv
+rows: 3
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: label
+    type: string
+    generator: word

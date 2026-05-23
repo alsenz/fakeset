@@ -1,0 +1,7 @@
+name: pool
+format: csv
+rows: 3
+data:
+  - name: pool_id
+    type: string
+    generator: uuid

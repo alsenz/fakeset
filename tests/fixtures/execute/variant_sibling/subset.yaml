@@ -1,9 +1,9 @@
 name: subset
 format: csv
-includes:
-  - file: source.yaml
-    ref: src
-    distribution: 0.4
+include:
+  file: source.yaml
+  ref: src
+  ratio: 0.4
 data:
   - name: id
     ref: src.id

@@ -1,0 +1,13 @@
+name: pool
+format: jsonl
+output_file: pool
+rows: 4
+data:
+  - name: pool_name
+    type: string
+    generator: word
+  - name: seen_in
+    type: list
+    content:
+      type: string
+    default: []

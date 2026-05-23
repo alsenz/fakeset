@@ -1,0 +1,11 @@
+name: child
+format: csv
+output_file: child
+include:
+  file: parent.yaml
+  ref: p
+  ratio: 0.5
+  cardinality: 2
+data:
+  - name: parent_id
+    ref: p.id

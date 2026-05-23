@@ -5,7 +5,7 @@ use fakeset::{
     expressions::pull_down_expression_deps, graph::build_dag,
     load_all_datasets, models::{Format, SyntheticDataset},
     plan::{build_plan, ExecutionPlan, ExecutionStep},
-    rewrite::{apply_global_locales, resolve_refs}, segment::DEFAULT_MAX_SIBLINGS, validate::validate,
+    rewrite::{apply_global_locales, expand_include_fields, resolve_refs}, segment::DEFAULT_MAX_SIBLINGS, validate::validate,
 };
 use petgraph::visit::Topo;
 use std::collections::HashMap;
@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
         eprintln!("{warning}");
     }
     let datasets = expand_field_variants(datasets)?;
+    let datasets = expand_include_fields(&datasets)?;
 
     if cli.print_dag {
         println!("=== DAG (before rewrite) ===\n");
@@ -158,19 +159,19 @@ fn print_plan(plan: &ExecutionPlan) {
                 }
             }
             ExecutionStep::GenerateInnerFlat {
-                list_field_name, outer_path, flat_key, include_path,
-                include_distribution, count, ..
+                list_field_name, outer_path, flat_key, pool_slots_path,
+                include, cardinality, ..
             } => {
                 let outer = outer_path.file_stem()
-                    .and_then(|s| s.to_str()).unwrap_or("?");
-                let inc = include_path.file_stem()
-                    .and_then(|s| s.to_str()).unwrap_or("?");
+                    .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
+                let inc = pool_slots_path.file_stem()
+                    .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
                 let flat = flat_key.file_stem()
                     .and_then(|s| s.to_str()).unwrap_or("?");
-                let dist = include_distribution
-                    .map(|d| format!(" dist:{:.0}%", d * 100.0))
+                let dist = include.ratio
+                    .map(|r| format!(" ratio:{:.0}%", r * 100.0))
                     .unwrap_or_default();
-                let count_label = match count {
+                let count_label = match cardinality {
                     fakeset::models::CountSpec::Fixed(n) => format!("{n}"),
                     fakeset::models::CountSpec::Uniform { min, max } => format!("{min}–{max}"),
                     fakeset::models::CountSpec::Normal { mean, .. } => format!("~{mean}"),
@@ -183,10 +184,24 @@ fn print_plan(plan: &ExecutionPlan) {
             ExecutionStep::AssembleNestedInclude { outer_path, dataset, flat_specs } => {
                 let outer = outer_path.file_stem()
                     .and_then(|s| s.to_str()).unwrap_or("?");
-                let fields: Vec<&str> = flat_specs.iter().map(|(n, _)| n.as_str()).collect();
+                let fields: Vec<&str> = flat_specs.iter().map(|(n, _, _)| n.as_str()).collect();
                 println!(
                     "[{}] assemble nested include: {} ← [{}] ({})",
                     i + 1, outer, fields.join(", "), dataset.format
+                );
+            }
+            ExecutionStep::CollectToPool { source_field, pool_field, pool_path, .. } => {
+                let pool = pool_path.file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("?");
+                println!(
+                    "[{}] collect to pool: {} → {}.{}",
+                    i + 1, source_field, pool, pool_field
+                );
+            }
+            ExecutionStep::EmitDataset { dataset, .. } => {
+                println!(
+                    "[{}] emit dataset: {} ({})",
+                    i + 1, dataset.name, dataset.format
                 );
             }
             ExecutionStep::WriteSharedOutput { output_file, format } => {
@@ -235,15 +250,11 @@ fn print_datasets(
             println!("  output_file: {of}");
         }
 
-        if !ds.includes.is_empty() {
-            println!("  includes:");
-            for inc in &ds.includes {
-                let dist = inc
-                    .distribution
-                    .map(|d| format!(" dist: {:.0}%", d * 100.0))
-                    .unwrap_or_default();
-                println!("    {} (ref: {}{})", inc.file, inc.reference, dist);
-            }
+        if let Some(ref inc) = ds.include {
+            let ratio = inc.ratio
+                .map(|r| format!(" ratio: {:.0}%", r * 100.0))
+                .unwrap_or_default();
+            println!("  include: {} (ref: {}{})", inc.file, inc.reference, ratio);
         }
 
         if !ds.data.is_empty() {
@@ -254,12 +265,12 @@ fn print_datasets(
         }
 
         if !ds.variants.is_empty() {
-            let fixed_sum: f64 = ds.variants.iter().filter_map(|v| v.distribution).sum();
-            let n_free = ds.variants.iter().filter(|v| v.distribution.is_none()).count();
+            let fixed_sum: f64 = ds.variants.iter().filter_map(|v| v.ratio).sum();
+            let n_free = ds.variants.iter().filter(|v| v.ratio.is_none()).count();
             let free_share = if n_free > 0 { (1.0 - fixed_sum) / n_free as f64 } else { 0.0 };
             println!("  variants: {} →", ds.variants.len());
             for (i, v) in ds.variants.iter().enumerate() {
-                let d = v.distribution.unwrap_or(free_share);
+                let d = v.ratio.unwrap_or(free_share);
                 let locale_tag = v.locale.as_ref().map(|l| format!(" locale:{l}")).unwrap_or_default();
                 println!("    v{i} ({:.0}%{locale_tag}):", d * 100.0);
                 for field in &v.data {
@@ -282,7 +293,7 @@ fn print_field(field: &fakeset::models::Field, indent: usize) {
         println!("{pad}{:<24} type:variant ({} choices){}",
             field.name, field.variants.len(), parquet_tag);
         for (i, v) in field.variants.iter().enumerate() {
-            let d = v.distribution.map(|d| format!("{:.0}%", d * 100.0))
+            let d = v.ratio.map(|d| format!("{:.0}%", d * 100.0))
                 .unwrap_or_else(|| "free".to_string());
             let vtype = v.field_type.as_ref().map(|t| format!("{t}")).unwrap_or_else(|| "inferred".to_string());
             let vval = v.value.as_ref().map(|val| format!("={}", format_yaml_value(val))).unwrap_or_default();
@@ -303,7 +314,7 @@ fn print_field(field: &fakeset::models::Field, indent: usize) {
         .map(|t| t.to_string())
         .unwrap_or_else(|| "-".to_string());
 
-    let ref_str = field.ref_field.as_deref().unwrap_or("-");
+    let ref_str = field.simple_ref().unwrap_or("-");
 
     let gen_str = field
         .generator
@@ -334,17 +345,14 @@ fn print_field(field: &fakeset::models::Field, indent: usize) {
         print_field(sub, indent + 2);
     }
     match field.content.as_deref() {
-        Some(c) if c.includes.is_empty() => {
+        Some(c) if c.group.is_none() => {
             print!("{pad}  [content] ");
             print_field(&c.item, indent + 2);
         }
         Some(c) => {
             println!("{pad}  [nested include content]");
-            for inc in &c.includes {
-                let dist = inc.distribution
-                    .map(|d| format!(" dist:{:.0}%", d * 100.0))
-                    .unwrap_or_default();
-                println!("{pad}    include: {} (ref: {}{})", inc.file, inc.reference, dist);
+            if let Some(ref group) = c.group {
+                println!("{pad}    group: {group}");
             }
             for f in &c.item.fields {
                 print_field(f, indent + 4);

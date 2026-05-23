@@ -1,0 +1,22 @@
+name: wards
+format: jsonl
+output_file: wards
+rows: 3
+links:
+  - file: doctors.yaml
+    ref: doctor
+    cardinality: 2
+data:
+  - name: ward_name
+    type: string
+    generator: city_name
+  - name: on_call_doctors
+    type: list
+    content:
+      group: doctor
+      fields:
+        - name: doctor_name
+          refs:
+            - doctor.doctor_name
+            - bind: doctor.on_call_wards
+              reducer: collect

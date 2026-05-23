@@ -3,10 +3,11 @@ use petgraph::visit::Topo;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use serde_yaml::Value as YamlValue;
 
 use crate::segment::{plan_segments, Segment, Sibling};
 use crate::graph::DatasetGraph;
-use crate::models::{for_each_content_include, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Locale, Schema, SyntheticDataset, VariantSchema};
+use crate::models::{expected_cardinality, for_each_link_content, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Locale, Reducer, RefBinding, Schema, SyntheticDataset, VariantSchema};
 use crate::rewrite::apply_locale_to_schema;
 
 const DEFAULT_ROWS: usize = 100;
@@ -48,21 +49,28 @@ pub enum ExecutionStep {
         siblings: Vec<Sibling>,
         skip_parent_emit: bool,
     },
-    /// Generate the flat intermediate for one nested include field.
+    /// Generate the joint-atom flat for one nested-include list field.
     ///
-    /// Produces a RecordBatch stored in `computed[flat_key]` with:
-    ///   - `_outer_idx: UInt32` — which outer row this item belongs to
-    ///   - one column per `inner_fields` field — sourced from the include batch (include-scoped
-    ///     refs), the outer batch (outer-scoped refs), or generated fresh (plain fields)
+    /// Each row of the resulting batch is one **atom**: a single (outer-slot, pool-slot) pair.
+    /// The batch is stored in `computed[flat_key]` and contains:
+    ///   - `_slot_idx: UInt32` — which outer row this atom belongs to
+    ///   - `_pool_idx: UInt32` — which pool slot this atom was assigned to
+    ///   - one column per `inner_fields` field, resolved as follows:
+    ///       - pool-scoped refs: the pushed-down pool-slot solution for `_pool_idx`
+    ///       - outer-scoped refs: the outer row value for `_slot_idx`
+    ///       - plain fields: generated fresh per atom
+    ///
+    /// `pool_slots_path` is the path of the pre-solved pool-slot batch (one row per eligible
+    /// pool slot). Atom rows sharing the same `_pool_idx` carry identical pool-scoped values
+    /// because they reference the same pre-solved slot.
     GenerateInnerFlat {
         flat_key: PathBuf,
         outer_path: PathBuf,
         list_field_name: String,
         inner_fields: Vec<Field>,
-        includes: Vec<Include>,
-        count: CountSpec,
-        include_path: PathBuf,
-        include_distribution: Option<f64>,
+        include: Include,
+        cardinality: CountSpec,
+        pool_slots_path: PathBuf,
     },
     /// Assemble nested include columns into the outer batch and emit.
     ///
@@ -72,7 +80,35 @@ pub enum ExecutionStep {
     AssembleNestedInclude {
         outer_path: PathBuf,
         dataset: Arc<SyntheticDataset>,
-        flat_specs: Vec<(String, PathBuf)>,
+        /// `(list_field_name, flat_key, project_col)` — `project_col` is `Some(col_name)`
+        /// when `content.project` is set, causing scalar-list assembly for that field.
+        flat_specs: Vec<(String, PathBuf, Option<String>)>,
+    },
+    /// Accumulate values from a source batch into a pool dataset's field in `computed`.
+    ///
+    /// Groups source rows by `group_by` (always `"_pool_idx"` for MULT-2), aggregates the
+    /// `source_field` column using `reducer`, and writes the result into the pool batch's
+    /// `pool_field` column. Pool rows with no matching source rows receive the pool field's
+    /// `default` value.
+    CollectToPool {
+        source_path:  PathBuf,
+        source_field: String,
+        pool_path:    PathBuf,
+        pool_field:   String,
+        group_by:     String,
+        reducer:      Reducer,
+        /// Declared `default:` from the pool field YAML, used as the fallback value for
+        /// pool rows that have no matching source rows (scalar reducers only).
+        /// For `Collect` the empty-list is built explicitly; this field is ignored.
+        default_val:  serde_yaml::Value,
+    },
+    /// Emit the batch at `path` from `computed` to an output file.
+    ///
+    /// Used after `CollectToPool` to write the now-updated pool batch. Applies
+    /// `filter_hidden_columns` and calls the normal emit path.
+    EmitDataset {
+        path:    PathBuf,
+        dataset: Arc<SyntheticDataset>,
     },
     /// Flush a shared output file: union + shuffle all accumulated batches, write once.
     WriteSharedOutput {
@@ -154,10 +190,182 @@ fn expand_variant_dataset(
         locale: effective_locale,
         rows: Some(rows),
         output_file: Some(output_key.to_string()),
-        includes: base.includes.clone(),
+        include: base.include.clone(),
+        links: base.links.clone(),
         data: merge_variant_fields(&base.data, &variant_fields),
         variants: vec![],
     }
+}
+
+/// Validate Case 2 v1 restriction: a pool dataset targeted by a nested-include collect binding
+/// must not be jointly segmented with another (non-pool) sibling. When it is, the correct
+/// approach is a top-level junction dataset (Case 1).
+fn check_case2_collect_restrictions(
+    datasets: &HashMap<PathBuf, SyntheticDataset>,
+    sibling_groups: &HashMap<PathBuf, Vec<Sibling>>,
+) -> Result<()> {
+    for (path, dataset) in datasets {
+        for field in &dataset.data {
+            let Some(content) = &field.content else { continue };
+            let Some(group_ref) = &content.group else { continue };
+            let has_collect = content.item.fields.iter().any(|cf| !cf.collect_bindings().is_empty());
+            if !has_collect { continue; }
+            let Some(link) = dataset.links.iter().find(|l| l.reference == *group_ref) else { continue };
+            let Some(pool_path) = resolve_include(path, &link.file) else { continue };
+            if let Some(siblings) = sibling_groups.get(&pool_path) {
+                if siblings.iter().any(|s| !s.is_pool) {
+                    anyhow::bail!(
+                        "dataset '{}': nested-include collect on field '{}' is not supported \
+                         when the pool dataset is jointly segmented with another sibling; \
+                         use a top-level junction dataset instead",
+                        dataset.name, field.name
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Return the maximum number of items a `CountSpec` can produce, or `None` if unbounded.
+fn max_cardinality_bound(spec: &CountSpec) -> Option<usize> {
+    match spec {
+        CountSpec::Fixed(n)            => Some(*n),
+        CountSpec::Uniform { max, .. } => Some(*max),
+        CountSpec::Normal  { .. }      => None,
+    }
+}
+
+/// Planning-time feasibility check for `reinforcement: 0` (without-replacement sampling).
+///
+/// Without-replacement requires that the number of items drawn per outer row (`M_n`) never
+/// exceeds the number of eligible pool slots (`n_eligible`). Because counts are stochastic,
+/// we check the maximum possible `M_n`:
+///
+/// - For nested-include fields: `max_cardinality_bound(cardinality) ≤ n_eligible_slots`.
+/// - For junction links: `junction_rows ≤ n_eligible_pool_rows`.
+///
+/// `Normal` cardinality has no finite upper bound, so without-replacement is disallowed for
+/// it unless the pool is unbounded (impossible in practice). We reject it as a planning error.
+fn check_reinforcement_zero_feasibility(
+    datasets: &HashMap<PathBuf, SyntheticDataset>,
+    row_counts: &HashMap<PathBuf, usize>,
+) -> Result<()> {
+    for (path, dataset) in datasets {
+        // Nested-include fields with reinforcement: 0.
+        for field in &dataset.data {
+            let Some(content) = &field.content else { continue };
+            let Some(group_ref) = &content.group else { continue };
+            let Some(link) = dataset.links.iter().find(|l| l.reference == *group_ref) else { continue };
+            if link.reinforcement != Some(0.0) { continue; }
+            let Some(pool_path) = resolve_include(path, &link.file) else { continue };
+            let n_eligible = {
+                let pool_rows = *row_counts.get(&pool_path).unwrap_or(&0);
+                match link.ratio {
+                    Some(r) => ((r * pool_rows as f64).round() as usize).max(1).min(pool_rows),
+                    None    => pool_rows,
+                }
+            };
+            let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
+            match max_cardinality_bound(&cardinality) {
+                None => anyhow::bail!(
+                    "dataset '{}' field '{}': `reinforcement: 0` (without-replacement) \
+                     is not compatible with `Normal` cardinality — the count is unbounded",
+                    dataset.name, field.name
+                ),
+                Some(max_m) if max_m > n_eligible => anyhow::bail!(
+                    "dataset '{}' field '{}': `reinforcement: 0` requires cardinality ≤ \
+                     eligible pool size ({n_eligible}), but max cardinality is {max_m}",
+                    dataset.name, field.name
+                ),
+                _ => {}
+            }
+        }
+
+        // Junction links with reinforcement: 0.
+        let list_link_refs: HashSet<&str> = dataset.data.iter()
+            .filter_map(|f| f.content.as_ref()?.group.as_deref())
+            .collect();
+        for link in &dataset.links {
+            if list_link_refs.contains(link.reference.as_str()) { continue; }
+            if link.reinforcement != Some(0.0) { continue; }
+            let Some(pool_path) = resolve_include(path, &link.file) else { continue };
+            let n_eligible = {
+                let pool_rows = *row_counts.get(&pool_path).unwrap_or(&0);
+                match link.ratio {
+                    Some(r) => ((r * pool_rows as f64).round() as usize).max(1).min(pool_rows),
+                    None    => pool_rows,
+                }
+            };
+            let junction_rows = *row_counts.get(path).unwrap_or(&0);
+            if junction_rows > n_eligible {
+                anyhow::bail!(
+                    "dataset '{}': `reinforcement: 0` on link '{}' requires junction rows \
+                     ({junction_rows}) ≤ eligible pool rows ({n_eligible})",
+                    dataset.name, link.reference
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk all datasets and return the set of pool dataset paths that are collect targets.
+///
+/// A dataset is a collect target when any field (top-level or inside a nested-include
+/// content block) carries a `reducer: collect` binding whose `bind` target resolves to
+/// a field in that dataset.
+fn scan_collect_targets(datasets: &HashMap<PathBuf, SyntheticDataset>) -> HashSet<PathBuf> {
+    let mut targets = HashSet::new();
+    for (path, dataset) in datasets {
+        for field in &dataset.data {
+            // Top-level collect bindings (Case 1 — junction datasets, activated in Stage 4).
+            for binding in field.collect_bindings() {
+                if let Some(pool_path) = resolve_collect_bind_target(path, dataset, binding) {
+                    targets.insert(pool_path);
+                }
+            }
+            // Nested-include content field collect bindings (Case 2).
+            if let Some(content) = &field.content {
+                if content.group.is_some() {
+                    for cf in &content.item.fields {
+                        for binding in cf.collect_bindings() {
+                            if let Some(pool_path) = resolve_collect_bind_target(path, dataset, binding) {
+                                targets.insert(pool_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Resolve the pool dataset path for a single collect binding.
+fn resolve_collect_bind_target(
+    dataset_path: &Path,
+    dataset: &SyntheticDataset,
+    binding: &RefBinding,
+) -> Option<PathBuf> {
+    let bind = binding.bind.as_deref()?;
+    let (pool_ref, _) = split_ref(bind)?;
+    let link = dataset.links.iter().find(|l| l.reference == pool_ref)?;
+    resolve_include(dataset_path, &link.file)
+}
+
+/// Look up the declared `default:` for `field_name` in the pool dataset at `pool_path`.
+/// Returns `YamlValue::Null` when no default is declared (e.g. for Collect targets
+/// where the fallback is an empty list built explicitly by `execute_collect_to_pool`).
+fn pool_field_default(
+    pool_path: &Path,
+    field_name: &str,
+    datasets: &HashMap<PathBuf, SyntheticDataset>,
+) -> YamlValue {
+    datasets.get(pool_path)
+        .and_then(|ds| ds.data.iter().find(|f| f.name == field_name))
+        .and_then(|f| f.default.clone())
+        .unwrap_or(YamlValue::Null)
 }
 
 /// Build the execution plan from the resolved dataset map and its DAG.
@@ -175,6 +383,9 @@ pub fn build_plan(
         .values()
         .flat_map(|sibs| sibs.iter().map(|s| s.path.clone()))
         .collect();
+    let collect_targets = scan_collect_targets(datasets);
+    check_case2_collect_restrictions(datasets, &sibling_groups)?;
+    check_reinforcement_zero_feasibility(datasets, &row_counts)?;
 
     let mut topo = Topo::new(&dag.graph);
     let mut steps: Vec<ExecutionStep> = Vec::new();
@@ -201,7 +412,7 @@ pub fn build_plan(
         // a single stable batch to pull columns from; variants produce N separate batches.
         if !dataset.variants.is_empty() {
             let output_key = dataset.output_file.clone().unwrap_or_else(|| dataset.name.clone());
-            let variant_dists: Vec<Option<f64>> = dataset.variants.iter().map(|v| v.distribution).collect();
+            let variant_dists: Vec<Option<f64>> = dataset.variants.iter().map(|v| v.ratio).collect();
             let dists = resolve_distributions(&variant_dists);
             let row_counts_v = distribute_rows(row_counts[path], &dists);
 
@@ -227,7 +438,7 @@ pub fn build_plan(
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
-                    push_with_nested_include(&mut steps, &concrete, &virtual_path, |rich| {
+                    push_with_nested_include(&mut steps, &concrete, &virtual_path, false, datasets, |rich| {
                         ExecutionStep::GenerateSiblingGroup {
                             parent_path: vpath,
                             parent: c,
@@ -240,7 +451,7 @@ pub fn build_plan(
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
-                    push_with_nested_include(&mut steps, &concrete, &virtual_path, |rich| {
+                    push_with_nested_include(&mut steps, &concrete, &virtual_path, false, datasets, |rich| {
                         ExecutionStep::GenerateDataset {
                             path: vpath,
                             dataset: c,
@@ -263,7 +474,8 @@ pub fn build_plan(
             let p = path.clone();
             let d = Arc::new(dataset.clone());
             let sibs = siblings.clone();
-            push_with_nested_include(&mut steps, dataset, path, |rich| {
+            let is_collect_target = collect_targets.contains(path);
+            push_with_nested_include(&mut steps, dataset, path, is_collect_target, datasets, |rich| {
                 ExecutionStep::GenerateSiblingGroup {
                     parent_path: p,
                     parent: d,
@@ -272,6 +484,11 @@ pub fn build_plan(
                     skip_parent_emit: rich,
                 }
             });
+            // Junction link siblings: emit CollectToPool + EmitDataset after the group step.
+            for sib in siblings {
+                if sib.is_pool { continue; }
+                emit_top_level_collect_steps(&sib.dataset, &sib.path, datasets, &mut steps);
+            }
             continue;
         }
 
@@ -280,7 +497,8 @@ pub fn build_plan(
         let d = Arc::new(dataset.clone());
         let prefills = compute_prefills(path, datasets, &sibling_set);
         let rows = row_counts[path];
-        push_with_nested_include(&mut steps, dataset, path, |rich| {
+        let is_collect_target = collect_targets.contains(path);
+        push_with_nested_include(&mut steps, dataset, path, is_collect_target, datasets, |rich| {
             ExecutionStep::GenerateDataset {
                 path: p,
                 dataset: d,
@@ -289,6 +507,7 @@ pub fn build_plan(
                 skip_emit: rich,
             }
         });
+        emit_top_level_collect_steps(dataset, path, datasets, &mut steps);
     }
 
     for (output_file, format) in shared_outputs {
@@ -303,46 +522,82 @@ fn inner_flat_key(outer_path: &Path, field_name: &str) -> PathBuf {
 }
 
 /// Push a step plus any follow-on nested include steps if `dataset` has nested include fields.
-/// The `skip` flag on the step is set to `true` when nested include steps are needed so that
-/// expression evaluation and emit are deferred to `AssembleNestedInclude`.
+/// `skip_emit_extra` is ORed with the nested-include `rich` flag — when either is true the
+/// main step's skip flag is set and expression evaluation / file emit are deferred.
 fn push_with_nested_include(
     steps: &mut Vec<ExecutionStep>,
     dataset: &SyntheticDataset,
     path: &Path,
+    skip_emit_extra: bool,
+    all_datasets: &HashMap<PathBuf, SyntheticDataset>,
     make_step: impl FnOnce(bool) -> ExecutionStep,
 ) {
-    let rich = dataset.data.iter().any(|f| f.is_nested_include());
-    steps.push(make_step(rich));
-    if rich {
-        emit_nested_include_steps(dataset, path, steps);
+    let has_link_content = dataset.data.iter().any(|f| f.is_link_content());
+    steps.push(make_step(has_link_content || skip_emit_extra));
+    if has_link_content {
+        emit_nested_include_steps(dataset, path, all_datasets, steps);
     }
 }
 
 fn emit_nested_include_steps(
     dataset: &SyntheticDataset,
     path: &Path,
+    all_datasets: &HashMap<PathBuf, SyntheticDataset>,
     steps: &mut Vec<ExecutionStep>,
 ) {
-    let mut flat_specs: Vec<(String, PathBuf)> = Vec::new();
+    let mut flat_specs: Vec<(String, PathBuf, Option<String>)> = Vec::new();
     for field in &dataset.data {
         let Some(content) = &field.content else { continue };
-        if content.includes.is_empty() {
-            continue;
-        }
-        let inc = &content.includes[0];
-        let Some(inc_path) = resolve_include(path, &inc.file) else { continue };
+        let Some(ref group_ref) = content.group else { continue };
+        let Some(link) = dataset.links.iter().find(|l| l.reference == *group_ref) else { continue };
+        let Some(pool_slots_path) = resolve_include(path, &link.file) else { continue };
         let flat_key = inner_flat_key(path, &field.name);
+        let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
         steps.push(ExecutionStep::GenerateInnerFlat {
             flat_key: flat_key.clone(),
             outer_path: path.to_path_buf(),
             list_field_name: field.name.clone(),
             inner_fields: content.item.fields.clone(),
-            includes: content.includes.clone(),
-            count: field.count.as_ref().cloned().unwrap_or(CountSpec::Fixed(1)),
-            include_path: inc_path,
-            include_distribution: inc.distribution,
+            include: link.clone(),
+            cardinality,
+            pool_slots_path: pool_slots_path.clone(),
         });
-        flat_specs.push((field.name.clone(), flat_key));
+        let project_col = content.project.as_ref()
+            .and_then(|p| split_ref(p))
+            .map(|(_, f)| f.to_string());
+        flat_specs.push((field.name.clone(), flat_key.clone(), project_col));
+
+        // Collect bindings in content fields: insert CollectToPool + EmitDataset
+        // between GenerateInnerFlat and AssembleNestedInclude so pool-node values
+        // accumulate upward before the outer dataset is assembled (Case 2).
+        // Pass 1: emit all CollectToPool steps; Pass 2: emit EmitDataset once after all.
+        let mut has_collect = false;
+        for cf in &content.item.fields {
+            for binding in cf.collect_bindings() {
+                let Some(bind) = binding.bind.as_deref() else { continue };
+                let Some((_, pool_field)) = split_ref(bind) else { continue };
+                let pf_name = pool_field.to_string();
+                let def = pool_field_default(&pool_slots_path, &pf_name, all_datasets);
+                steps.push(ExecutionStep::CollectToPool {
+                    source_path:  flat_key.clone(),
+                    source_field: cf.name.clone(),
+                    pool_path:    pool_slots_path.clone(),
+                    pool_field:   pf_name,
+                    group_by:     "_pool_idx".to_string(),
+                    reducer:      binding.reducer.clone().unwrap_or(Reducer::Collect),
+                    default_val:  def,
+                });
+                has_collect = true;
+            }
+        }
+        if has_collect {
+            if let Some(pool_ds) = all_datasets.get(&pool_slots_path) {
+                steps.push(ExecutionStep::EmitDataset {
+                    path:    pool_slots_path.clone(),
+                    dataset: Arc::new(pool_ds.clone()),
+                });
+            }
+        }
     }
     if !flat_specs.is_empty() {
         steps.push(ExecutionStep::AssembleNestedInclude {
@@ -350,6 +605,58 @@ fn emit_nested_include_steps(
             dataset: Arc::new(dataset.clone()),
             flat_specs,
         });
+    }
+}
+
+/// Emit `CollectToPool` + `EmitDataset` steps for any top-level collect bindings
+/// in `dataset` that target a junction link's pool dataset (Case 1).
+///
+/// All `CollectToPool` steps for a given pool are emitted before that pool's `EmitDataset`
+/// so that every reducer result is written before the output file is finalised.
+///
+/// List-link collect bindings (Case 2) are handled by `emit_nested_include_steps`.
+fn emit_top_level_collect_steps(
+    dataset: &SyntheticDataset,
+    path: &Path,
+    all_datasets: &HashMap<PathBuf, SyntheticDataset>,
+    steps: &mut Vec<ExecutionStep>,
+) {
+    let list_link_refs: HashSet<&str> = dataset.data.iter()
+        .filter_map(|f| f.content.as_ref()?.group.as_deref())
+        .collect();
+
+    // Pass 1: emit all CollectToPool steps, collecting which pools need EmitDataset.
+    let mut pools_to_emit: Vec<(PathBuf, Arc<SyntheticDataset>)> = Vec::new();
+    let mut seen_pools: HashSet<PathBuf> = HashSet::new();
+    for field in &dataset.data {
+        for binding in field.collect_bindings() {
+            let Some(bind) = binding.bind.as_deref() else { continue };
+            let Some((pool_ref, pool_field)) = split_ref(bind) else { continue };
+            let Some(link) = dataset.links.iter().find(|l| l.reference == pool_ref) else { continue };
+            if list_link_refs.contains(link.reference.as_str()) { continue; }
+            let Some(pool_path) = resolve_include(path, &link.file) else { continue };
+            let pf_name = pool_field.to_string();
+            let def = pool_field_default(&pool_path, &pf_name, all_datasets);
+            steps.push(ExecutionStep::CollectToPool {
+                source_path:  path.to_path_buf(),
+                source_field: field.name.clone(),
+                pool_path:    pool_path.clone(),
+                pool_field:   pf_name,
+                group_by:     "_pool_idx".to_string(),
+                reducer:      binding.reducer.clone().unwrap_or(Reducer::Collect),
+                default_val:  def,
+            });
+            if seen_pools.insert(pool_path.clone()) {
+                if let Some(pool_ds) = all_datasets.get(&pool_path) {
+                    pools_to_emit.push((pool_path.clone(), Arc::new(pool_ds.clone())));
+                }
+            }
+        }
+    }
+
+    // Pass 2: emit one EmitDataset per pool, after ALL CollectToPool steps for that pool.
+    for (pool_path, pool_ds) in pools_to_emit {
+        steps.push(ExecutionStep::EmitDataset { path: pool_path, dataset: pool_ds });
     }
 }
 
@@ -382,13 +689,13 @@ fn compute_prefills(
         if sibling_set.contains(child_path) {
             continue;
         }
-        for include in &child_ds.includes {
+        for include in child_ds.include.iter() {
             let Some(resolved) = resolve_include(child_path, &include.file) else { continue };
             if resolved != path {
                 continue;
             }
             for field in &child_ds.data {
-                let Some(ref ref_str) = field.ref_field else { continue };
+                let Some(ref_str) = field.simple_ref() else { continue };
                 let Some((ref_part, target_col)) = split_ref(ref_str) else { continue };
                 if ref_part != include.reference {
                     continue;
@@ -409,20 +716,22 @@ fn build_sibling_groups(
 ) -> HashMap<PathBuf, Vec<Sibling>> {
     let mut groups: HashMap<PathBuf, Vec<Sibling>> = HashMap::new();
     for (outer_path, dataset) in datasets {
-        // Flat siblings: datasets that include a parent with a distribution.
-        for include in &dataset.includes {
-            let Some(d) = include.distribution else { continue };
+        // Flat siblings: datasets that include a parent. Registered unconditionally — even a
+        // ratio-1.0 child must enter conflict pruning so its field constraints are applied
+        // jointly with sibling constraints rather than silently winning via join order.
+        for include in dataset.include.iter() {
             let Some(parent_path) = resolve_include(outer_path, &include.file) else { continue };
             groups.entry(parent_path).or_default().push(Sibling {
                 path: outer_path.clone(),
                 dataset: dataset.clone(),
-                distribution: d,
+                ratio: include.ratio.unwrap_or(1.0),
+                cardinality: include.cardinality.clone(),
                 reference: include.reference.clone(),
                 is_pool: false,
             });
         }
         // Pool siblings: nested-include fields whose content includes another dataset with a
-        // distribution. The pool represents the subset of the included dataset eligible
+        // ratio. The pool represents the subset of the included dataset eligible
         // for list sampling. Its constraints (from list content ref fields) are applied
         // to the parent's generation rather than producing standalone rows.
         collect_pool_siblings(outer_path, dataset, &mut groups);
@@ -437,9 +746,8 @@ fn collect_pool_siblings(
     dataset: &SyntheticDataset,
     groups: &mut HashMap<PathBuf, Vec<Sibling>>,
 ) {
-    for_each_content_include(&dataset.data, &mut |field, inc, item_fields| {
-        let Some(d) = inc.distribution else { return };
-        let Some(inc_path) = resolve_include(outer_path, &inc.file) else { return };
+    for_each_link_content(&dataset.links, &dataset.data, &mut |field, link, item_fields| {
+        let Some(inc_path) = resolve_include(outer_path, &link.file) else { return };
         // Virtual path uniquely identifies this pool within the outer dataset.
         let pool_path = pool_sibling_path(outer_path, &field.name);
         // The pool "dataset" carries only the list-content item fields so that
@@ -450,15 +758,17 @@ fn collect_pool_siblings(
             output_file: None,
             rows: None,
             locale: dataset.locale.clone(),
-            includes: vec![],
+            include: None,
+            links: vec![],
             data: item_fields.to_vec(),
             variants: vec![],
         };
         groups.entry(inc_path).or_default().push(Sibling {
             path: pool_path,
             dataset: pool_dataset,
-            distribution: d,
-            reference: inc.reference.clone(),
+            ratio: link.ratio.unwrap_or(1.0),
+            cardinality: None,
+            reference: link.reference.clone(),
             is_pool: true,
         });
     });
@@ -503,11 +813,16 @@ fn rows_from_includes(
     dataset: &SyntheticDataset,
     counts: &HashMap<PathBuf, usize>,
 ) -> Option<usize> {
-    dataset.includes.iter().find_map(|inc| {
-        let d = inc.distribution.unwrap_or(1.0);
-        let inc_rows = *counts.get(&resolve_include(path, &inc.file)?)?;
-        Some(((inc_rows as f64 * d).round() as usize).max(1))
-    })
+    let inc = dataset.include.as_ref()?;
+    let r = inc.ratio.unwrap_or(1.0);
+    let inc_rows = *counts.get(&resolve_include(path, &inc.file)?)?;
+    let base_rows = (inc_rows as f64 * r).round() as usize;
+    let rows = if let Some(card) = &inc.cardinality {
+        (base_rows as f64 * expected_cardinality(card)).round() as usize
+    } else {
+        base_rows
+    };
+    Some(rows.max(1))
 }
 
 fn rows_from_children(
@@ -518,15 +833,15 @@ fn rows_from_children(
     datasets
         .iter()
         .flat_map(|(other_path, other_ds)| {
-            other_ds.includes.iter().map(move |inc| (other_path, inc))
+            other_ds.include.iter().map(move |inc| (other_path, inc))
         })
         .find_map(|(other_path, inc)| {
-            let d = inc.distribution.filter(|&d| d > 0.0)?;
+            let r = inc.ratio.filter(|&r| r > 0.0)?;
             if resolve_include(other_path, &inc.file)? != *path {
                 return None;
             }
             let other_rows = *counts.get(other_path)?;
-            Some(((other_rows as f64 / d).round() as usize).max(1))
+            Some(((other_rows as f64 / r).round() as usize).max(1))
         })
 }
 
@@ -542,7 +857,8 @@ mod tests {
             rows,
             output_file: None,
             locale: None,
-            includes: vec![],
+            include: None,
+            links: vec![],
             data: Schema::default(),
             variants: vec![],
         }

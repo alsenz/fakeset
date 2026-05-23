@@ -1,0 +1,7 @@
+name: base
+format: parquet
+rows: 50
+data:
+  - name: id
+    type: string
+    generator: uuid

@@ -1,0 +1,7 @@
+name: pool
+format: csv
+rows: 5
+data:
+  - name: item_name
+    type: string
+    generator: name

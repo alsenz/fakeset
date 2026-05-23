@@ -1,0 +1,8 @@
+name: individuals
+format: jsonl
+output_file: individuals
+rows: 5
+data:
+  - name: person_name
+    type: string
+    generator: name

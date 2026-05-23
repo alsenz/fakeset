@@ -1,0 +1,14 @@
+name: main
+format: jsonl
+rows: 3
+links:
+  - file: source.yaml
+    ref: src
+data:
+  - name: items
+    type: list
+    content:
+      group: src
+      fields:
+        - name: missing
+          ref: src.nonexistent    # error: nonexistent does not exist in source

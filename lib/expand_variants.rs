@@ -69,7 +69,7 @@ fn build_local_combinations(variant_paths: &VariantPaths) -> Vec<VariantSchema> 
     let mut combos: Vec<(f64, Schema)> = vec![(1.0, vec![])];
 
     for (path, choices, outer_parquet) in variant_paths {
-        let choice_dists: Vec<Option<f64>> = choices.iter().map(|v| v.distribution).collect();
+        let choice_dists: Vec<Option<f64>> = choices.iter().map(|v| v.ratio).collect();
         let dists = resolve_distributions(&choice_dists);
         let mut next = Vec::with_capacity(combos.len() * choices.len());
 
@@ -86,7 +86,7 @@ fn build_local_combinations(variant_paths: &VariantPaths) -> Vec<VariantSchema> 
 
     combos
         .into_iter()
-        .map(|(dist, data)| VariantSchema { data, distribution: Some(dist), locale: None })
+        .map(|(dist, data)| VariantSchema { data, ratio: Some(dist), locale: None })
         .collect()
 }
 
@@ -97,17 +97,17 @@ fn cross_product_variants(
     globals: &[VariantSchema],
     locals: &[VariantSchema],
 ) -> Vec<VariantSchema> {
-    let global_raw: Vec<Option<f64>> = globals.iter().map(|v| v.distribution).collect();
+    let global_raw: Vec<Option<f64>> = globals.iter().map(|v| v.ratio).collect();
     let global_dists = resolve_distributions(&global_raw);
     let mut result = Vec::with_capacity(globals.len() * locals.len());
 
     for (gv, &gd) in globals.iter().zip(global_dists.iter()) {
         for lv in locals {
-            let joint_dist = gd * lv.distribution.unwrap_or(1.0);
+            let joint_dist = gd * lv.ratio.unwrap_or(1.0);
             let merged_data = deep_merge_schemas(&gv.data, &lv.data);
             result.push(VariantSchema {
                 data: merged_data,
-                distribution: Some(joint_dist),
+                ratio: Some(joint_dist),
                 locale: gv.locale.clone(),
             });
         }
@@ -229,7 +229,7 @@ mod tests {
         FieldVariant {
             field_type: Some(FieldType::String),
             value: Some(serde_yaml::Value::String(val.to_string())),
-            distribution: dist,
+            ratio: dist,
             ..Default::default()
         }
     }
@@ -241,7 +241,8 @@ mod tests {
             output_file: None,
             rows: Some(100),
             locale: None,
-            includes: vec![],
+            include: None,
+            links: vec![],
             data,
             variants: vec![],
         }
@@ -264,7 +265,7 @@ mod tests {
         assert_eq!(ds.variants.len(), 2);
         assert!(ds.data.iter().all(|f| !matches!(f.field_type, Some(FieldType::Variant))));
 
-        let dists: Vec<f64> = ds.variants.iter().map(|v| v.distribution.unwrap()).collect();
+        let dists: Vec<f64> = ds.variants.iter().map(|v| v.ratio.unwrap()).collect();
         assert!((dists[0] - 0.6).abs() < 1e-9);
         assert!((dists[1] - 0.4).abs() < 1e-9);
     }
@@ -290,7 +291,7 @@ mod tests {
 
         assert_eq!(ds.variants.len(), 6, "2 × 3 = 6 combinations");
 
-        let sum: f64 = ds.variants.iter().map(|v| v.distribution.unwrap()).sum();
+        let sum: f64 = ds.variants.iter().map(|v| v.ratio.unwrap()).sum();
         assert!((sum - 1.0).abs() < 1e-9, "joint distributions must sum to 1.0; got {sum}");
     }
 
@@ -298,9 +299,9 @@ mod tests {
     fn free_distributions_split_remainder_equally() {
         let ds = bare_ds(vec![
             make_variant_field("x", vec![
-                FieldVariant { field_type: Some(FieldType::String), distribution: None, ..Default::default() },
-                FieldVariant { field_type: Some(FieldType::String), distribution: None, ..Default::default() },
-                FieldVariant { field_type: Some(FieldType::String), distribution: None, ..Default::default() },
+                FieldVariant { field_type: Some(FieldType::String), ratio: None, ..Default::default() },
+                FieldVariant { field_type: Some(FieldType::String), ratio: None, ..Default::default() },
+                FieldVariant { field_type: Some(FieldType::String), ratio: None, ..Default::default() },
             ]),
         ]);
         let mut map = HashMap::new();
@@ -308,7 +309,7 @@ mod tests {
         let result = expand_field_variants(map).unwrap();
         let ds = result.values().next().unwrap();
         for v in &ds.variants {
-            assert!((v.distribution.unwrap() - 1.0 / 3.0).abs() < 1e-9);
+            assert!((v.ratio.unwrap() - 1.0 / 3.0).abs() < 1e-9);
         }
     }
 
@@ -322,8 +323,8 @@ mod tests {
         ]);
         // Two existing global variants (50/50)
         ds.variants = vec![
-            VariantSchema { data: vec![], distribution: Some(0.5), locale: None },
-            VariantSchema { data: vec![], distribution: Some(0.5), locale: None },
+            VariantSchema { data: vec![], ratio: Some(0.5), locale: None },
+            VariantSchema { data: vec![], ratio: Some(0.5), locale: None },
         ];
 
         let mut map = HashMap::new();
@@ -333,7 +334,7 @@ mod tests {
 
         // 2 global × 2 local = 4
         assert_eq!(ds.variants.len(), 4);
-        let sum: f64 = ds.variants.iter().map(|v| v.distribution.unwrap()).sum();
+        let sum: f64 = ds.variants.iter().map(|v| v.ratio.unwrap()).sum();
         assert!((sum - 1.0).abs() < 1e-9);
     }
 
@@ -367,7 +368,7 @@ mod tests {
     fn range_only_variant_infers_number_type() {
         let choice = FieldVariant {
             range: Some(Range { min: Some(1.0), max: Some(10.0) }),
-            distribution: Some(1.0),
+            ratio: Some(1.0),
             ..Default::default()
         };
         let inferred = infer_field_type(&choice);
@@ -378,7 +379,7 @@ mod tests {
     fn string_value_variant_infers_string_type() {
         let choice = FieldVariant {
             value: Some(serde_yaml::Value::String("hello".into())),
-            distribution: Some(1.0),
+            ratio: Some(1.0),
             ..Default::default()
         };
         let inferred = infer_field_type(&choice);
@@ -392,7 +393,7 @@ mod tests {
         let choice = FieldVariant {
             field_type: Some(FieldType::Number),
             range: Some(Range { min: Some(0.0), max: Some(100.0) }),
-            distribution: Some(1.0),
+            ratio: Some(1.0),
             parquet: None,
             ..Default::default()
         };
@@ -407,7 +408,7 @@ mod tests {
         let inner_parquet = ParquetConfig { datatype: ParquetDatatype::Float32 };
         let choice = FieldVariant {
             field_type: Some(FieldType::Number),
-            distribution: Some(1.0),
+            ratio: Some(1.0),
             parquet: Some(inner_parquet),
             ..Default::default()
         };

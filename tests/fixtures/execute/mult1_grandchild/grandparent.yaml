@@ -1,0 +1,8 @@
+name: grandparent
+format: csv
+output_file: grandparent
+rows: 5
+data:
+  - name: id
+    type: string
+    generator: uuid

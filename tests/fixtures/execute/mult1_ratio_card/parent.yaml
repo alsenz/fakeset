@@ -1,0 +1,8 @@
+name: parent
+format: csv
+output_file: parent
+rows: 10
+data:
+  - name: id
+    type: string
+    generator: uuid

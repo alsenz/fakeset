@@ -1,0 +1,10 @@
+name: child
+format: parquet
+rows: 50    # error: rows cannot be set when include.cardinality is present
+include:
+  file: base.yaml
+  ref: b
+  cardinality: 3
+data:
+  - name: val
+    ref: b.val

@@ -1,0 +1,20 @@
+name: outer
+format: jsonl
+output_file: outer
+rows: 4
+links:
+  - file: pool.yaml
+    ref: pool
+    cardinality: 3
+    reinforcement: 0
+data:
+  - name: slot_name
+    type: string
+    generator: word
+  - name: items
+    type: list
+    content:
+      group: pool
+      fields:
+        - name: pool_id
+          ref: pool.pool_id

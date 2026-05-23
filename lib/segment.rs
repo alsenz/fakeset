@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::constraints::{FieldConstraints, Merge};
-use crate::models::SyntheticDataset;
+use crate::models::{CountSpec, SyntheticDataset};
 
 /// Default cap on the number of siblings in a single sibling group.
 /// Segment enumeration is 2^N, so 16 siblings → 65 536 subsets.
@@ -19,10 +19,12 @@ pub struct Sibling {
     /// Dataset after the rewrite pass (ref fields resolved).
     pub dataset: SyntheticDataset,
     /// Fraction of the parent's population this sibling represents.
-    pub distribution: f64,
+    pub ratio: f64,
+    /// How many child rows to generate per parent-row slot (top-level cardinality).
+    pub cardinality: Option<CountSpec>,
     /// The `ref:` name from the include declaration pointing to the parent.
     pub reference: String,
-    /// True for nested-include pool siblings (created from `content: {includes: [...]}` fields).
+    /// True for nested-include pool siblings (created from `content: {include: {...}}` fields).
     /// Pool siblings do not generate standalone batches — they only contribute field
     /// constraints to the parent's segment generation, and their rows must be placed
     /// first in the parent batch so `GenerateInnerFlat`'s pool_size index is correct.
@@ -90,7 +92,7 @@ pub fn plan_segments(parent_rows: usize, siblings: &[Sibling], max_siblings: usi
         .map(|mask| {
             let mut w = 1.0_f64;
             for (i, sib) in siblings.iter().enumerate() {
-                w *= if in_subset(mask, i) { sib.distribution } else { 1.0 - sib.distribution };
+                w *= if in_subset(mask, i) { sib.ratio } else { 1.0 - sib.ratio };
             }
             w
         })
@@ -261,7 +263,7 @@ fn ipf_rescale_sparse(
     for _ in 0..200 {
         let mut converged = true;
         for i in 0..n {
-            let target = siblings[i].distribution;
+            let target = siblings[i].ratio;
             let mass_in: f64 = feasible.keys()
                 .filter(|&&m| in_subset(m, i))
                 .map(|&m| weights[m])
@@ -328,8 +330,8 @@ pub(crate) fn sibling_field_constraints(sibling: &Sibling) -> HashMap<String, Fi
     let prefix = format!("{}.", sibling.reference);
     let mut map = HashMap::new();
     for field in &sibling.dataset.data {
-        if let Some(ref ref_str) = field.ref_field {
-            if let Some(parent_field_name) = ref_str.strip_prefix(&prefix) {
+        if let Some(ref_str) = field.simple_ref() {
+            if let Some(parent_field_name) = ref_str.strip_prefix(prefix.as_str()) {
                 map.insert(parent_field_name.to_string(), FieldConstraints::from(field));
             }
         }
@@ -340,16 +342,16 @@ pub(crate) fn sibling_field_constraints(sibling: &Sibling) -> HashMap<String, Fi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Field, FieldType, Format, Range};
+    use crate::models::{Field, FieldType, Format, Range, RefsSpec};
     use serde_yaml::Value as YamlValue;
 
-    fn make_sibling(path: &str, distribution: f64, ref_constraints: Vec<(&str, FieldConstraints)>) -> Sibling {
+    fn make_sibling(path: &str, ratio: f64, ref_constraints: Vec<(&str, FieldConstraints)>) -> Sibling {
         let fields = ref_constraints
             .into_iter()
             .map(|(fname, fc)| Field {
                 name: fname.to_string(),
                 field_type: Some(FieldType::String),
-                ref_field: Some(format!("parent_ref.{fname}")),
+                refs: Some(RefsSpec::Single(format!("parent_ref.{fname}"))),
                 generator: fc.generator,
                 range: if fc.min.is_some() || fc.max.is_some() {
                     Some(Range { min: fc.min, max: fc.max })
@@ -369,11 +371,13 @@ mod tests {
                 rows: None,
                 output_file: None,
                 locale: None,
-                includes: vec![],
+                include: None,
+                links: vec![],
                 data: fields,
                 variants: vec![],
             },
-            distribution,
+            ratio,
+            cardinality: None,
             reference: "parent_ref".to_string(),
             is_pool: false,
         }

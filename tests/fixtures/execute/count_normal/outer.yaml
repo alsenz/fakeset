@@ -2,20 +2,21 @@ name: outer
 format: jsonl
 output_file: outer
 rows: 10
+links:
+  - file: pool.yaml
+    ref: p
+    ratio: 0.8
+    cardinality:
+      mean: 3.0
+      std_dev: 1.0
 data:
   - name: id
     type: string
     generator: uuid
   - name: samples
     type: list
-    count:
-      mean: 3.0
-      std_dev: 1.0
     content:
-      includes:
-        - file: pool.yaml
-          ref: p
-          distribution: 0.8
+      group: p
       fields:
         - name: val
           ref: p.val

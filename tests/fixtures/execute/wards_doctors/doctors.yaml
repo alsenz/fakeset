@@ -1,0 +1,13 @@
+name: doctors
+format: jsonl
+output_file: doctors
+rows: 5
+data:
+  - name: doctor_name
+    type: string
+    generator: name
+  - name: on_call_wards
+    type: list
+    content:
+      type: string
+    default: []

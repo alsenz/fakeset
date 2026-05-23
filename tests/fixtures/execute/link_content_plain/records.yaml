@@ -1,0 +1,30 @@
+name: records
+format: jsonl
+output_file: records
+rows: 5
+links:
+  - file: pool.yaml
+    ref: entry
+    ratio: 0.8
+    cardinality:
+      min: 1
+      max: 4
+data:
+  - name: record_id
+    type: string
+    generator: uuid
+  - name: entries
+    type: list
+    content:
+      group: entry
+      fields:
+        - name: tag
+          ref: entry.tag
+        - name: badge
+          type: string
+          generator: word
+        - name: score
+          type: number
+          range:
+            min: 0
+            max: 10

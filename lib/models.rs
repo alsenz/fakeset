@@ -14,6 +14,17 @@ pub enum CountSpec {
     Uniform { min: usize, max: usize },
 }
 
+/// Returns the expected (mean) value of a `CountSpec` for row-count planning purposes.
+/// This is a planning estimate, not a stochastic sample — use `generator::sample_count`
+/// at execution time when an actual draw is needed.
+pub fn expected_cardinality(spec: &CountSpec) -> f64 {
+    match spec {
+        CountSpec::Fixed(n)             => *n as f64,
+        CountSpec::Uniform { min, max } => (*min + *max) as f64 / 2.0,
+        CountSpec::Normal  { mean, .. } => *mean,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
@@ -131,7 +142,8 @@ pub struct FieldVariant {
     /// Fraction of this variant field's population allocated to this choice.
     /// Free slots (None) share the remainder equally.  Must sum to ≤ 1.0;
     /// if all are set they must sum to exactly 1.0.
-    pub distribution: Option<f64>,
+    #[serde(alias = "distribution")]
+    pub ratio: Option<f64>,
 }
 
 /// Selects a specific fake-rs faker to drive value generation.
@@ -318,19 +330,59 @@ pub struct Range {
     pub max: Option<f64>,
 }
 
+/// Specifies one or more ref bindings on a field.
+///
+/// `Single` covers the common case (`ref: include_ref.field`) and `Multi` supports
+/// multiple entries including collect reducer bindings (`refs: [...]`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RefsSpec {
+    Single(String),
+    Multi(Vec<RefEntry>),
+}
+
+/// One entry in a multi-ref `refs:` list.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RefEntry {
+    Simple(String),
+    Rich(RefBinding),
+}
+
+/// A rich ref binding — carries an optional type-source target and an optional collect binding.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefBinding {
+    /// The ref target (`"include_ref.field_name"`). Absent on bind-only entries.
+    pub target: Option<String>,
+    /// The collect target (`"pool_ref.field_name"`). Used with `reducer: collect`.
+    pub bind: Option<String>,
+    pub reducer: Option<Reducer>,
+}
+
+/// How values are assembled when the referenced include has a different cardinality.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reducer {
+    TakeFirst,
+    Sum,
+    Max,
+    Min,
+    Collect,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Field {
     #[serde(default)]
     pub name: String,
-    /// Concrete type. Absent when `ref_field` is set; populated by the rewrite
+    /// Concrete type. Absent when `refs` is set; populated by the rewrite
     /// pass before execution.
     #[serde(rename = "type")]
     pub field_type: Option<FieldType>,
-    /// Cross-dataset field reference in the form `"include_ref.field_name"`.
-    /// When set, `field_type`, `fields`, and `content` must all be absent in
-    /// the YAML; they are filled in by `resolve_refs`.
-    #[serde(rename = "ref")]
-    pub ref_field: Option<String>,
+    /// Cross-dataset field reference(s). `ref` is a serde alias for backward-compat.
+    /// Use `simple_ref()` to get the type-sourcing ref string; use `collect_bindings()`
+    /// for collect reducer targets.
+    #[serde(alias = "ref")]
+    pub refs: Option<RefsSpec>,
     /// Selects a specific fake-rs faker. Absent means the type default is used.
     pub generator: Option<Generator>,
     /// Locale for fake-rs data. Only valid on generators that support locale selection;
@@ -369,11 +421,43 @@ pub struct Field {
     /// powers of 10 (e.g. -2 rounds to the nearest 100). Applied after generation.
     /// Ignored on non-number fields.
     pub precision: Option<i32>,
+    /// Default value used when this field is not prefilled by any child.
+    /// Must be type-compatible with `field_type`. List fields use `default: []`
+    /// as the empty-collect fallback required by `reducer: collect` bindings.
+    pub default: Option<serde_yaml::Value>,
 }
 
 impl Field {
-    pub fn is_nested_include(&self) -> bool {
-        self.content.as_deref().is_some_and(|c| !c.includes.is_empty())
+    /// Returns true when this field is a list whose items are drawn from a linked dataset
+    /// (i.e. `content.group:` is set).
+    pub fn is_link_content(&self) -> bool {
+        self.content.as_deref().is_some_and(|c| c.group.is_some())
+    }
+
+    /// Returns the type-sourcing ref string — the first non-bind-only target from `refs`, if any.
+    pub fn simple_ref(&self) -> Option<&str> {
+        match &self.refs {
+            Some(RefsSpec::Single(s)) => Some(s.as_str()),
+            Some(RefsSpec::Multi(entries)) => entries.iter().find_map(|e| match e {
+                RefEntry::Simple(s)  => Some(s.as_str()),
+                RefEntry::Rich(b)    => b.target.as_deref(),
+            }),
+            None => None,
+        }
+    }
+
+    /// Returns all collect bindings declared on this field.
+    /// Returns all ref bindings that carry a `reducer` (i.e. planning annotations, not
+    /// type-sourcing refs). This includes all reducer variants: `collect`, `sum`, `max`,
+    /// `min`, and `take_first`.
+    pub fn collect_bindings(&self) -> Vec<&RefBinding> {
+        match &self.refs {
+            Some(RefsSpec::Multi(entries)) => entries.iter().filter_map(|e| match e {
+                RefEntry::Rich(b) if b.reducer.is_some() => Some(b),
+                _ => None,
+            }).collect(),
+            _ => vec![],
+        }
     }
 }
 
@@ -385,21 +469,24 @@ pub fn resolve_distributions(dists: &[Option<f64>]) -> Vec<f64> {
     dists.iter().map(|d| d.unwrap_or(free_share)).collect()
 }
 
-/// Call `visitor(field, include, item_fields)` for every `content: {includes: [...]}` entry
-/// found by recursing through `fields`, then recursing into content item fields and object
-/// sub-fields.
-pub fn for_each_content_include<'a>(
+/// Call `visitor(field, link, item_fields)` for every link-content field (`content.group:` set)
+/// found by recursing through `fields`, pairing each with the matching link from `links`.
+/// Also recurses into content item fields and object sub-fields.
+pub fn for_each_link_content<'a>(
+    links: &'a [Include],
     fields: &'a [Field],
     visitor: &mut impl FnMut(&'a Field, &'a Include, &'a [Field]),
 ) {
     for field in fields {
         if let Some(content) = &field.content {
-            for inc in &content.includes {
-                visitor(field, inc, &content.item.fields);
+            if let Some(group_ref) = &content.group {
+                if let Some(link) = links.iter().find(|l| &l.reference == group_ref) {
+                    visitor(field, link, &content.item.fields);
+                }
             }
-            for_each_content_include(&content.item.fields, visitor);
+            for_each_link_content(links, &content.item.fields, visitor);
         }
-        for_each_content_include(&field.fields, visitor);
+        for_each_link_content(links, &field.fields, visitor);
     }
 }
 
@@ -421,27 +508,32 @@ pub(crate) fn resolve_include(dataset_path: &Path, file: &str) -> Option<PathBuf
         .ok()
 }
 
-/// Element spec for a `list` type field: a [`Field`] plus an optional set of includes.
+/// Element spec for a `list` type field.
 ///
-/// When `includes` is non-empty this is a **nested include**: each list item is a struct whose
-/// fields may be sourced from an included dataset (include-scoped ref: `ref: include_ref.field`)
-/// or from the enclosing outer row (outer-scoped ref: `ref: field`). Include-scoped field names
-/// live under `fields:`; the nested-include pipeline (GenerateInnerFlat / AssembleNestedInclude)
-/// handles generation and assembly.
+/// When `group` is set this is a **nested include**: each list item is a struct whose fields
+/// may be sourced from the pool dataset named by `group` (pool-scoped ref: `ref: <ref>.field`)
+/// or from the enclosing outer row (outer-scoped ref: `ref: field`). The named pool dataset
+/// must be declared in the parent dataset's `links:` list. The nested-include pipeline
+/// (`GenerateInnerFlat` / `AssembleNestedInclude`) handles generation and assembly.
 ///
-/// When `includes` is empty this is a **simple list**: items are generated directly from the
+/// When `group` is absent this is a **simple list**: items are generated directly from the
 /// `item` field spec, exactly as a plain field would be.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListContent {
-    /// When non-empty, marks this as a nested include. Each entry names a dataset
-    /// whose rows supply values for include-scoped ref fields (`ref: include_ref.field`).
-    /// Set `distribution` on an include to narrow the sampled subset.
-    #[serde(default)]
-    pub includes: Vec<Include>,
+    /// When set, names the link (by its `ref:` value in the dataset's `links:` list) whose
+    /// pre-solved pool-slot rows supply values for pool-scoped ref fields. Marks this as a
+    /// nested include.
+    pub group: Option<String>,
+    /// Project a single field from the linked dataset, producing a scalar list instead of a
+    /// list of structs. Value must be `"<link_ref>.<field_name>"`. Mutually exclusive with
+    /// explicit `fields` in `item`.
+    pub project: Option<String>,
     #[serde(flatten)]
     pub item: Field,
 }
 
+/// One concrete variant of a dataset: a data schema fragment (merged on top of the
+/// dataset's base `data`), an optional locale override, and an optional row-fraction.
 pub type Schema = Vec<Field>;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -449,14 +541,28 @@ pub struct Include {
     pub file: String,
     #[serde(rename = "ref")]
     pub reference: String,
-    /// Fraction of the included population this dataset represents (0.0–1.0).
-    /// When set on two or more siblings that share a common parent, the executor
-    /// injects a Bernoulli segmentation to correctly model the overlap.
-    pub distribution: Option<f64>,
+    /// Marginal row-membership probability (0.0–1.0). When set on two or more siblings that
+    /// share a common parent, the executor uses Bernoulli segmentation + IPF to correctly
+    /// model the overlap.
+    #[serde(alias = "distribution")]
+    pub ratio: Option<f64>,
+    /// How many times each child row is replicated into the parent batch (top-level include),
+    /// or how many items to draw per outer row (links entry used as a pool partner).
+    pub cardinality: Option<CountSpec>,
+    /// Sampling intensity: 0 = without-replacement, 1 = uniform, >1 = clumping.
+    /// Model field only; execution deferred to MULT-2.
+    pub reinforcement: Option<f64>,
+    /// Field names to automatically copy from the included dataset into this dataset's `data`
+    /// (driver `include`) or into the associated list field's `content.fields` (list links).
+    /// Use `["*"]` to copy all fields; otherwise list specific field names.
+    /// Each matched field becomes a `ref: <ref>.<field>` entry, resolved in the rewrite phase.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// Field names to suppress after wildcard/pattern expansion.
+    /// Only valid when `fields` is non-empty.
+    pub exclude: Option<Vec<String>>,
 }
 
-/// One concrete variant of a dataset: a data schema fragment (merged on top of the
-/// dataset's base `data`), an optional locale override, and an optional row-fraction.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VariantSchema {
     /// Fields that override or extend the dataset's base `data` for this variant.
@@ -466,9 +572,10 @@ pub struct VariantSchema {
     /// Locale override for this variant's fields. Falls back to the dataset-level locale.
     pub locale: Option<Locale>,
     /// Fraction of the parent dataset's rows this variant receives (0.0–1.0).
-    /// Variants without a distribution share the remainder equally.
-    /// All distributions must sum to ≤ 1.0; if all are set they must sum to exactly 1.0.
-    pub distribution: Option<f64>,
+    /// Variants without a ratio share the remainder equally.
+    /// All ratios must sum to ≤ 1.0; if all are set they must sum to exactly 1.0.
+    #[serde(alias = "distribution")]
+    pub ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -479,14 +586,19 @@ pub struct SyntheticDataset {
     /// that does not set its own explicit `locale`. Field-level `locale` takes precedence.
     pub locale: Option<Locale>,
     /// Explicit row count. Must not be set when any include specifies a
-    /// `distribution` — in that case rows are derived from the parent size.
+    /// `ratio` — in that case rows are derived from the parent size.
     pub rows: Option<usize>,
     /// Write output appended into this named file rather than a per-dataset
     /// file, allowing multiple combinatorial factor datasets to be unioned
     /// and randomly shuffled into one output.
     pub output_file: Option<String>,
+    pub include: Option<Include>,
+    /// Pool/partner datasets for junction or nested-include list sampling.
+    /// Each entry names a dataset (by file + ref) from which atoms draw pool-scoped values.
+    /// A link referenced by a `content.group:` field is a **list link** (nested-include pipeline).
+    /// A link with no `content.group:` reference is a **junction link** (activated in MULT-2).
     #[serde(default)]
-    pub includes: Vec<Include>,
+    pub links: Vec<Include>,
     #[serde(default)]
     pub data: Schema,
     /// When non-empty, the dataset is virtually split into N concrete variants at plan time.

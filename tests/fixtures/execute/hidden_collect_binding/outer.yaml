@@ -1,0 +1,26 @@
+name: outer
+format: jsonl
+output_file: outer
+rows: 3
+links:
+  - file: pool.yaml
+    ref: pool
+    cardinality: 2
+data:
+  - name: outer_id
+    type: string
+    generator: uuid
+  - name: items
+    type: list
+    content:
+      group: pool
+      fields:
+        - name: pool_ref
+          refs:
+            - pool.pool_name
+            - bind: pool.seen_in
+              reducer: collect
+          hidden: true
+        - name: label
+          type: string
+          generator: word

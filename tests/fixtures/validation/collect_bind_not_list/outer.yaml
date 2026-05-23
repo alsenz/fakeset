@@ -1,0 +1,20 @@
+name: outer
+format: csv
+rows: 10
+links:
+  - file: pool.yaml
+    ref: pool
+    cardinality: 2
+data:
+  - name: label
+    type: string
+    generator: name
+  - name: items
+    type: list
+    content:
+      group: pool
+      fields:
+        - name: item
+          refs:
+            - pool.item_name
+            - {bind: pool.item_name, reducer: collect}

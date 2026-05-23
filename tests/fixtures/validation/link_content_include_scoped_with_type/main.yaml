@@ -1,0 +1,15 @@
+name: main
+format: jsonl
+rows: 3
+links:
+  - file: source.yaml
+    ref: src
+data:
+  - name: items
+    type: list
+    content:
+      group: src
+      fields:
+        - name: label
+          type: string    # error: type must not be set on a pool-scoped ref
+          ref: src.label

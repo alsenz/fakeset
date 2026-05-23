@@ -1,5 +1,5 @@
 name: base
 format: parquet
-includes:
-  - file: types.yaml
-    ref: type_defs
+include:
+  file: types.yaml
+  ref: type_defs

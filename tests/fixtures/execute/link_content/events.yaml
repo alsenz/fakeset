@@ -1,0 +1,28 @@
+name: events
+format: jsonl
+output_file: events
+rows: 5
+links:
+  - file: people.yaml
+    ref: person
+    ratio: 0.5
+    cardinality:
+      min: 1
+      max: 4
+data:
+  - name: event_id
+    type: string
+    generator: uuid
+  - name: title
+    type: string
+    generator: sentence
+  - name: attendees
+    type: list
+    content:
+      group: person
+      fields:
+        - name: name
+          ref: person.full_name
+        - name: event_title
+          type: string
+          ref: title

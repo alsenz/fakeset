@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constraints::validate_field_constraints;
 use crate::expressions::extract_identifiers;
-use crate::models::{resolve_include, split_ref, Field, FieldType, FieldVariant, Include, Schema, SyntheticDataset};
+use crate::models::{resolve_include, split_ref, CountSpec, Field, FieldType, FieldVariant, Include, RefBinding, Reducer, Schema, SyntheticDataset};
 
 /// Validate all loaded datasets, returning any non-fatal warnings.
 /// Hard errors (e.g. `rows` set alongside `distribution`) are returned as `Err`.
@@ -24,8 +24,8 @@ fn validate_dataset(
 ) -> Result<()> {
     // Rule 0: variant distribution consistency.
     if !dataset.variants.is_empty() {
-        let fixed_sum: f64 = dataset.variants.iter().filter_map(|v| v.distribution).sum();
-        let n_free = dataset.variants.iter().filter(|v| v.distribution.is_none()).count();
+        let fixed_sum: f64 = dataset.variants.iter().filter_map(|v| v.ratio).sum();
+        let n_free = dataset.variants.iter().filter(|v| v.ratio.is_none()).count();
         if fixed_sum > 1.0 + 1e-9 {
             bail!(
                 "dataset '{}': variant distributions sum to {:.4} which exceeds 1.0",
@@ -46,18 +46,18 @@ fn validate_dataset(
         }
     }
 
-    // Rule 1: explicit rows is incompatible with distribution includes.
-    if dataset.rows.is_some() && dataset.includes.iter().any(|i| i.distribution.is_some()) {
+    // Rule 1: explicit rows is incompatible with ratio includes.
+    if dataset.rows.is_some() && dataset.include.as_ref().map_or(false, |i| i.ratio.is_some()) {
         bail!(
-            "dataset '{}': `rows` cannot be set when any include specifies a `distribution` \
-             — the row count is derived from the distribution percentage and the included \
+            "dataset '{}': `rows` cannot be set when `include` specifies a `ratio` \
+             — the row count is derived from the ratio and the included \
              dataset's size. Remove the `rows` field.",
             dataset.name
         );
     }
 
-    // Rule 2: root datasets (no includes) must declare an explicit row count.
-    if dataset.rows.is_none() && dataset.includes.is_empty() {
+    // Rule 2: root datasets (no include) must declare an explicit row count.
+    if dataset.rows.is_none() && dataset.include.is_none() {
         warnings.push(format!(
             "warning: dataset '{}' has no includes and no explicit `rows` \
              — defaulting to 100 rows",
@@ -65,10 +65,79 @@ fn validate_dataset(
         ));
     }
 
-    // Rule 3: multiple includes with mismatched expected row counts.
-    if dataset.includes.len() > 1 {
-        if let Some(warning) = check_row_count_mismatch(path, dataset, all) {
-            warnings.push(warning);
+    // Rule: validate links.
+    let group_refs = collect_group_refs(&dataset.data);
+    for link in &dataset.links {
+        if resolve_include(path, &link.file).is_none() {
+            bail!(
+                "dataset '{}': linked file not found: '{}'",
+                dataset.name, link.file
+            );
+        }
+        if !group_refs.contains(&link.reference) {
+            // Junction link: cardinality is not meaningful (one pool row sampled per junction row).
+            if link.cardinality.is_some() {
+                bail!(
+                    "dataset '{}': junction link '{}' must not set `cardinality` — \
+                     junction links sample exactly one pool row per junction row",
+                    dataset.name, link.reference
+                );
+            }
+        }
+    }
+    // group ref must match a link.
+    for group_ref in &group_refs {
+        if !dataset.links.iter().any(|l| &l.reference == group_ref) {
+            bail!(
+                "dataset '{}': `content.group: {}` does not match any entry in `links`",
+                dataset.name, group_ref
+            );
+        }
+    }
+    // Two content.group fields may not reference the same link.
+    let mut seen_groups: HashSet<&str> = HashSet::new();
+    for gr in &group_refs {
+        if !seen_groups.insert(gr.as_str()) {
+            bail!(
+                "dataset '{}': two or more list fields share `content.group: {}` — each link may be referenced by at most one list field",
+                dataset.name, gr
+            );
+        }
+    }
+
+    // Rule: include.fields / exclude consistency.
+    let check_fields_exclude = |inc: &Include, kind: &str| -> Result<()> {
+        if inc.exclude.is_some() && inc.fields.is_empty() {
+            bail!(
+                "dataset '{}': {} '{}': `exclude` is only valid when `fields` is also set",
+                dataset.name, kind, inc.reference
+            );
+        }
+        Ok(())
+    };
+    if let Some(inc) = &dataset.include {
+        check_fields_exclude(inc, "include")?;
+        if !inc.fields.is_empty() {
+            validate_include_fields(path, dataset, inc, all, warnings);
+        }
+    }
+    for link in &dataset.links {
+        check_fields_exclude(link, "link")?;
+        if !link.fields.is_empty() {
+            validate_include_fields(path, dataset, link, all, warnings);
+        }
+    }
+
+    // Rule: top-level include cardinality constraints.
+    if let Some(inc) = &dataset.include {
+        if let Some(card) = &inc.cardinality {
+            if dataset.rows.is_some() {
+                bail!(
+                    "dataset '{}': `rows` cannot be set when `include.cardinality` is present",
+                    dataset.name
+                );
+            }
+            validate_cardinality(card, &format!("dataset '{}'", dataset.name))?;
         }
     }
 
@@ -80,11 +149,14 @@ fn validate_dataset(
         let field_path = format!("{}.{}", dataset.name, field.name);
         validate_field(&field_path, field, warnings)?;
 
-        // Rich list content needs full dataset context — handle separately.
+        // Link-content fields need full dataset context — handle separately.
         if let Some(content) = &field.content {
-            if !content.includes.is_empty() {
-                let content_path = format!("{field_path}[]");
-                validate_rich_content(&content_path, &content.includes, &content.item.fields, path, dataset, all, warnings)?;
+            if let Some(ref group_ref) = content.group {
+                if let Some(link) = dataset.links.iter().find(|l| &l.reference == group_ref) {
+                    let content_path = format!("{field_path}[]");
+                    validate_project(content, link, &content_path, path, dataset, all)?;
+                    validate_link_content(&content_path, link, &content.item.fields, path, dataset, all, warnings)?;
+                }
             }
         }
     }
@@ -95,6 +167,9 @@ fn validate_dataset(
     // Rule 5: expression variables only reference fields defined above them (YAML order).
     validate_expression_order(dataset)?;
 
+    // Rule 6: collect reducer bindings are structurally valid.
+    validate_collect_bindings(path, dataset, all)?;
+
     Ok(())
 }
 
@@ -104,7 +179,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         if field.field_type.is_some() {
             bail!("field '{path}': `expression` cannot be combined with `type`");
         }
-        if field.ref_field.is_some() {
+        if field.simple_ref().is_some() {
             bail!("field '{path}': `expression` cannot be combined with `ref`");
         }
         let has_range = field.range.as_ref().map(|r| r.min.is_some() || r.max.is_some()).unwrap_or(false);
@@ -125,7 +200,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     // `fields` and `content` are structural, not constraints, so also banned.
     // Constraint fields (generator, min, max, value) are allowed — they specialise
     // the referenced field and are merged with its constraints during the rewrite step.
-    if field.ref_field.is_some() {
+    if field.simple_ref().is_some() {
         if field.field_type.is_some() {
             bail!(
                 "field '{path}': `type` cannot be set alongside `ref` \
@@ -158,7 +233,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     }
 
     // Type-dependent checks require a known type — deferred to the rewrite step for ref fields.
-    if field.ref_field.is_some() {
+    if field.simple_ref().is_some() {
         return Ok(());
     }
 
@@ -175,8 +250,8 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         for (i, choice) in field.variants.iter().enumerate() {
             validate_field_variant(&format!("{path}.variants[{i}]"), choice, warnings)?;
         }
-        let fixed_sum: f64 = field.variants.iter().filter_map(|v| v.distribution).sum();
-        let n_free = field.variants.iter().filter(|v| v.distribution.is_none()).count();
+        let fixed_sum: f64 = field.variants.iter().filter_map(|v| v.ratio).sum();
+        let n_free = field.variants.iter().filter(|v| v.ratio.is_none()).count();
         if fixed_sum > 1.0 + 1e-9 {
             bail!(
                 "field '{path}': variant distributions sum to {:.4} which exceeds 1.0",
@@ -250,29 +325,55 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
                 "warning: field '{path}' is `list` type but has no `content` \
                  — will generate empty lists"
             )),
-            Some(c) if c.includes.is_empty() => {
+            Some(c) if c.group.is_none() => {
                 validate_field(&format!("{path}[]"), &c.item, warnings)?;
             }
             Some(_) => {
-                // Rich list — validated separately in validate_dataset (requires full context).
+                // Rich list — count must not be set on the field; cardinality belongs on the link.
+                if field.count.is_some() {
+                    bail!(
+                        "field '{path}': `count` cannot be set on a nested-include list field — \
+                         use `cardinality` on the link in `links`"
+                    );
+                }
+                // Remaining validation requires full dataset context; handled in validate_dataset.
             }
+        }
+    }
+
+    // `default` value must be type-compatible with the declared field type.
+    if let Some(default_val) = &field.default {
+        let (compatible, expected) = match field_type {
+            FieldType::Number   => (default_val.is_number(), "a number"),
+            FieldType::String | FieldType::Date | FieldType::DateTime
+                                => (default_val.is_string(), "a string"),
+            FieldType::Boolean  => (default_val.is_bool(), "a boolean"),
+            FieldType::List     => (default_val.is_sequence(), "a sequence (e.g. `default: []`)"),
+            FieldType::Object   => (default_val.is_mapping(), "a mapping"),
+            FieldType::Variant  => (true, ""),
+        };
+        if !compatible {
+            bail!(
+                "field '{path}': `default` value is incompatible with `type: {field_type}` — \
+                 expected {expected}"
+            );
         }
     }
 
     Ok(())
 }
 
-/// Validate all fields inside a `content: {includes: [...], data: {...}}` block.
+/// Validate all fields inside a `content: {group: <ref>, ...}` block.
 ///
 /// Two ref scopes apply:
-/// - **Include-scoped** (`ref: include_ref.field`): dot-prefixed with the content include ref;
-///   the include must exist in `rich_includes` and the target field in the included dataset.
-/// - **Outer-scoped** (`ref: field`): no dot (or dot not matching any include ref); the field
+/// - **Pool-scoped** (`ref: link_ref.field`): dot-prefixed with the link ref; the target
+///   field must exist in the linked dataset.
+/// - **Outer-scoped** (`ref: field`): no dot (or dot not matching the link ref); the field
 ///   must exist in the enclosing `dataset`. An explicit `type:` must be set (auto-inference
 ///   from the outer field is not yet supported).
-fn validate_rich_content(
+fn validate_link_content(
     path: &str,
-    rich_includes: &[Include],
+    link: &Include,
     data: &Schema,
     dataset_path: &Path,
     dataset: &SyntheticDataset,
@@ -289,30 +390,30 @@ fn validate_rich_content(
             bail!("field '{fpath}': `expression` is not supported inside nested include content");
         }
 
-        if let Some(ref ref_str) = field.ref_field {
-            // Determine scope: include-scoped (dot matches a content include) or outer-scoped.
-            let include_scoped = split_ref(ref_str)
-                .and_then(|(ref_part, _)| rich_includes.iter().find(|i| i.reference == ref_part));
+        if let Some(ref_str) = field.simple_ref() {
+            // Determine scope: pool-scoped (dot matches the link ref) or outer-scoped.
+            let pool_scoped = split_ref(ref_str)
+                .and_then(|(ref_part, _)| if link.reference == ref_part { Some(link) } else { None });
 
-            if let Some(include) = include_scoped {
-                // Include-scoped ref — type must not be set (inherited from include target).
+            if let Some(inc) = pool_scoped {
+                // Pool-scoped ref — type must not be set (inherited from link target).
                 if field.field_type.is_some() {
                     bail!(
-                        "field '{fpath}': `type` cannot be set alongside an include-scoped `ref` \
+                        "field '{fpath}': `type` cannot be set alongside a pool-scoped `ref` \
                          — the type is inherited from the referenced field"
                     );
                 }
                 let (_, target_name) = split_ref(ref_str).unwrap();
-                let inc_path = resolve_include(dataset_path, &include.file).ok_or_else(|| {
-                    anyhow!("field '{fpath}': cannot resolve include file '{}'", include.file)
+                let inc_path = resolve_include(dataset_path, &inc.file).ok_or_else(|| {
+                    anyhow!("field '{fpath}': cannot resolve link file '{}'", inc.file)
                 })?;
                 let included = all.get(&inc_path).ok_or_else(|| {
-                    anyhow!("field '{fpath}': included dataset '{}' not loaded", include.file)
+                    anyhow!("field '{fpath}': linked dataset '{}' not loaded", inc.file)
                 })?;
                 if !included.data.iter().any(|f| f.name == target_name) {
                     bail!(
                         "field '{fpath}': ref '{}' — field '{}' does not exist in '{}'",
-                        ref_str, target_name, include.file
+                        ref_str, target_name, inc.file
                     );
                 }
             } else {
@@ -324,7 +425,7 @@ fn validate_rich_content(
                     );
                 }
                 // Validate that the outer field actually exists in the enclosing dataset.
-                if !dataset.data.iter().any(|f| f.name == ref_str.as_str()) {
+                if !dataset.data.iter().any(|f| f.name == ref_str) {
                     bail!(
                         "field '{fpath}': outer-scoped ref '{ref_str}' — \
                          field '{ref_str}' does not exist in dataset '{}'",
@@ -414,13 +515,152 @@ fn validate_field_variant(path: &str, choice: &FieldVariant, warnings: &mut Vec<
     Ok(())
 }
 
+fn validate_cardinality(card: &CountSpec, ctx: &str) -> Result<()> {
+    match card {
+        CountSpec::Fixed(n) if *n < 1 => {
+            bail!("{ctx}: `cardinality` must be at least 1, got {n}");
+        }
+        CountSpec::Uniform { min, .. } if *min < 1 => {
+            bail!("{ctx}: `cardinality.min` must be at least 1, got {min}");
+        }
+        CountSpec::Uniform { min, max } if min > max => {
+            bail!("{ctx}: `cardinality.min` ({min}) must be ≤ `cardinality.max` ({max})");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_collect_bindings(
+    dataset_path: &Path,
+    dataset: &SyntheticDataset,
+    all: &HashMap<PathBuf, SyntheticDataset>,
+) -> Result<()> {
+    // Top-level fields (Case 1 — junction dataset, activated in Stage 4).
+    for field in &dataset.data {
+        let field_path = format!("{}.{}", dataset.name, field.name);
+        for binding in field.collect_bindings() {
+            validate_single_collect_bind(dataset_path, dataset, all, &field_path, binding)?;
+        }
+
+        // Case 2 — fields inside nested-include content blocks.
+        if let Some(content) = &field.content {
+            if content.group.is_some() {
+                for cf in &content.item.fields {
+                    let cf_path = format!("{field_path}[].{}", cf.name);
+                    for binding in cf.collect_bindings() {
+                        validate_single_collect_bind(dataset_path, dataset, all, &cf_path, binding)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_single_collect_bind(
+    dataset_path: &Path,
+    dataset: &SyntheticDataset,
+    all: &HashMap<PathBuf, SyntheticDataset>,
+    field_path: &str,
+    binding: &RefBinding,
+) -> Result<()> {
+    let bind = binding.bind.as_deref().ok_or_else(|| {
+        anyhow!("field '{field_path}': collect binding has no `bind` target")
+    })?;
+
+    let (pool_ref, pool_field_name) = split_ref(bind).ok_or_else(|| {
+        anyhow!(
+            "field '{field_path}': collect `bind: {bind}` must be in the form \
+             'pool_ref.field_name'"
+        )
+    })?;
+
+    let link = dataset
+        .links
+        .iter()
+        .find(|l| l.reference == pool_ref)
+        .ok_or_else(|| {
+            anyhow!(
+                "field '{field_path}': collect `bind: {bind}` — \
+                 no link with ref '{pool_ref}' in this dataset"
+            )
+        })?;
+
+    let pool_path = resolve_include(dataset_path, &link.file).ok_or_else(|| {
+        anyhow!(
+            "field '{field_path}': collect `bind: {bind}` — \
+             cannot resolve pool file '{}'",
+            link.file
+        )
+    })?;
+
+    let pool_ds = all.get(&pool_path).ok_or_else(|| {
+        anyhow!("field '{field_path}': collect `bind: {bind}` — pool dataset not loaded")
+    })?;
+
+    let pool_field = pool_ds
+        .data
+        .iter()
+        .find(|f| f.name == pool_field_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "field '{field_path}': collect `bind: {bind}` — \
+                 field '{pool_field_name}' not found in '{}'",
+                link.file
+            )
+        })?;
+
+    // Type compatibility: each reducer requires a specific pool field type.
+    let reducer = binding.reducer.as_ref().unwrap_or(&Reducer::Collect);
+    match reducer {
+        Reducer::Collect => {
+            if !matches!(pool_field.field_type, Some(FieldType::List)) {
+                bail!(
+                    "field '{field_path}': collect `bind: {bind}` — \
+                     target field '{pool_field_name}' in '{}' must be `type: list` \
+                     (collect accumulates values into a list; got type: {:?})",
+                    link.file,
+                    pool_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
+                );
+            }
+        }
+        Reducer::Sum => {
+            if !matches!(pool_field.field_type, Some(FieldType::Number)) {
+                bail!(
+                    "field '{field_path}': sum `bind: {bind}` — \
+                     target field '{pool_field_name}' in '{}' must be `type: number` \
+                     (sum requires a numeric target; got type: {:?})",
+                    link.file,
+                    pool_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
+                );
+            }
+        }
+        Reducer::Max | Reducer::Min | Reducer::TakeFirst => {
+            // No type restriction — max/min/take_first work on any orderable type.
+        }
+    }
+
+    if pool_field.default.is_none() {
+        bail!(
+            "field '{field_path}': {:?} `bind: {bind}` — \
+             target field '{pool_field_name}' in '{}' must declare `default:` \
+             (the default is used when no atoms map to that pool row)",
+            reducer,
+            link.file
+        );
+    }
+
+    Ok(())
+}
+
 fn validate_dataset_refs(
     path: &Path,
     dataset: &SyntheticDataset,
     all: &HashMap<PathBuf, SyntheticDataset>,
 ) -> Result<()> {
     for field in &dataset.data {
-        if let Some(ref ref_str) = field.ref_field {
+        if let Some(ref_str) = field.simple_ref() {
             validate_ref_target(path, dataset, all, &field.name, ref_str)?;
         }
     }
@@ -442,12 +682,13 @@ fn validate_ref_target(
     })?;
 
     let include = dataset
-        .includes
+        .include
         .iter()
+        .chain(dataset.links.iter())
         .find(|i| i.reference == include_ref)
         .ok_or_else(|| {
             anyhow!(
-                "field '{}.{}': ref '{}' — no include with ref '{}' in this dataset",
+                "field '{}.{}': ref '{}' — no include or link with ref '{}' in this dataset",
                 dataset.name, field_name, ref_str, include_ref
             )
         })?;
@@ -476,6 +717,125 @@ fn validate_ref_target(
     Ok(())
 }
 
+/// Collect all `content.group` ref strings found recursively in a field list.
+fn collect_group_refs(fields: &[Field]) -> Vec<String> {
+    let mut refs = Vec::new();
+    for field in fields {
+        if let Some(content) = &field.content {
+            if let Some(ref g) = content.group {
+                refs.push(g.clone());
+            }
+            refs.extend(collect_group_refs(&content.item.fields));
+        }
+        refs.extend(collect_group_refs(&field.fields));
+    }
+    refs
+}
+
+/// Warn about unknown exclude entries and empty expansions for an `include.fields` declaration.
+fn validate_include_fields(
+    path: &Path,
+    dataset: &SyntheticDataset,
+    include: &Include,
+    all: &HashMap<PathBuf, SyntheticDataset>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(target_path) = resolve_include(path, &include.file) else { return };
+    let Some(target) = all.get(&target_path) else { return };
+    let target_names: HashSet<&str> = target.data.iter().map(|f| f.name.as_str()).collect();
+    let exclude_set: HashSet<&str> = include
+        .exclude
+        .iter()
+        .flat_map(|v| v.iter())
+        .map(|s| s.as_str())
+        .collect();
+
+    for ex in &exclude_set {
+        if !target_names.contains(ex) {
+            warnings.push(format!(
+                "warning: dataset '{}': include '{}': `exclude` names field '{}' \
+                 which does not exist in '{}'",
+                dataset.name, include.reference, ex, include.file
+            ));
+        }
+    }
+
+    let would_expand = include.fields.iter().any(|p| {
+        if p == "*" {
+            target_names.iter().any(|n| !exclude_set.contains(n))
+        } else {
+            target_names.contains(p.as_str()) && !exclude_set.contains(p.as_str())
+        }
+    });
+    if !would_expand {
+        warnings.push(format!(
+            "warning: dataset '{}': include '{}': `fields` expands to no fields \
+             after applying `exclude`",
+            dataset.name, include.reference
+        ));
+    }
+}
+
+/// Validate the `project:` directive on a link-content block.
+///
+/// - `project` and explicit `content.fields` are mutually exclusive.
+/// - The ref part of `project` must match the link's reference.
+/// - The field part must exist in the link's target dataset.
+fn validate_project(
+    content: &crate::models::ListContent,
+    link: &Include,
+    content_path: &str,
+    dataset_path: &Path,
+    dataset: &SyntheticDataset,
+    all: &HashMap<PathBuf, SyntheticDataset>,
+) -> Result<()> {
+    let Some(ref proj) = content.project else { return Ok(()) };
+
+    if !content.item.fields.is_empty() {
+        bail!(
+            "field '{}': `project` and `fields` are mutually exclusive — remove `fields` when using `project`",
+            content_path
+        );
+    }
+
+    let (ref_part, field_part) = split_ref(proj).ok_or_else(|| {
+        anyhow!(
+            "field '{}': `project: {}` — expected `<link_ref>.<field_name>` format",
+            content_path, proj
+        )
+    })?;
+
+    if ref_part != link.reference {
+        bail!(
+            "field '{}': `project: {}` — ref part '{}' does not match the link ref '{}'",
+            content_path, proj, ref_part, link.reference
+        );
+    }
+
+    let inc_path = resolve_include(dataset_path, &link.file).ok_or_else(|| {
+        anyhow!(
+            "field '{}': `project: {}` — cannot resolve link file '{}'",
+            content_path, proj, link.file
+        )
+    })?;
+    let linked = all.get(&inc_path).ok_or_else(|| {
+        anyhow!(
+            "field '{}': `project: {}` — linked dataset '{}' not loaded",
+            content_path, proj, link.file
+        )
+    })?;
+
+    if !linked.data.iter().any(|f| f.name == field_part) {
+        bail!(
+            "field '{}': `project: {}` — field '{}' does not exist in '{}'",
+            content_path, proj, field_part, link.file
+        );
+    }
+
+    let _ = dataset; // suppress unused warning
+    Ok(())
+}
+
 /// Check that every variable in an expression field refers to a field defined
 /// above it in the YAML (evaluation order). Only tokens that match a known field
 /// name are checked; SQL keywords and function names are passed through to DataFusion.
@@ -499,53 +859,4 @@ fn validate_expression_order(dataset: &SyntheticDataset) -> Result<()> {
         available.insert(field.name.as_str());
     }
     Ok(())
-}
-
-fn check_row_count_mismatch(
-    path: &Path,
-    dataset: &SyntheticDataset,
-    all: &HashMap<PathBuf, SyntheticDataset>,
-) -> Option<String> {
-    let parent_rows = dataset.rows.unwrap_or(100);
-
-    let counts: Vec<(String, usize)> = dataset
-        .includes
-        .iter()
-        .filter_map(|inc| {
-            let expected = if let Some(dist) = inc.distribution {
-                (parent_rows as f64 * dist).round() as usize
-            } else {
-                // No distribution: the include contributes all its rows; warn if they differ.
-                let canonical = resolve_include(path, &inc.file)?;
-                all.get(&canonical)?.rows.unwrap_or(parent_rows)
-            };
-            Some((inc.file.clone(), expected))
-        })
-        .collect();
-
-    if counts.len() < 2 {
-        return None;
-    }
-
-    let min = counts.iter().map(|(_, n)| *n).min().unwrap();
-    let max = counts.iter().map(|(_, n)| *n).max().unwrap();
-
-    if min == max {
-        return None;
-    }
-
-    let detail: Vec<String> = counts
-        .iter()
-        .map(|(file, n)| format!("  {file}: {n} row(s)"))
-        .collect();
-
-    Some(format!(
-        "warning: dataset '{}' includes datasets with mismatched expected row counts:\n{}\n  \
-         {} row(s) will be used; {} excess row(s) discarded — \
-         output may lack referential integrity between included datasets.",
-        dataset.name,
-        detail.join("\n"),
-        min,
-        max - min,
-    ))
 }

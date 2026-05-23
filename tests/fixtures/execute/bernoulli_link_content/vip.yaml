@@ -1,0 +1,10 @@
+name: vip
+format: jsonl
+output_file: vip
+include:
+  file: events.yaml
+  ref: events
+  ratio: 0.5
+data:
+  - name: title
+    ref: events.title

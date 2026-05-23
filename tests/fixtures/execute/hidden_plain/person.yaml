@@ -1,0 +1,15 @@
+name: person
+format: csv
+output_file: person
+rows: 5
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: internal_key
+    type: string
+    generator: uuid
+    hidden: true
+  - name: label
+    type: string
+    generator: word

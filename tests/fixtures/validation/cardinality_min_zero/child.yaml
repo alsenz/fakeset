@@ -1,0 +1,11 @@
+name: child
+format: parquet
+include:
+  file: base.yaml
+  ref: b
+  cardinality:
+    min: 0    # error: min must be at least 1
+    max: 3
+data:
+  - name: val
+    ref: b.val

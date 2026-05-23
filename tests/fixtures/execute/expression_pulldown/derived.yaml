@@ -1,9 +1,9 @@
 name: derived
 format: csv
 output_file: derived
-includes:
-  - file: source.yaml
-    ref: src
+include:
+  file: source.yaml
+  ref: src
 data:
   - name: id
     ref: src.id

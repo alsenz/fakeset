@@ -62,11 +62,11 @@ fn test_resolve_refs_preserves_ref_field_string() {
         .find(|f| f.name == "employee_id")
         .expect("should find field");
 
-    // ref_field is kept so the executor can wire up pre-filled columns.
+    // refs is kept so the executor can wire up pre-filled columns.
     assert_eq!(
-        id_field.ref_field.as_deref(),
+        id_field.simple_ref(),
         Some("b_data.employee_id"),
-        "ref_field should be preserved after resolution"
+        "refs should be preserved after resolution"
     );
 }
 
@@ -135,7 +135,7 @@ fn test_resolve_refs_for_nested_include_content_field() {
     //   name: ref: person.full_name  (include-scoped — type inherited from people.full_name: string)
     //   event_title: type: string, ref: title  (outer-scoped — left as-is)
     // After resolve_refs the include-scoped field should carry field_type: String.
-    let paths = vec![PathBuf::from("tests/fixtures/execute/rich_list")];
+    let paths = vec![PathBuf::from("tests/fixtures/execute/link_content")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     validate(&datasets).expect("should pass validation");
     let resolved = resolve_refs(&datasets).expect("should resolve refs");
@@ -146,7 +146,7 @@ fn test_resolve_refs_for_nested_include_content_field() {
         .expect("find attendees field");
 
     let content_fields = match attendees.content.as_deref() {
-        Some(c) if !c.includes.is_empty() => &c.item.fields,
+        Some(c) if c.group.is_some() => &c.item.fields,
         other => panic!("attendees should have rich content, got: {other:?}"),
     };
 

@@ -1,0 +1,16 @@
+name: child
+format: csv
+output_file: child
+include:
+  file: parent.yaml
+  ref: p
+  cardinality: 2
+data:
+  - name: parent_id
+    ref: p.id
+  - name: label
+    type: string
+    value: "child"
+  - name: fresh
+    type: string
+    generator: word

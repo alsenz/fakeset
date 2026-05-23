@@ -1,0 +1,11 @@
+name: items
+format: csv
+output_file: items
+rows: 5
+data:
+  - name: item_name
+    type: string
+    generator: word
+  - name: item_code
+    type: string
+    generator: uuid

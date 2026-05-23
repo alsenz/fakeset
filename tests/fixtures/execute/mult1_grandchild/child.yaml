@@ -1,0 +1,9 @@
+name: child
+format: csv
+output_file: child
+include:
+  file: parent.yaml
+  ref: p
+data:
+  - name: gp_id
+    ref: p.gp_id

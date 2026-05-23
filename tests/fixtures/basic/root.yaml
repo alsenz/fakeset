@@ -1,8 +1,6 @@
 name: root
 format: parquet
 rows: 10
-includes:
-  - file: base.yaml
-    ref: base_data
-  - file: utils.yaml
-    ref: util_data
+include:
+  file: base.yaml
+  ref: base_data

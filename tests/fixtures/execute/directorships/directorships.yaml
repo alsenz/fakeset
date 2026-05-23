@@ -1,0 +1,17 @@
+name: directorships
+format: jsonl
+output_file: directorships
+include:
+  file: individuals.yaml
+  ref: individual
+links:
+  - file: organisations.yaml
+    ref: organisation
+data:
+  - name: director_name
+    refs:
+      - individual.person_name
+      - bind: organisation.directors
+        reducer: collect
+  - name: org_name
+    ref: organisation.org_name

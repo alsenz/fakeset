@@ -1,5 +1,5 @@
 name: c
 format: parquet
-includes:
-  - file: a.yaml
-    ref: a_data
+include:
+  file: a.yaml
+  ref: a_data

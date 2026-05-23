@@ -1,0 +1,9 @@
+name: flat_sibling
+format: csv
+include:
+  file: pool.yaml
+  ref: pool
+  ratio: 0.5
+data:
+  - name: pool_name
+    ref: pool.pool_name

@@ -1,0 +1,19 @@
+name: outer
+format: csv
+rows: 4
+links:
+  - file: pool.yaml
+    ref: pool
+    cardinality: 5
+    reinforcement: 0
+data:
+  - name: label
+    type: string
+    generator: word
+  - name: items
+    type: list
+    content:
+      group: pool
+      fields:
+        - name: pool_ref
+          ref: pool.pool_id

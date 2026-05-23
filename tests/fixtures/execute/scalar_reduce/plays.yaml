@@ -1,0 +1,22 @@
+name: plays
+format: jsonl
+output_file: plays
+rows: 9
+links:
+  - file: scoreboard.yaml
+    ref: board
+data:
+  - name: score
+    type: number
+    value: 5
+    refs:
+      - bind: board.total
+        reducer: sum
+      - bind: board.high
+        reducer: max
+      - bind: board.low
+        reducer: min
+      - bind: board.first
+        reducer: take_first
+  - name: team_name
+    ref: board.team_name

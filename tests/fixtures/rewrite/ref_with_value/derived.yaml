@@ -1,8 +1,8 @@
 name: derived
 format: parquet
-includes:
-  - file: base.yaml
-    ref: base_ref
+include:
+  file: base.yaml
+  ref: base_ref
 data:
   - name: status
     ref: base_ref.status
