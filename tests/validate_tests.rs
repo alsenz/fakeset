@@ -311,8 +311,8 @@ fn test_link_content_expression_in_content_errors() {
         "error should mention 'expression': {msg}"
     );
     assert!(
-        msg.contains("nested include"),
-        "error should mention 'nested include': {msg}"
+        msg.contains("list-link") || msg.contains("nested include"),
+        "error should mention 'list-link' or 'nested include': {msg}"
     );
 }
 

@@ -8,7 +8,7 @@ data:
   - name: items
     type: list
     content:
-      group: src
+      from: src
       fields:
         - name: label
           type: string    # error: type must not be set on a pool-scoped ref

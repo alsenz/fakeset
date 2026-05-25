@@ -5,7 +5,7 @@ use fakeset::{
     expressions::pull_down_expression_deps, graph::build_dag,
     load_all_datasets, models::{Format, SyntheticDataset},
     plan::{build_plan, ExecutionPlan, ExecutionStep},
-    rewrite::{apply_global_locales, expand_include_fields, resolve_refs}, segment::DEFAULT_MAX_SIBLINGS, validate::validate,
+    rewrite::{apply_global_locales, expand_include_fields, resolve_refs}, segment::DEFAULT_MAX_LOWER_COVER, validate::validate,
 };
 use petgraph::visit::Topo;
 use std::collections::HashMap;
@@ -35,10 +35,10 @@ struct Cli {
     #[arg(long)]
     print_plan: bool,
 
-    /// Maximum number of siblings allowed in one sibling group (default 16).
+    /// Maximum number of lower cover members in one lower cover group (default 16).
     /// Segment enumeration is 2^N, so raising this requires proportionally more RAM.
-    #[arg(long, default_value_t = DEFAULT_MAX_SIBLINGS)]
-    max_siblings: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_LOWER_COVER)]
+    max_lower_cover: usize,
 
     /// Override the output format for every dataset (parquet, csv, json, jsonl).
     /// Takes precedence over per-dataset `format:` declarations.
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let plan = build_plan(&dag, &resolved, cli.max_siblings)?;
+    let plan = build_plan(&dag, &resolved, cli.max_lower_cover)?;
 
     if cli.print_plan {
         println!("=== Execution Plan ({} steps) ===\n", plan.steps.len());
@@ -121,15 +121,15 @@ fn print_plan(plan: &ExecutionPlan) {
                     println!("    prefill: {}.{} → {}", src, p.from_column, p.into_column);
                 }
             }
-            ExecutionStep::GenerateSiblingGroup { parent, segments, siblings, .. } => {
+            ExecutionStep::GenerateLowerCoverGroup { parent, segments, members, .. } => {
                 let total: usize = segments.iter().map(|s| s.rows).sum();
                 println!(
-                    "[{}] sibling group: {} ({} rows across {} segments, {})",
+                    "[{}] lower cover group: {} ({} rows across {} segments, {})",
                     i + 1, parent.name, total, segments.len(), parent.format
                 );
                 for seg in segments {
-                    let names: Vec<&str> = seg.siblings.iter()
-                        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()))
+                    let names: Vec<&str> = seg.members.iter()
+                        .filter_map(|p: &PathBuf| p.file_stem().and_then(|s: &std::ffi::OsStr| s.to_str()))
                         .collect();
                     let label = if names.is_empty() {
                         "(parent-only)".to_string()
@@ -153,21 +153,21 @@ fn print_plan(plan: &ExecutionPlan) {
                         println!("    segment {} → {} rows [{}]", label, seg.rows, overrides.join(", "));
                     }
                 }
-                println!("    siblings:");
-                for sib in siblings {
-                    println!("      {} ({})", sib.dataset.name, sib.dataset.format);
+                println!("    members:");
+                for m in members {
+                    println!("      {} ({})", m.dataset.name, m.dataset.format);
                 }
             }
-            ExecutionStep::GenerateInnerFlat {
-                list_field_name, outer_path, flat_key, pool_slots_path,
+            ExecutionStep::GenerateWitness {
+                list_field_name, staging_path, witness_key, linked_path,
                 include, cardinality, ..
             } => {
-                let outer = outer_path.file_stem()
+                let staging = staging_path.file_stem()
                     .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
-                let inc = pool_slots_path.file_stem()
+                let linked = linked_path.file_stem()
                     .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
-                let flat = flat_key.file_stem()
-                    .and_then(|s| s.to_str()).unwrap_or("?");
+                let wkey = witness_key.file_stem()
+                    .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
                 let dist = include.ratio
                     .map(|r| format!(" ratio:{:.0}%", r * 100.0))
                     .unwrap_or_default();
@@ -177,25 +177,25 @@ fn print_plan(plan: &ExecutionPlan) {
                     fakeset::models::CountSpec::Normal { mean, .. } => format!("~{mean}"),
                 };
                 println!(
-                    "[{}] inner flat: {}.{} from {} (count:{}, inc:{}{}) → {}",
-                    i + 1, outer, list_field_name, inc, count_label, inc, dist, flat
+                    "[{}] witness: {}.{} from {} (count:{}, linked:{}{}) → {}",
+                    i + 1, staging, list_field_name, linked, count_label, linked, dist, wkey
                 );
             }
-            ExecutionStep::AssembleNestedInclude { outer_path, dataset, flat_specs } => {
-                let outer = outer_path.file_stem()
-                    .and_then(|s| s.to_str()).unwrap_or("?");
-                let fields: Vec<&str> = flat_specs.iter().map(|(n, _, _)| n.as_str()).collect();
+            ExecutionStep::AssembleFromWitness { staging_path, dataset, witness_specs } => {
+                let staging = staging_path.file_stem()
+                    .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
+                let fields: Vec<&str> = witness_specs.iter().map(|(n, _, _): &(String, PathBuf, Option<String>)| n.as_str()).collect();
                 println!(
-                    "[{}] assemble nested include: {} ← [{}] ({})",
-                    i + 1, outer, fields.join(", "), dataset.format
+                    "[{}] assemble from witness: {} ← [{}] ({})",
+                    i + 1, staging, fields.join(", "), dataset.format
                 );
             }
-            ExecutionStep::CollectToPool { source_field, pool_field, pool_path, .. } => {
-                let pool = pool_path.file_stem()
-                    .and_then(|s| s.to_str()).unwrap_or("?");
+            ExecutionStep::AccumulateToLinked { source_field, linked_field, linked_path, .. } => {
+                let linked = linked_path.file_stem()
+                    .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
                 println!(
-                    "[{}] collect to pool: {} → {}.{}",
-                    i + 1, source_field, pool, pool_field
+                    "[{}] accumulate to linked: {} → {}.{}",
+                    i + 1, source_field, linked, linked_field
                 );
             }
             ExecutionStep::EmitDataset { dataset, .. } => {
@@ -345,14 +345,14 @@ fn print_field(field: &fakeset::models::Field, indent: usize) {
         print_field(sub, indent + 2);
     }
     match field.content.as_deref() {
-        Some(c) if c.group.is_none() => {
+        Some(c) if c.from.is_none() => {
             print!("{pad}  [content] ");
             print_field(&c.item, indent + 2);
         }
         Some(c) => {
-            println!("{pad}  [nested include content]");
-            if let Some(ref group) = c.group {
-                println!("{pad}    group: {group}");
+            println!("{pad}  [list-link content]");
+            if let Some(ref from) = c.from {
+                println!("{pad}    from: {from}");
             }
             for f in &c.item.fields {
                 print_field(f, indent + 4);

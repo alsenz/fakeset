@@ -12,7 +12,7 @@ data:
   - name: items
     type: list
     content:
-      group: pool
+      from: pool
       fields:
         - name: tag
           refs:

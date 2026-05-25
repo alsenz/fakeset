@@ -130,7 +130,7 @@ fn test_ref_to_expression_field_errors_at_rewrite() {
 }
 
 #[test]
-fn test_resolve_refs_for_nested_include_content_field() {
+fn test_resolve_refs_for_list_link_content_field() {
     // events.attendees content has:
     //   name: ref: person.full_name  (include-scoped — type inherited from people.full_name: string)
     //   event_title: type: string, ref: title  (outer-scoped — left as-is)
@@ -146,7 +146,7 @@ fn test_resolve_refs_for_nested_include_content_field() {
         .expect("find attendees field");
 
     let content_fields = match attendees.content.as_deref() {
-        Some(c) if c.group.is_some() => &c.item.fields,
+        Some(c) if c.from.is_some() => &c.item.fields,
         other => panic!("attendees should have rich content, got: {other:?}"),
     };
 

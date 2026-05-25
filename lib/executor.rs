@@ -24,8 +24,8 @@ use crate::constraints::FieldConstraints;
 use crate::generator::{generate_column, sample_count};
 use crate::schema::{field_to_arrow, schema_to_arrow};
 use crate::models::{resolve_include, split_ref, CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset};
-use crate::plan::{ExecutionPlan, ExecutionStep, PrefillSource};
-use crate::segment::{Segment, Sibling};
+use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField};
+use crate::segment::{LowerCoverMember, Segment};
 
 /// Execute the plan produced by `plan::build_plan`, writing outputs to `output_dir`.
 ///
@@ -36,9 +36,9 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
     let mut computed: HashMap<PathBuf, RecordBatch> = HashMap::new();
-    // Tracks datasets that were generated *as a parent* in their own GenerateSiblingGroup step.
-    // Only these are eligible for reuse when they appear as a sibling in a later step.
-    // Datasets generated *as siblings* are not reusable across separate variant groups.
+    // Tracks datasets that were generated *as a parent* in their own GenerateLowerCoverGroup step.
+    // Only these are eligible for reuse when they appear as a lower cover member in a later step.
+    // Datasets generated *as lower cover members* are not reusable across separate variant groups.
     let mut parent_computed: HashSet<PathBuf> = HashSet::new();
     let mut shared: HashMap<String, (Format, Vec<RecordBatch>)> = HashMap::new();
 
@@ -47,20 +47,20 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
             ExecutionStep::GenerateDataset { path, dataset, rows, prefills, skip_emit } => {
                 let prefill_map = resolve_prefills(prefills, &computed);
                 let batch = generate_prefilled_batch(&dataset.data, *rows, &prefill_map)?;
-                let has_link_content = dataset.data.iter().any(|f| f.is_link_content());
-                if *skip_emit && has_link_content {
-                    // Scalar-only intermediate; AssembleNestedInclude adds list columns and emits.
+                let has_list_link = dataset.data.iter().any(|f| f.is_list_link());
+                if *skip_emit && has_list_link {
+                    // Scalar-only intermediate; AssembleFromWitness adds list columns and emits.
                     computed.insert(path.clone(), batch);
                 } else {
                     // Evaluate expressions for both normal emit and collect-target deferral
-                    // (collect targets have skip_emit=true but no nested includes).
+                    // (collect targets have skip_emit=true but no list-link fields).
                     let batch = evaluate_expressions(batch, dataset.as_ref()).await?;
-                    // Inject _pool_idx for junction datasets (link without include).
-                    // The full batch (with _pool_idx) is kept in `computed` for CollectToPool;
-                    // _pool_idx is stripped before emitting.
-                    let batch = inject_pool_idx(&batch, path, dataset.as_ref(), &computed)?;
+                    // Inject _linked_idx for junction datasets (link without include).
+                    // The full batch (with _linked_idx) is kept in `computed` for AccumulateToLinked;
+                    // _linked_idx is stripped before emitting.
+                    let batch = inject_linked_idx(&batch, path, dataset.as_ref(), &computed)?;
                     let output = filter_hidden_columns(
-                        strip_pool_idx(batch.clone()),
+                        strip_linked_idx(batch.clone()),
                         &dataset.data,
                     ).await?;
                     computed.insert(path.clone(), batch);
@@ -68,40 +68,40 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                         emit_batch(output, &dataset.format, &dataset.output_file, &mut shared)?;
                     }
                     // When skip_emit is true (collect target): batch stored, file write deferred
-                    // to the EmitDataset step that follows CollectToPool.
+                    // to the EmitDataset step that follows AccumulateToLinked.
                 }
             }
-            ExecutionStep::GenerateSiblingGroup {
-                parent_path, parent, segments, siblings, skip_parent_emit,
+            ExecutionStep::GenerateLowerCoverGroup {
+                parent_path, parent, segments, members, skip_parent_emit,
             } => {
-                execute_sibling_group(
-                    parent_path, parent.as_ref(), segments, siblings, *skip_parent_emit,
+                execute_lower_cover_group(
+                    parent_path, parent.as_ref(), segments, members, *skip_parent_emit,
                     &mut computed, &mut parent_computed, &mut shared,
                 ).await?;
             }
-            ExecutionStep::GenerateInnerFlat {
-                flat_key, outer_path, list_field_name,
+            ExecutionStep::GenerateWitness {
+                witness_key, staging_path, list_field_name,
                 inner_fields, include, cardinality,
-                pool_slots_path,
+                linked_path,
             } => {
-                execute_inner_flat(
-                    flat_key, outer_path, list_field_name,
+                execute_witness(
+                    witness_key, staging_path, list_field_name,
                     inner_fields, include, cardinality,
-                    pool_slots_path,
+                    linked_path,
                     &mut computed,
                 )?;
             }
-            ExecutionStep::AssembleNestedInclude { outer_path, dataset, flat_specs } => {
-                execute_assemble_nested_include(
-                    outer_path, dataset.as_ref(), flat_specs,
+            ExecutionStep::AssembleFromWitness { staging_path, dataset, witness_specs } => {
+                execute_assemble_from_witness(
+                    staging_path, dataset.as_ref(), witness_specs,
                     &mut computed, &mut shared,
                 ).await?;
             }
-            ExecutionStep::CollectToPool {
-                source_path, source_field, pool_path, pool_field, group_by, reducer, default_val,
+            ExecutionStep::AccumulateToLinked {
+                source_path, source_field, linked_path, linked_field, group_by, reducer, default_val,
             } => {
-                execute_collect_to_pool(
-                    source_path, source_field, pool_path, pool_field, group_by, reducer, default_val,
+                execute_accumulate_to_linked(
+                    source_path, source_field, linked_path, linked_field, group_by, reducer, default_val,
                     &mut computed,
                 ).await?;
             }
@@ -127,7 +127,7 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn resolve_prefills(
-    prefills: &[PrefillSource],
+    prefills: &[InheritedField],
     computed: &HashMap<PathBuf, RecordBatch>,
 ) -> HashMap<String, Vec<ArrayRef>> {
     let mut map: HashMap<String, Vec<ArrayRef>> = HashMap::new();
@@ -142,31 +142,31 @@ fn resolve_prefills(
 }
 
 // ---------------------------------------------------------------------------
-// Sibling group execution
+// Lower cover group execution
 // ---------------------------------------------------------------------------
 
-async fn execute_sibling_group(
+async fn execute_lower_cover_group(
     path: &Path,
     dataset: &SyntheticDataset,
     segments: &[Segment],
-    siblings: &[Sibling],
+    members: &[LowerCoverMember],
     skip_parent_emit: bool,
     computed: &mut HashMap<PathBuf, RecordBatch>,
     parent_computed: &mut HashSet<PathBuf>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
-    let pool_sibling_paths: HashSet<PathBuf> = siblings.iter()
-        .filter(|s| s.is_pool)
-        .map(|s| s.path.clone())
+    let witness_source_paths: HashSet<PathBuf> = members.iter()
+        .filter(|m| m.is_witness_source)
+        .map(|m| m.path.clone())
         .collect();
-    let has_pool_siblings = !pool_sibling_paths.is_empty();
+    let has_witness_sources = !witness_source_paths.is_empty();
 
-    // pool_parent_batches: rows from segments that contain at least one pool sibling.
-    // These are placed before the shuffled non-pool rows so that GenerateInnerFlat's
-    // n_eligible_slots boundary correctly identifies pool-member rows.
-    let mut pool_parent_batches: Vec<RecordBatch> = Vec::new();
-    let mut nonpool_parent_batches: Vec<RecordBatch> = Vec::new();
-    let mut sibling_buffers: HashMap<PathBuf, Vec<RecordBatch>> = HashMap::new();
+    // witness_source_parent_batches: rows from segments that contain at least one witness-source member.
+    // These are placed before the shuffled non-witness-source rows so that GenerateWitness's
+    // n_eligible_slots boundary correctly identifies linked-member rows.
+    let mut witness_source_parent_batches: Vec<RecordBatch> = Vec::new();
+    let mut non_witness_source_parent_batches: Vec<RecordBatch> = Vec::new();
+    let mut member_buffers: HashMap<PathBuf, Vec<RecordBatch>> = HashMap::new();
     let mut slot_offset: usize = 0;
 
     for seg in segments {
@@ -174,69 +174,69 @@ async fn execute_sibling_group(
             continue;
         }
 
-        let seg_has_pool = seg.siblings.iter().any(|sp| pool_sibling_paths.contains(sp));
+        let seg_has_witness_source = seg.members.iter().any(|mp| witness_source_paths.contains(mp));
 
-        if seg.siblings.is_empty() {
+        if seg.members.is_empty() {
             // Parent-only segment: no child rows to inherit — generate fresh.
             let parent_seg = generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?;
-            nonpool_parent_batches.push(parent_seg);
+            non_witness_source_parent_batches.push(parent_seg);
         } else {
-            // Pool siblings contribute constraints to the segment but produce no standalone
-            // batches. Separate them from real (flat) siblings before generating children.
-            let real_sib_paths: Vec<&PathBuf> = seg.siblings.iter()
-                .filter(|sp| !pool_sibling_paths.contains(*sp))
+            // Witness-source members contribute constraints but produce no standalone batches.
+            // Separate them from real (flat) members before generating children.
+            let real_member_paths: Vec<&PathBuf> = seg.members.iter()
+                .filter(|mp| !witness_source_paths.contains(*mp))
                 .collect();
 
-            // Children are preceding: generate each real sibling first, then grow the
+            // Children are preceding: generate each real member first, then grow the
             // parent outward from those already-solved rows (UNION ALL semantics).
             //
-            // If a sibling was itself a parent with its own sibling group, it is already
+            // If a member was itself a parent with its own lower cover group, it is already
             // in `computed` — use that batch directly rather than regenerating it, and
             // suppress re-emission below.
-            let mut child_batches: Vec<(&Sibling, RecordBatch)> = Vec::new();
-            for sib_path in &real_sib_paths {
-                let sib = siblings.iter().find(|s| &s.path == *sib_path).unwrap();
-                if parent_computed.contains(&sib.path) {
-                    if let Some(ref card) = sib.cardinality {
-                        // The precomputed batch has total_sib_rows rows, but
+            let mut child_batches: Vec<(&LowerCoverMember, RecordBatch)> = Vec::new();
+            for member_path in &real_member_paths {
+                let m = members.iter().find(|m| &m.path == *member_path).unwrap();
+                if parent_computed.contains(&m.path) {
+                    if let Some(ref card) = m.cardinality {
+                        // The precomputed batch has total_member_rows rows, but
                         // grow_parent_from_children expects seg.rows canonical rows (one per
                         // parent slot). Generate a fresh canonical batch for assembly and an
                         // expanded batch tagged with _slot_idx so the lattice position is
                         // recorded in computed after all segments are processed.
                         let canonical = generate_fresh_batch(
-                            &sib.dataset.data, seg.rows, &seg.field_constraints,
+                            &m.dataset.data, seg.rows, &seg.field_constraints,
                         )?;
                         let expanded = generate_expanded_batch(
-                            &sib.dataset.data, seg.rows, &seg.field_constraints, card, slot_offset,
+                            &m.dataset.data, seg.rows, &seg.field_constraints, card, slot_offset,
                         )?;
-                        sibling_buffers.entry(sib.path.clone()).or_default().push(expanded);
-                        child_batches.push((sib, canonical));
+                        member_buffers.entry(m.path.clone()).or_default().push(expanded);
+                        child_batches.push((m, canonical));
                     } else {
                         // No cardinality: precomputed row count matches seg.rows.
-                        let precomputed = computed[&sib.path].clone();
-                        child_batches.push((sib, precomputed));
+                        let precomputed = computed[&m.path].clone();
+                        child_batches.push((m, precomputed));
                     }
                 } else {
                     // Canonical batch: one row per slot, used for parent assembly.
                     let canonical = generate_fresh_batch(
-                        &sib.dataset.data, seg.rows, &seg.field_constraints,
+                        &m.dataset.data, seg.rows, &seg.field_constraints,
                     )?;
-                    if let Some(ref card) = sib.cardinality {
+                    if let Some(ref card) = m.cardinality {
                         // Expanded batch: M_n rows per slot, tagged with _slot_idx for output.
                         let expanded = generate_expanded_batch(
-                            &sib.dataset.data, seg.rows, &seg.field_constraints, card, slot_offset,
+                            &m.dataset.data, seg.rows, &seg.field_constraints, card, slot_offset,
                         )?;
-                        sibling_buffers.entry(sib.path.clone()).or_default().push(expanded);
-                        child_batches.push((sib, canonical));
+                        member_buffers.entry(m.path.clone()).or_default().push(expanded);
+                        child_batches.push((m, canonical));
                     } else {
-                        sibling_buffers.entry(sib.path.clone()).or_default().push(canonical.clone());
-                        child_batches.push((sib, canonical));
+                        member_buffers.entry(m.path.clone()).or_default().push(canonical.clone());
+                        child_batches.push((m, canonical));
                     }
                 }
             }
 
             let parent_seg = if child_batches.is_empty() {
-                // Pool-only segment: all siblings are pool siblings; no real children.
+                // Witness-source-only segment: all members are witness sources; no real children.
                 generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?
             } else {
                 grow_parent_from_children(
@@ -244,34 +244,34 @@ async fn execute_sibling_group(
                 ).await?
             };
 
-            if seg_has_pool {
-                pool_parent_batches.push(parent_seg);
+            if seg_has_witness_source {
+                witness_source_parent_batches.push(parent_seg);
             } else {
-                nonpool_parent_batches.push(parent_seg);
+                non_witness_source_parent_batches.push(parent_seg);
             }
         }
         slot_offset += seg.rows;
     }
 
-    // Pool-rows-first: pool members occupy the leading positions in the combined parent
-    // batch so that GenerateInnerFlat's n_eligible_slots boundary selects them correctly.
-    let parent_shuffled = if has_pool_siblings && !pool_parent_batches.is_empty() {
-        combine_pool_first(pool_parent_batches, nonpool_parent_batches, &dataset.data, &dataset.name).await?
+    // Linked-rows-preceding-staging-rows: witness-source members occupy the leading positions
+    // in the combined parent batch so GenerateWitness's n_eligible_slots boundary selects them.
+    let parent_shuffled = if has_witness_sources && !witness_source_parent_batches.is_empty() {
+        combine_witness_source_first(witness_source_parent_batches, non_witness_source_parent_batches, &dataset.data, &dataset.name).await?
     } else {
-        let mut all = pool_parent_batches;
-        all.extend(nonpool_parent_batches);
+        let mut all = witness_source_parent_batches;
+        all.extend(non_witness_source_parent_batches);
         combine_and_shuffle(all, &dataset.data, &dataset.name).await?
     };
 
-    let has_link_content = dataset.data.iter().any(|f| f.is_link_content());
-    if skip_parent_emit && has_link_content {
-        // Scalar-only intermediate; AssembleNestedInclude adds list columns, evaluates
+    let has_list_link = dataset.data.iter().any(|f| f.is_list_link());
+    if skip_parent_emit && has_list_link {
+        // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
         // expressions, and emits.
         computed.insert(path.to_path_buf(), parent_shuffled);
     } else {
-        // For both normal emit and collect-target deferral (skip_parent_emit=true, no nested
-        // includes): evaluate expressions now; file write is either done immediately or deferred
-        // to the EmitDataset step that follows CollectToPool.
+        // For both normal emit and collect-target deferral (skip_parent_emit=true, no list-link
+        // fields): evaluate expressions now; file write is either done immediately or deferred
+        // to the EmitDataset step that follows AccumulateToLinked.
         let parent_shuffled = evaluate_expressions(parent_shuffled, dataset).await?;
         let parent_output = filter_hidden_columns(parent_shuffled.clone(), &dataset.data).await?;
         computed.insert(path.to_path_buf(), parent_shuffled);
@@ -281,41 +281,41 @@ async fn execute_sibling_group(
     }
     parent_computed.insert(path.to_path_buf());
 
-    for sib in siblings {
-        // Pool siblings have no standalone output — skip entirely.
-        if sib.is_pool {
+    for m in members {
+        // Witness-source members have no standalone output — skip entirely.
+        if m.is_witness_source {
             continue;
         }
-        // Siblings that were themselves parents in a prior step are already emitted.
-        // If the sibling had cardinality we accumulated an expanded+_slot_idx batch in
-        // sibling_buffers during the segment loop — store it in computed so downstream
-        // steps (collect bindings, pool sampling) see its lattice position.
-        if parent_computed.contains(&sib.path) {
-            if sib.cardinality.is_some() {
-                let buffers = sibling_buffers.remove(&sib.path).unwrap_or_default();
+        // Members that were themselves parents in a prior step are already emitted.
+        // If the member had cardinality we accumulated an expanded+_slot_idx batch in
+        // member_buffers during the segment loop — store it in computed so downstream
+        // steps (collect bindings, linked sampling) see its lattice position.
+        if parent_computed.contains(&m.path) {
+            if m.cardinality.is_some() {
+                let buffers = member_buffers.remove(&m.path).unwrap_or_default();
                 if !buffers.is_empty() {
-                    let sib_schema = buffers[0].schema();
-                    let tagged = concat_batches(&sib_schema, &buffers)?;
-                    computed.insert(sib.path.clone(), tagged);
+                    let m_schema = buffers[0].schema();
+                    let tagged = concat_batches(&m_schema, &buffers)?;
+                    computed.insert(m.path.clone(), tagged);
                 }
             }
             continue;
         }
-        let sib_shuffled = combine_and_shuffle(
-            sibling_buffers.remove(&sib.path).unwrap_or_default(),
-            &sib.dataset.data,
-            &sib.dataset.name,
+        let m_shuffled = combine_and_shuffle(
+            member_buffers.remove(&m.path).unwrap_or_default(),
+            &m.dataset.data,
+            &m.dataset.name,
         ).await?;
-        let sib_shuffled = evaluate_expressions(sib_shuffled, &sib.dataset).await?;
-        // For junction link siblings: sample one pool row per row and prepend as _pool_idx.
-        // The pool batch must already be in `computed` (DAG link-edge ordering guarantees this).
-        let sib_shuffled = inject_pool_idx(&sib_shuffled, &sib.path, &sib.dataset, computed)?;
-        let sib_output = filter_hidden_columns(
-            strip_pool_idx(strip_slot_idx(sib_shuffled.clone())),
-            &sib.dataset.data,
+        let m_shuffled = evaluate_expressions(m_shuffled, &m.dataset).await?;
+        // For junction link members: sample one linked row per row and prepend as _linked_idx.
+        // The linked batch must already be in `computed` (DAG link-edge ordering guarantees this).
+        let m_shuffled = inject_linked_idx(&m_shuffled, &m.path, &m.dataset, computed)?;
+        let m_output = filter_hidden_columns(
+            strip_linked_idx(strip_slot_idx(m_shuffled.clone())),
+            &m.dataset.data,
         ).await?;
-        computed.insert(sib.path.clone(), sib_shuffled);
-        emit_batch(sib_output, &sib.dataset.format, &sib.dataset.output_file, shared)?;
+        computed.insert(m.path.clone(), m_shuffled);
+        emit_batch(m_output, &m.dataset.format, &m.dataset.output_file, shared)?;
     }
 
     Ok(())
@@ -334,7 +334,7 @@ async fn execute_sibling_group(
 /// 3. Neither → generated fresh into the skeleton and pulled from there.
 async fn grow_parent_from_children(
     parent_schema: &Schema,
-    child_batches: &[(&Sibling, RecordBatch)],
+    child_batches: &[(&LowerCoverMember, RecordBatch)],
     field_constraints: &HashMap<String, FieldConstraints>,
 ) -> Result<RecordBatch> {
     let n = child_batches.first()
@@ -344,10 +344,10 @@ async fn grow_parent_from_children(
     // Map parent field name → (child alias "c0"/"c1"/…, child column name).
     // or_insert preserves first-child-wins semantics.
     let mut sources: HashMap<String, (String, String)> = HashMap::new();
-    for (ci, (sib, child_batch)) in child_batches.iter().enumerate() {
+    for (ci, (m, child_batch)) in child_batches.iter().enumerate() {
         let alias = format!("c{ci}");
-        let prefix = format!("{}.", sib.reference);
-        for child_field in &sib.dataset.data {
+        let prefix = format!("{}.", m.reference);
+        for child_field in &m.dataset.data {
             if child_batch.schema().index_of(&child_field.name).is_err() { continue; }
             // Rule 1: cross-schema ref — child's ref points back to a parent field by name.
             if let Some(ref_str) = child_field.simple_ref() {
@@ -369,7 +369,7 @@ async fn grow_parent_from_children(
 
     // Active parent fields (skip expressions and nested-include placeholders).
     let active: Vec<&Field> = parent_schema.iter()
-        .filter(|f| f.expression.is_none() && !f.is_link_content())
+        .filter(|f| f.expression.is_none() && !f.is_list_link())
         .collect();
 
     // Build skeleton batch: _row_idx column + all rule-3 (fresh) columns.
@@ -434,71 +434,68 @@ fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<Reco
 }
 
 // ---------------------------------------------------------------------------
-// Nested include generation
+// Witness generation
 // ---------------------------------------------------------------------------
 
-/// Build the flat intermediate table for one nested include field.
+/// Generate the witness batch for one list-link field.
 ///
-/// Produces a `RecordBatch` with `_slot_idx: UInt32` (which outer row each
-/// Generate the joint-atom flat for one nested-include list field.
-///
-/// Each row is one **atom**: a (outer-slot, pool-slot) pair. Column sources:
-///   - pool-scoped refs: the pushed-down pool-slot solution for that atom's `_pool_idx`
-///   - outer-scoped refs: the outer row value for that atom's `_slot_idx`
+/// Each row is one **atom**: a (staging-slot, linked-slot) pair. Column sources:
+///   - linked-scoped refs: the pushed-down linked-slot solution for that atom's `_linked_idx`
+///   - outer-scoped refs: the staging row value for that atom's `_slot_idx`
 ///   - plain fields: generated fresh per atom
 ///
-/// All atoms sharing the same `_pool_idx` carry identical pool-scoped field values because
-/// they draw from the same pre-solved pool-slot row. This is the push-down mechanism:
-/// the pool node's field schema is resolved once per slot, then referenced by every atom
+/// All atoms sharing the same `_linked_idx` carry identical linked-scoped field values because
+/// they draw from the same pre-solved linked-slot row. This is the push-down mechanism:
+/// the linked node's field schema is resolved once per slot, then referenced by every atom
 /// assigned to that slot.
-fn execute_inner_flat(
-    flat_key: &PathBuf,
-    outer_path: &PathBuf,
+fn execute_witness(
+    witness_key: &PathBuf,
+    staging_path: &PathBuf,
     list_field_name: &str,
     inner_fields: &[Field],
     include: &Include,
     cardinality: &CountSpec,
-    pool_slots_path: &PathBuf,
+    linked_path: &PathBuf,
     computed: &mut HashMap<PathBuf, RecordBatch>,
 ) -> Result<()> {
-    let outer_batch = computed.get(outer_path).ok_or_else(|| {
-        anyhow!("inner flat '{list_field_name}': outer batch not yet computed")
+    let staging_batch = computed.get(staging_path).ok_or_else(|| {
+        anyhow!("witness '{list_field_name}': staging batch not yet computed")
     })?.clone();
-    // pool_slots: one pre-solved row per pool slot. Pool-scoped refs in atom rows
-    // are resolved by indexing into this batch at the atom's assigned _pool_idx.
-    let pool_slots = computed.get(pool_slots_path).ok_or_else(|| {
-        anyhow!("inner flat '{list_field_name}': pool-slot batch not yet computed")
+    // linked_batch: one pre-solved row per linked slot. Linked-scoped refs in atom rows
+    // are resolved by indexing into this batch at the atom's assigned _linked_idx.
+    let linked_batch = computed.get(linked_path).ok_or_else(|| {
+        anyhow!("witness '{list_field_name}': linked-slot batch not yet computed")
     })?.clone();
 
-    // --- Phase 1: assign each atom to an outer slot and a pool slot ---
+    // --- Phase 1: assign each atom to a staging slot and a linked slot ---
     let n_eligible_slots = match include.ratio {
-        Some(r) => ((r * pool_slots.num_rows() as f64).round() as usize)
-            .min(pool_slots.num_rows()).max(1),
-        None => pool_slots.num_rows(),
+        Some(r) => ((r * linked_batch.num_rows() as f64).round() as usize)
+            .min(linked_batch.num_rows()).max(1),
+        None => linked_batch.num_rows(),
     };
 
-    let n = outer_batch.num_rows();
+    let n = staging_batch.num_rows();
     let counts: Vec<usize> = (0..n).map(|_| sample_count(cardinality)).collect();
     let total: usize = counts.iter().sum();
 
-    let outer_idxs: Vec<u32> = counts.iter().enumerate()
+    let staging_idxs: Vec<u32> = counts.iter().enumerate()
         .flat_map(|(i, &c)| std::iter::repeat(i as u32).take(c))
         .collect();
-    let slot_idx_arr: ArrayRef = Arc::new(UInt32Array::from(outer_idxs.clone()));
-    // slot_assignments: which pool slot each atom row is assigned to (_pool_idx values).
+    let slot_idx_arr: ArrayRef = Arc::new(UInt32Array::from(staging_idxs.clone()));
+    // slot_assignments: which linked slot each atom row is assigned to (_linked_idx values).
     // The sampling mode is controlled by include.reinforcement:
     //   None / 1.0 → uniform with-replacement (existing behaviour)
-    //   0.0        → Fisher-Yates without-replacement per outer row
-    //   r > 1.0    → Polya-urn weighted re-selection per outer row
+    //   0.0        → Fisher-Yates without-replacement per staging row
+    //   r > 1.0    → Polya-urn weighted re-selection per staging row
     let slot_assignments: UInt32Array = {
         let r = include.reinforcement;
         if r == Some(0.0) {
-            // Without-replacement: draw M_n unique slots per outer row.
+            // Without-replacement: draw M_n unique linked slots per staging row.
             counts.iter().flat_map(|&m_n| {
                 sample_pool_without_replacement(n_eligible_slots, m_n)
             }).collect::<Vec<u32>>().into()
         } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
-            // Polya-urn: weighted re-selection per outer row.
+            // Polya-urn: weighted re-selection per staging row.
             counts.iter().flat_map(|&m_n| {
                 sample_pool_weighted(n_eligible_slots, m_n, reinf)
             }).collect::<Vec<u32>>().into()
@@ -510,30 +507,30 @@ fn execute_inner_flat(
                 .into()
         }
     };
-    let pool_idx_arr: ArrayRef = Arc::new(slot_assignments.clone());
-    let rep_indices: UInt32Array = outer_idxs.into();
+    let linked_idx_arr: ArrayRef = Arc::new(slot_assignments.clone());
+    let rep_indices: UInt32Array = staging_idxs.into();
 
     // --- Phase 2: build atom columns ---
-    // Pool-scoped refs: apply the pre-solved pool-slot value for the assigned slot.
-    // Outer-scoped refs: replicate the outer-row value for the slot index.
+    // Linked-scoped refs: apply the pre-solved linked-slot value for the assigned slot.
+    // Outer-scoped refs: replicate the staging-row value for the slot index.
     // Plain fields: generate fresh per atom.
     let mut arrow_fields: Vec<ArrowField> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
 
     for field in inner_fields {
         let col: ArrayRef = if let Some(ref_str) = field.simple_ref() {
-            let is_pool_scoped = split_ref(ref_str)
+            let is_linked_scoped = split_ref(ref_str)
                 .map(|(rp, _)| include.reference == rp)
                 .unwrap_or(false);
-            if is_pool_scoped {
+            if is_linked_scoped {
                 let (_, target_col) = split_ref(ref_str).unwrap();
-                let idx = pool_slots.schema().index_of(target_col)
-                    .map_err(|_| anyhow!("column '{target_col}' not found in pool-slot batch"))?;
-                take(pool_slots.column(idx).as_ref(), &slot_assignments, None)?
+                let idx = linked_batch.schema().index_of(target_col)
+                    .map_err(|_| anyhow!("column '{target_col}' not found in linked-slot batch"))?;
+                take(linked_batch.column(idx).as_ref(), &slot_assignments, None)?
             } else {
-                let idx = outer_batch.schema().index_of(ref_str)
-                    .map_err(|_| anyhow!("outer-scoped column '{ref_str}' not found in outer batch"))?;
-                take(outer_batch.column(idx).as_ref(), &rep_indices, None)?
+                let idx = staging_batch.schema().index_of(ref_str)
+                    .map_err(|_| anyhow!("outer-scoped column '{ref_str}' not found in staging batch"))?;
+                take(staging_batch.column(idx).as_ref(), &rep_indices, None)?
             }
         } else {
             generate_column(field, total, &[])?
@@ -543,50 +540,50 @@ fn execute_inner_flat(
     }
 
     let data_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(arrow_fields)), columns)?;
-    let with_pool = prepend_column(&data_batch, "_pool_idx", pool_idx_arr)?;
-    let flat_batch = prepend_column(&with_pool, "_slot_idx", slot_idx_arr)?;
-    computed.insert(flat_key.clone(), flat_batch);
+    let with_linked = prepend_column(&data_batch, "_linked_idx", linked_idx_arr)?;
+    let witness_batch = prepend_column(&with_linked, "_slot_idx", slot_idx_arr)?;
+    computed.insert(witness_key.clone(), witness_batch);
     Ok(())
 }
 
-/// Fold the inner flat tables produced by `execute_inner_flat` back into the
-/// outer batch as `ListArray` columns, then evaluate expressions and emit.
-async fn execute_assemble_nested_include(
-    outer_path: &PathBuf,
+/// Fold the witness batches produced by `execute_witness` back into the
+/// staging batch as `ListArray` columns, then evaluate expressions and emit.
+async fn execute_assemble_from_witness(
+    staging_path: &PathBuf,
     dataset: &SyntheticDataset,
-    flat_specs: &[(String, PathBuf, Option<String>)],
+    witness_specs: &[(String, PathBuf, Option<String>)],
     computed: &mut HashMap<PathBuf, RecordBatch>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
-    let mut batch = computed.get(outer_path).ok_or_else(|| {
-        anyhow!("assemble nested include '{}': outer batch not yet computed", dataset.name)
+    let mut batch = computed.get(staging_path).ok_or_else(|| {
+        anyhow!("assemble from witness '{}': staging batch not yet computed", dataset.name)
     })?.clone();
 
-    for (field_name, flat_key, project_col) in flat_specs {
-        let inner = computed.get(flat_key).ok_or_else(|| {
-            anyhow!("assemble nested include '{}': inner flat for '{field_name}' not yet computed", dataset.name)
+    for (field_name, witness_key, project_col) in witness_specs {
+        let inner = computed.get(witness_key).ok_or_else(|| {
+            anyhow!("assemble from witness '{}': witness for '{field_name}' not yet computed", dataset.name)
         })?.clone();
 
-        let outer_n = batch.num_rows();
-        let outer_idx_col = inner.schema().index_of("_slot_idx")
-            .map_err(|_| anyhow!("inner flat missing '_slot_idx' column"))?;
-        let outer_idx_arr = inner.column(outer_idx_col)
+        let staging_n = batch.num_rows();
+        let slot_idx_col = inner.schema().index_of("_slot_idx")
+            .map_err(|_| anyhow!("witness batch missing '_slot_idx' column"))?;
+        let slot_idx_arr = inner.column(slot_idx_col)
             .as_any().downcast_ref::<UInt32Array>()
             .ok_or_else(|| anyhow!("_slot_idx is not UInt32"))?;
 
-        let mut counts = vec![0usize; outer_n];
-        for &idx in outer_idx_arr.values() {
+        let mut counts = vec![0usize; staging_n];
+        for &idx in slot_idx_arr.values() {
             counts[idx as usize] += 1;
         }
 
-        // Strip both sentinels: _slot_idx (slot grouping) and _pool_idx (pool sampling).
-        let inner = strip_pool_idx(strip_slot_idx(inner));
+        // Strip both sentinels: _slot_idx (slot grouping) and _linked_idx (linked sampling).
+        let inner = strip_linked_idx(strip_slot_idx(inner));
         let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
 
         let list_col: ArrayRef = if let Some(col_name) = project_col {
             // Project: extract a single column and produce a scalar ListArray.
             let col_idx = inner.schema().index_of(col_name.as_str())
-                .map_err(|_| anyhow!("project: column '{col_name}' not found in inner flat for '{field_name}'"))?;
+                .map_err(|_| anyhow!("project: column '{col_name}' not found in witness for '{field_name}'"))?;
             let col = inner.column(col_idx).clone();
             let item_field = Arc::new(ArrowField::new("item", col.data_type().clone(), true));
             Arc::new(ListArray::new(item_field, offsets, col, None))
@@ -620,18 +617,18 @@ async fn execute_assemble_nested_include(
 
     let batch = evaluate_expressions(batch, dataset).await?;
     let output = filter_hidden_columns(batch.clone(), &dataset.data).await?;
-    computed.insert(outer_path.clone(), batch);
+    computed.insert(staging_path.clone(), batch);
     emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Pool accumulation
+// Linked dataset accumulation
 // ---------------------------------------------------------------------------
 
 /// Build an Arrow array of `n` rows all set to the given `YamlValue`, typed as `dtype`.
 ///
-/// Used as the fallback column for scalar-reducer `CollectToPool`: pool rows with no
+/// Used as the fallback column for scalar-reducer `AccumulateToLinked`: linked rows with no
 /// matching source rows receive this value (their declared `default:`).
 fn yaml_value_to_array(val: &YamlValue, dtype: &DataType, n: usize) -> ArrayRef {
     match dtype {
@@ -653,38 +650,38 @@ fn yaml_value_to_array(val: &YamlValue, dtype: &DataType, n: usize) -> ArrayRef 
     }
 }
 
-/// Accumulate values from a junction or inner-flat batch into a pool dataset's field.
+/// Accumulate values from a junction or witness batch into a linked dataset's field.
 ///
-/// Groups `source_batch[source_field]` by `source_batch[group_by]` (always `"_pool_idx"`),
-/// aggregates using `reducer`, then replaces the `pool_field` column in `computed[pool_path]`.
+/// Groups `source_batch[source_field]` by `source_batch[group_by]` (always `"_linked_idx"`),
+/// aggregates using `reducer`, then replaces the `linked_field` column in `computed[linked_path]`.
 ///
-/// - `Collect`   → `array_agg`: builds a `ListArray`; unmapped pool rows get an empty list.
-/// - `Sum`       → `sum`: scalar Float64; unmapped pool rows keep their existing default.
+/// - `Collect`   → `array_agg`: builds a `ListArray`; unmapped linked rows get an empty list.
+/// - `Sum`       → `sum`: scalar Float64; unmapped linked rows keep their existing default.
 /// - `Max`/`Min` → `max`/`min`: scalar; unmapped rows keep their existing default.
 /// - `TakeFirst` → `first_value`: first value in an arbitrary within-group order; unmapped
 ///   rows keep their existing default.
-async fn execute_collect_to_pool(
+async fn execute_accumulate_to_linked(
     source_path: &PathBuf,
     source_field: &str,
-    pool_path: &PathBuf,
-    pool_field: &str,
+    linked_path: &PathBuf,
+    linked_field: &str,
     group_by: &str,
     reducer: &Reducer,
     default_val: &YamlValue,
     computed: &mut HashMap<PathBuf, RecordBatch>,
 ) -> Result<()> {
     let source_batch = computed.get(source_path).ok_or_else(|| {
-        anyhow!("CollectToPool: source batch '{}' not computed", source_path.display())
+        anyhow!("AccumulateToLinked: source batch '{}' not computed", source_path.display())
     })?.clone();
-    let pool_batch = computed.get(pool_path).ok_or_else(|| {
-        anyhow!("CollectToPool: pool batch '{}' not computed", pool_path.display())
+    let linked_batch = computed.get(linked_path).ok_or_else(|| {
+        anyhow!("AccumulateToLinked: linked batch '{}' not computed", linked_path.display())
     })?.clone();
-    let pool_n = pool_batch.num_rows();
+    let linked_n = linked_batch.num_rows();
 
-    // Locate the pool field upfront — needed for scalar reducers to keep existing defaults.
-    let pool_col_idx = pool_batch.schema().index_of(pool_field)
-        .map_err(|_| anyhow!("CollectToPool: field '{}' not found in pool batch", pool_field))?;
-    let existing_pool_col = pool_batch.column(pool_col_idx).clone();
+    // Locate the linked field upfront — needed for scalar reducers to keep existing defaults.
+    let linked_col_idx = linked_batch.schema().index_of(linked_field)
+        .map_err(|_| anyhow!("AccumulateToLinked: field '{}' not found in linked batch", linked_field))?;
+    let existing_linked_col = linked_batch.column(linked_col_idx).clone();
 
     // Build and run the DataFusion aggregate.
     let aggr_expr = match reducer {
@@ -702,7 +699,7 @@ async fn execute_collect_to_pool(
         .unwrap_or_else(|| Arc::new(ArrowSchema::empty()));
     let agg_batch = concat_batches(&agg_schema, &agg_batches)?;
 
-    // Build pool_idx → agg_row index map.
+    // Build linked_idx → agg_row index map.
     let group_col = agg_batch.schema().index_of(group_by)
         .ok()
         .and_then(|i| agg_batch.column(i).as_any().downcast_ref::<UInt32Array>().map(|a| a.values().to_vec()))
@@ -711,25 +708,25 @@ async fn execute_collect_to_pool(
         .map(|i| agg_batch.column(i).clone())
         .unwrap_or_else(|_| Arc::new(arrow::array::Int32Array::from(vec![] as Vec<i32>)));
     let mut idx_map: HashMap<u32, usize> = HashMap::new();
-    for (row, &pool_idx) in group_col.iter().enumerate() {
-        idx_map.insert(pool_idx, row);
+    for (row, &linked_idx) in group_col.iter().enumerate() {
+        idx_map.insert(linked_idx, row);
     }
 
     // Build the replacement column.
     let new_col: ArrayRef = match reducer {
         Reducer::Collect => {
-            // Collect: build a ListArray; unmapped pool rows get an empty list.
+            // Collect: build a ListArray; unmapped linked rows get an empty list.
             let element_type = match agg_values_col.data_type() {
                 DataType::List(f) => f.data_type().clone(),
-                other => bail!("CollectToPool: expected List from array_agg, got {other:?}"),
+                other => bail!("AccumulateToLinked: expected List from array_agg, got {other:?}"),
             };
             let agg_list = agg_values_col.as_any().downcast_ref::<ListArray>()
-                .ok_or_else(|| anyhow!("CollectToPool: __agg column is not a ListArray"))?;
+                .ok_or_else(|| anyhow!("AccumulateToLinked: __agg column is not a ListArray"))?;
             let item_field = Arc::new(ArrowField::new("item", element_type.clone(), true));
             let mut offsets: Vec<i32> = vec![0];
             let mut child_slices: Vec<ArrayRef> = Vec::new();
-            for pool_row in 0..pool_n {
-                if let Some(&agg_row) = idx_map.get(&(pool_row as u32)) {
+            for linked_row in 0..linked_n {
+                if let Some(&agg_row) = idx_map.get(&(linked_row as u32)) {
                     let slice = agg_list.value(agg_row);
                     offsets.push(offsets.last().unwrap() + slice.len() as i32);
                     child_slices.push(slice);
@@ -747,30 +744,30 @@ async fn execute_collect_to_pool(
             Arc::new(ListArray::new(item_field, offsets_buf, child_array, None))
         }
         _ => {
-            // Scalar reducers (Sum, Max, Min, TakeFirst): mapped pool rows get the aggregated
-            // value; unmapped pool rows get the field's declared `default_val`.
+            // Scalar reducers (Sum, Max, Min, TakeFirst): mapped linked rows get the aggregated
+            // value; unmapped linked rows get the field's declared `default_val`.
             //
             // Implementation: concatenate [agg_col, default_col] into a combined array, then
             // `take` with indices that point into agg_col for mapped rows and into default_col
             // for unmapped rows.
             let agg_n = agg_batch.num_rows();
-            let take_indices: UInt32Array = (0..pool_n as u32).map(|pool_row| {
-                idx_map.get(&pool_row)
+            let take_indices: UInt32Array = (0..linked_n as u32).map(|linked_row| {
+                idx_map.get(&linked_row)
                     .map(|&agg_row| agg_row as u32)
-                    .unwrap_or(agg_n as u32 + pool_row)
+                    .unwrap_or(agg_n as u32 + linked_row)
             }).collect::<Vec<u32>>().into();
-            let default_col = yaml_value_to_array(default_val, existing_pool_col.data_type(), pool_n);
+            let default_col = yaml_value_to_array(default_val, existing_linked_col.data_type(), linked_n);
             let combined = concat(&[agg_values_col.as_ref(), default_col.as_ref()])?;
             take(combined.as_ref(), &take_indices, None)?
         }
     };
 
-    // Replace pool_field column in pool_batch.
-    let mut fields: Vec<Arc<ArrowField>> = pool_batch.schema().fields().to_vec();
-    let mut columns = pool_batch.columns().to_vec();
-    fields[pool_col_idx] = Arc::new(ArrowField::new(pool_field, new_col.data_type().clone(), true));
-    columns[pool_col_idx] = new_col;
-    computed.insert(pool_path.clone(), RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?);
+    // Replace linked_field column in linked_batch.
+    let mut fields: Vec<Arc<ArrowField>> = linked_batch.schema().fields().to_vec();
+    let mut columns = linked_batch.columns().to_vec();
+    fields[linked_col_idx] = Arc::new(ArrowField::new(linked_field, new_col.data_type().clone(), true));
+    columns[linked_col_idx] = new_col;
+    computed.insert(linked_path.clone(), RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?);
     Ok(())
 }
 
@@ -875,10 +872,10 @@ fn strip_slot_idx(batch: RecordBatch) -> RecordBatch {
     strip_sentinel(batch, "_slot_idx")
 }
 
-/// Strip `_pool_idx` from a batch before emitting a junction dataset's output.
-/// The full batch (including `_pool_idx`) is retained in `computed` for `CollectToPool`.
-fn strip_pool_idx(batch: RecordBatch) -> RecordBatch {
-    strip_sentinel(batch, "_pool_idx")
+/// Strip `_linked_idx` from a batch before emitting a junction dataset's output.
+/// The full batch (including `_linked_idx`) is retained in `computed` for `AccumulateToLinked`.
+fn strip_linked_idx(batch: RecordBatch) -> RecordBatch {
+    strip_sentinel(batch, "_linked_idx")
 }
 
 fn strip_sentinel(batch: RecordBatch, sentinel: &str) -> RecordBatch {
@@ -893,30 +890,30 @@ fn strip_sentinel(batch: RecordBatch, sentinel: &str) -> RecordBatch {
         .expect("strip_sentinel: schema mismatch is impossible")
 }
 
-/// Inject `_pool_idx` into `batch` for any junction links in `dataset`.
+/// Inject `_linked_idx` into `batch` for any junction links in `dataset`.
 ///
-/// For each junction link (a link not referenced by any `content.group`), samples one pool
-/// row per batch row and prepends a `_pool_idx: UInt32` column. The pool batch must already
-/// be in `computed` (the DAG link-edge from pool → junction guarantees this).
+/// For each junction link (a link not referenced by any `content.from`), samples one linked
+/// row per batch row and prepends a `_linked_idx: UInt32` column. The linked batch must already
+/// be in `computed` (the DAG link-edge from linked dataset → junction guarantees this).
 ///
-/// For Stage 4, only the first junction link is processed (multi-link deferred).
-fn inject_pool_idx(
+/// Only the first junction link is processed (multi-link deferred).
+fn inject_linked_idx(
     batch: &RecordBatch,
     path: &Path,
     dataset: &SyntheticDataset,
     computed: &HashMap<PathBuf, RecordBatch>,
 ) -> Result<RecordBatch> {
     let list_link_refs: HashSet<&str> = dataset.data.iter()
-        .filter_map(|f| f.content.as_ref()?.group.as_deref())
+        .filter_map(|f| f.content.as_ref()?.from.as_deref())
         .collect();
     for link in &dataset.links {
         if list_link_refs.contains(link.reference.as_str()) { continue; }
-        let Some(pool_path) = resolve_include(path, &link.file) else { continue };
-        let Some(pool_batch) = computed.get(&pool_path) else { continue };
-        let n_pool = pool_batch.num_rows();
+        let Some(linked_path) = resolve_include(path, &link.file) else { continue };
+        let Some(linked_batch) = computed.get(&linked_path) else { continue };
+        let n_linked = linked_batch.num_rows();
         let n_eligible = match link.ratio {
-            Some(r) => ((r * n_pool as f64).round() as usize).clamp(1, n_pool),
-            None    => n_pool,
+            Some(r) => ((r * n_linked as f64).round() as usize).clamp(1, n_linked),
+            None    => n_linked,
         };
         let n_rows = batch.num_rows();
         let r = link.reinforcement;
@@ -929,8 +926,8 @@ fn inject_pool_idx(
                 .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
                 .collect()
         };
-        let pool_idx_arr: ArrayRef = Arc::new(UInt32Array::from(assignments));
-        return prepend_column(batch, "_pool_idx", pool_idx_arr);
+        let linked_idx_arr: ArrayRef = Arc::new(UInt32Array::from(assignments));
+        return prepend_column(batch, "_linked_idx", linked_idx_arr);
     }
     Ok(batch.clone())
 }
@@ -954,7 +951,7 @@ fn generate_batch(
     let arrow_schema = Arc::new(schema_to_arrow(schema));
     let columns = schema
         .iter()
-        .filter(|f| f.expression.is_none() && !f.is_link_content())
+        .filter(|f| f.expression.is_none() && !f.is_list_link())
         .map(|f| {
             let prefix = prefills.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
             let effective = overrides.get(&f.name).map(|fc| apply_constraints(f, fc));
@@ -1005,18 +1002,19 @@ async fn union_and_shuffle(batches: Vec<RecordBatch>, name: &str) -> Result<Reco
     Ok(concat_batches(&schema, &shuffled)?)
 }
 
-/// Prepend pool rows (unshuffled) before shuffled non-pool rows. Pool rows must appear
-/// first so that GenerateInnerFlat's n_eligible_slots boundary correctly identifies them.
-async fn combine_pool_first(
-    pool_batches: Vec<RecordBatch>,
-    nonpool_batches: Vec<RecordBatch>,
+/// Prepend witness-source rows (unshuffled) before shuffled non-witness-source rows.
+/// Witness-source rows must appear first so GenerateWitness's n_eligible_slots boundary
+/// correctly identifies them.
+async fn combine_witness_source_first(
+    witness_source_batches: Vec<RecordBatch>,
+    non_witness_source_batches: Vec<RecordBatch>,
     schema: &Schema,
     name: &str,
 ) -> Result<RecordBatch> {
-    let shuffled_nonpool = combine_and_shuffle(nonpool_batches, schema, name).await?;
+    let shuffled_non_witness = combine_and_shuffle(non_witness_source_batches, schema, name).await?;
     let arrow_schema = Arc::new(schema_to_arrow(schema));
-    let pool_combined = concat_batches(&arrow_schema, &pool_batches)?;
-    Ok(concat_batches(&pool_combined.schema(), &[pool_combined, shuffled_nonpool])?)
+    let ws_combined = concat_batches(&arrow_schema, &witness_source_batches)?;
+    Ok(concat_batches(&ws_combined.schema(), &[ws_combined, shuffled_non_witness])?)
 }
 
 fn emit_batch(

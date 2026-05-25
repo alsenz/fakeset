@@ -14,7 +14,7 @@ data:
   - name: items
     type: list
     content:
-      group: pool
+      from: pool
       fields:
         - name: pool_id
           ref: pool.pool_id

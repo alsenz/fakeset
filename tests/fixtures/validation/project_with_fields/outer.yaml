@@ -9,7 +9,7 @@ data:
   - name: items
     type: list
     content:
-      group: pool
+      from: pool
       project: pool.label
       fields:
         - name: label

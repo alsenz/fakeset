@@ -9,5 +9,5 @@ data:
   - name: items
     type: list
     content:
-      group: pool
+      from: pool
       project: pool.nonexistent_field

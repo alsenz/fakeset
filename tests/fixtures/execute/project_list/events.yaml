@@ -13,5 +13,5 @@ data:
   - name: attendees
     type: list
     content:
-      group: person
+      from: person
       project: person.full_name

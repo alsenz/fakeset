@@ -16,7 +16,7 @@ data:
   - name: samples
     type: list
     content:
-      group: p
+      from: p
       fields:
         - name: val
           ref: p.val

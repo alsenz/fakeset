@@ -86,21 +86,21 @@ fn validate_dataset(
         }
     }
     // group ref must match a link.
-    for group_ref in &group_refs {
-        if !dataset.links.iter().any(|l| &l.reference == group_ref) {
+    for from_ref in &group_refs {
+        if !dataset.links.iter().any(|l| &l.reference == from_ref) {
             bail!(
-                "dataset '{}': `content.group: {}` does not match any entry in `links`",
-                dataset.name, group_ref
+                "dataset '{}': `content.from: {}` does not match any entry in `links`",
+                dataset.name, from_ref
             );
         }
     }
-    // Two content.group fields may not reference the same link.
-    let mut seen_groups: HashSet<&str> = HashSet::new();
-    for gr in &group_refs {
-        if !seen_groups.insert(gr.as_str()) {
+    // Two content.from fields may not reference the same link.
+    let mut seen_from: HashSet<&str> = HashSet::new();
+    for fr in &group_refs {
+        if !seen_from.insert(fr.as_str()) {
             bail!(
-                "dataset '{}': two or more list fields share `content.group: {}` — each link may be referenced by at most one list field",
-                dataset.name, gr
+                "dataset '{}': two or more list fields share `content.from: {}` — each link may be referenced by at most one list field",
+                dataset.name, fr
             );
         }
     }
@@ -151,8 +151,8 @@ fn validate_dataset(
 
         // Link-content fields need full dataset context — handle separately.
         if let Some(content) = &field.content {
-            if let Some(ref group_ref) = content.group {
-                if let Some(link) = dataset.links.iter().find(|l| &l.reference == group_ref) {
+            if let Some(ref from_ref) = content.from {
+                if let Some(link) = dataset.links.iter().find(|l| &l.reference == from_ref) {
                     let content_path = format!("{field_path}[]");
                     validate_project(content, link, &content_path, path, dataset, all)?;
                     validate_link_content(&content_path, link, &content.item.fields, path, dataset, all, warnings)?;
@@ -325,14 +325,14 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
                 "warning: field '{path}' is `list` type but has no `content` \
                  — will generate empty lists"
             )),
-            Some(c) if c.group.is_none() => {
+            Some(c) if c.from.is_none() => {
                 validate_field(&format!("{path}[]"), &c.item, warnings)?;
             }
             Some(_) => {
                 // Rich list — count must not be set on the field; cardinality belongs on the link.
                 if field.count.is_some() {
                     bail!(
-                        "field '{path}': `count` cannot be set on a nested-include list field — \
+                        "field '{path}': `count` cannot be set on a list-link field — \
                          use `cardinality` on the link in `links`"
                     );
                 }
@@ -382,12 +382,12 @@ fn validate_link_content(
 ) -> Result<()> {
     for field in data {
         if field.name.is_empty() {
-            bail!("nested include content at '{path}': a field is missing a `name`");
+            bail!("list-link content at '{path}': a field is missing a `name`");
         }
         let fpath = format!("{path}.{}", field.name);
 
         if field.expression.is_some() {
-            bail!("field '{fpath}': `expression` is not supported inside nested include content");
+            bail!("field '{fpath}': `expression` is not supported inside list-link content");
         }
 
         if let Some(ref_str) = field.simple_ref() {
@@ -543,9 +543,9 @@ fn validate_collect_bindings(
             validate_single_collect_bind(dataset_path, dataset, all, &field_path, binding)?;
         }
 
-        // Case 2 — fields inside nested-include content blocks.
+        // Case 2 — fields inside list-link content blocks.
         if let Some(content) = &field.content {
-            if content.group.is_some() {
+            if content.from.is_some() {
                 for cf in &content.item.fields {
                     let cf_path = format!("{field_path}[].{}", cf.name);
                     for binding in cf.collect_bindings() {
@@ -569,44 +569,44 @@ fn validate_single_collect_bind(
         anyhow!("field '{field_path}': collect binding has no `bind` target")
     })?;
 
-    let (pool_ref, pool_field_name) = split_ref(bind).ok_or_else(|| {
+    let (linked_ref, linked_field_name) = split_ref(bind).ok_or_else(|| {
         anyhow!(
             "field '{field_path}': collect `bind: {bind}` must be in the form \
-             'pool_ref.field_name'"
+             'linked_ref.field_name'"
         )
     })?;
 
     let link = dataset
         .links
         .iter()
-        .find(|l| l.reference == pool_ref)
+        .find(|l| l.reference == linked_ref)
         .ok_or_else(|| {
             anyhow!(
                 "field '{field_path}': collect `bind: {bind}` — \
-                 no link with ref '{pool_ref}' in this dataset"
+                 no link with ref '{linked_ref}' in this dataset"
             )
         })?;
 
-    let pool_path = resolve_include(dataset_path, &link.file).ok_or_else(|| {
+    let linked_path = resolve_include(dataset_path, &link.file).ok_or_else(|| {
         anyhow!(
             "field '{field_path}': collect `bind: {bind}` — \
-             cannot resolve pool file '{}'",
+             cannot resolve linked file '{}'",
             link.file
         )
     })?;
 
-    let pool_ds = all.get(&pool_path).ok_or_else(|| {
-        anyhow!("field '{field_path}': collect `bind: {bind}` — pool dataset not loaded")
+    let linked_ds = all.get(&linked_path).ok_or_else(|| {
+        anyhow!("field '{field_path}': collect `bind: {bind}` — linked dataset not loaded")
     })?;
 
-    let pool_field = pool_ds
+    let linked_field = linked_ds
         .data
         .iter()
-        .find(|f| f.name == pool_field_name)
+        .find(|f| f.name == linked_field_name)
         .ok_or_else(|| {
             anyhow!(
                 "field '{field_path}': collect `bind: {bind}` — \
-                 field '{pool_field_name}' not found in '{}'",
+                 field '{linked_field_name}' not found in '{}'",
                 link.file
             )
         })?;
@@ -615,24 +615,24 @@ fn validate_single_collect_bind(
     let reducer = binding.reducer.as_ref().unwrap_or(&Reducer::Collect);
     match reducer {
         Reducer::Collect => {
-            if !matches!(pool_field.field_type, Some(FieldType::List)) {
+            if !matches!(linked_field.field_type, Some(FieldType::List)) {
                 bail!(
                     "field '{field_path}': collect `bind: {bind}` — \
-                     target field '{pool_field_name}' in '{}' must be `type: list` \
+                     target field '{linked_field_name}' in '{}' must be `type: list` \
                      (collect accumulates values into a list; got type: {:?})",
                     link.file,
-                    pool_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
+                    linked_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
                 );
             }
         }
         Reducer::Sum => {
-            if !matches!(pool_field.field_type, Some(FieldType::Number)) {
+            if !matches!(linked_field.field_type, Some(FieldType::Number)) {
                 bail!(
                     "field '{field_path}': sum `bind: {bind}` — \
-                     target field '{pool_field_name}' in '{}' must be `type: number` \
+                     target field '{linked_field_name}' in '{}' must be `type: number` \
                      (sum requires a numeric target; got type: {:?})",
                     link.file,
-                    pool_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
+                    linked_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
                 );
             }
         }
@@ -641,11 +641,11 @@ fn validate_single_collect_bind(
         }
     }
 
-    if pool_field.default.is_none() {
+    if linked_field.default.is_none() {
         bail!(
             "field '{field_path}': {:?} `bind: {bind}` — \
-             target field '{pool_field_name}' in '{}' must declare `default:` \
-             (the default is used when no atoms map to that pool row)",
+             target field '{linked_field_name}' in '{}' must declare `default:` \
+             (the default is used when no atoms map to that linked row)",
             reducer,
             link.file
         );
@@ -717,12 +717,12 @@ fn validate_ref_target(
     Ok(())
 }
 
-/// Collect all `content.group` ref strings found recursively in a field list.
+/// Collect all `content.from` ref strings found recursively in a field list.
 fn collect_group_refs(fields: &[Field]) -> Vec<String> {
     let mut refs = Vec::new();
     for field in fields {
         if let Some(content) = &field.content {
-            if let Some(ref g) = content.group {
+            if let Some(ref g) = content.from {
                 refs.push(g.clone());
             }
             refs.extend(collect_group_refs(&content.item.fields));

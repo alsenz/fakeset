@@ -11,7 +11,7 @@ data:
   - name: items
     type: list
     content:
-      group: src
+      from: src
       fields:
         - name: event_title
           ref: title    # error: outer-scoped ref with no type:

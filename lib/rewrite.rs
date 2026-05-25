@@ -50,8 +50,8 @@ pub fn expand_include_fields(
             let out = result.get_mut(path).unwrap();
             for field in &mut out.data {
                 let Some(ref mut content) = field.content else { continue };
-                let Some(ref group_ref) = content.group else { continue };
-                if *group_ref != link.reference {
+                let Some(ref from_ref) = content.from else { continue };
+                if *from_ref != link.reference {
                     continue;
                 }
                 // `project` injection: if project is set and no fields yet, inject a single ref.
@@ -160,14 +160,14 @@ pub fn resolve_refs(
                     field.clone()
                 };
 
-                // Resolve pool-scoped refs inside nested include content.
+                // Resolve linked-dataset refs inside list-link content.
                 if let Some(content) = &field.content {
-                    if let Some(ref group_ref) = content.group {
-                        let group_ref = group_ref.clone();
-                        if let Some(link) = dataset.links.iter().find(|l| l.reference == group_ref) {
+                    if let Some(ref from_ref) = content.from {
+                        let from_ref = from_ref.clone();
+                        if let Some(link) = dataset.links.iter().find(|l| l.reference == from_ref) {
                             let link = link.clone();
                             let new_content_fields: Vec<Field> = content.item.fields.iter()
-                                .map(|cf| resolve_nested_include_content_field(path, datasets, cf, &link))
+                                .map(|cf| resolve_list_link_content_field(path, datasets, cf, &link))
                                 .collect::<Result<_>>()?;
                             if let Some(ref mut c) = out.content {
                                 c.item.fields = new_content_fields;
@@ -324,15 +324,15 @@ fn resolve_to_base<'a>(
     resolve_to_base(next_field, next_ds, &inc_path, all, depth + 1)
 }
 
-/// Resolve a single field inside a nested include content block.
+/// Resolve a single field inside a list-link content block.
 ///
-/// - **Include-scoped ref** (`ref: include_ref.field`): copies `field_type` and nested schema
-///   from the target field in the included dataset, merging any local constraints.
-/// - **Outer-scoped ref** (no dot or dot not matching any content include): left unchanged
+/// - **Linked-dataset ref** (`ref: linked_ref.field`): copies `field_type` and nested schema
+///   from the target field in the linked dataset, merging any local constraints.
+/// - **Outer-scoped ref** (no dot or dot not matching any content link): left unchanged
 ///   — the field already carries an explicit `type` (validated) and the executor will stamp
 ///   the value from the outer row at generation time.
 /// - **No ref**: left unchanged.
-fn resolve_nested_include_content_field(
+fn resolve_list_link_content_field(
     dataset_path: &Path,
     all: &HashMap<PathBuf, SyntheticDataset>,
     field: &Field,
@@ -354,7 +354,7 @@ fn resolve_nested_include_content_field(
 
     let include_path = resolve_include(dataset_path, &include.file).ok_or_else(|| {
         anyhow!(
-            "nested include field '{}': cannot resolve include '{}'",
+            "list-link content field '{}': cannot resolve linked file '{}'",
             field.name, include.file
         )
     })?;
@@ -364,14 +364,14 @@ fn resolve_nested_include_content_field(
         .and_then(|ds| ds.data.iter().find(|f| f.name == target_name))
         .ok_or_else(|| {
             anyhow!(
-                "nested include field '{}': target field '{}' not found in '{}'",
+                "list-link content field '{}': target field '{}' not found in '{}'",
                 field.name, target_name, include.file
             )
         })?;
 
     let merged = FieldConstraints::from(field).merge(&FieldConstraints::from(target)).ok_or_else(|| {
         anyhow!(
-            "nested include field '{}': local constraints conflict with target '{}'",
+            "list-link content field '{}': local constraints conflict with target '{}'",
             field.name, target_name
         )
     })?;

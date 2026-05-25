@@ -60,8 +60,8 @@ fn flat_dataset_produces_generate_then_write_steps() {
 }
 
 #[test]
-fn bernoulli_sibling_absorbed_not_standalone() {
-    // single_sibling: source (parent, rows:20) and subset (sibling, dist:0.5).
+fn bernoulli_lower_cover_member_absorbed_not_standalone() {
+    // single_sibling: source (parent, rows:20) and subset (lower cover member, ratio:0.5).
     // Only source should appear as a step; subset is absorbed into the group.
     let steps = plan_for("tests/fixtures/execute/single_sibling");
     let has_standalone_subset = steps.iter().any(|s| {
@@ -69,11 +69,11 @@ fn bernoulli_sibling_absorbed_not_standalone() {
     });
     assert!(
         !has_standalone_subset,
-        "subset is a Bernoulli sibling and must not appear as a standalone GenerateDataset"
+        "subset is a Bernoulli lower cover member and must not appear as a standalone GenerateDataset"
     );
     assert!(
-        steps.iter().any(|s| matches!(s, ExecutionStep::GenerateSiblingGroup { parent, .. } if parent.name == "source")),
-        "expected GenerateSiblingGroup for source"
+        steps.iter().any(|s| matches!(s, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name == "source")),
+        "expected GenerateLowerCoverGroup for source"
     );
 }
 
@@ -105,24 +105,24 @@ fn distribution_drives_parent_segment_row_counts() {
     // going to the segment that includes subset.
     let steps = plan_for("tests/fixtures/execute/single_sibling");
     let segments = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateSiblingGroup { parent, segments, .. }
+        ExecutionStep::GenerateLowerCoverGroup { parent, segments, .. }
             if parent.name == "source" =>
         {
             Some(segments)
         }
         _ => None,
     });
-    let segments = segments.expect("GenerateSiblingGroup for source not found");
+    let segments = segments.expect("GenerateLowerCoverGroup for source not found");
 
     let total: usize = segments.iter().map(|s| s.rows).sum();
     assert_eq!(total, 20, "total segment rows should equal source's row count");
 
-    let sibling_rows: usize = segments
+    let member_rows: usize = segments
         .iter()
-        .filter(|s| !s.siblings.is_empty())
+        .filter(|s| !s.members.is_empty())
         .map(|s| s.rows)
         .sum();
-    assert_eq!(sibling_rows, 10, "subset's segment should cover 20 × 0.5 = 10 rows");
+    assert_eq!(member_rows, 10, "subset's segment should cover 20 × 0.5 = 10 rows");
 }
 
 // ---------------------------------------------------------------------------
@@ -132,21 +132,21 @@ fn distribution_drives_parent_segment_row_counts() {
 #[test]
 fn ref_field_wired_as_prefill_on_includee() {
     // ref_wiring: derived includes source with no explicit ratio (defaults to 1.0).
-    // Since Stage 5, all children are registered as siblings unconditionally, so
-    // source gets a GenerateSiblingGroup step with derived as its sibling.
+    // Since Stage 5, all children are registered as lower cover members unconditionally, so
+    // source gets a GenerateLowerCoverGroup step with derived as a lower cover member.
     // The actual ref-field wiring (derived.id → source.id) is verified by the
     // executor test test_ref_wiring_propagates_column_values.
     let steps = plan_for("tests/fixtures/execute/ref_wiring");
-    let sibling_group = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateSiblingGroup { parent, siblings, .. } if parent.name == "source" => {
-            Some(siblings)
+    let lower_cover_group = steps.iter().find_map(|s| match s {
+        ExecutionStep::GenerateLowerCoverGroup { parent, members, .. } if parent.name == "source" => {
+            Some(members)
         }
         _ => None,
     });
-    let siblings = sibling_group.expect("GenerateSiblingGroup step for 'source' not found");
+    let members = lower_cover_group.expect("GenerateLowerCoverGroup step for 'source' not found");
     assert!(
-        siblings.iter().any(|s| s.dataset.name == "derived"),
-        "derived should appear as a sibling of source; got: {siblings:?}"
+        members.iter().any(|m| m.dataset.name == "derived"),
+        "derived should appear as a lower cover member of source; got: {members:?}"
     );
 }
 
@@ -154,41 +154,41 @@ fn ref_field_wired_as_prefill_on_includee() {
 fn hidden_ref_field_wired_as_prefill() {
     // expression_pulldown: derived has expression "age * 2" referencing source.age,
     // pulled down as a hidden ref field. Since Stage 5, derived is registered as a
-    // sibling of source unconditionally, so source gets GenerateSiblingGroup.
+    // lower cover member of source unconditionally, so source gets GenerateLowerCoverGroup.
     // The actual hidden-field wiring is verified by the executor tests.
     let steps = plan_for("tests/fixtures/execute/expression_pulldown");
-    let sibling_group = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateSiblingGroup { parent, siblings, .. } if parent.name == "source" => {
-            Some(siblings)
+    let lower_cover_group = steps.iter().find_map(|s| match s {
+        ExecutionStep::GenerateLowerCoverGroup { parent, members, .. } if parent.name == "source" => {
+            Some(members)
         }
         _ => None,
     });
-    let siblings = sibling_group.expect("GenerateSiblingGroup step for 'source' not found");
+    let members = lower_cover_group.expect("GenerateLowerCoverGroup step for 'source' not found");
     assert!(
-        siblings.iter().any(|s| s.dataset.name == "derived"),
-        "derived should appear as a sibling of source; got: {siblings:?}"
+        members.iter().any(|m| m.dataset.name == "derived"),
+        "derived should appear as a lower cover member of source; got: {members:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Nested include plan decomposition
+// List-link plan decomposition
 // ---------------------------------------------------------------------------
 
 #[test]
-fn nested_include_dataset_decomposes_into_inner_flat_and_assemble() {
-    // events has a nested include field (attendees), people does not.
-    // Because events includes people with a distribution (pool sibling), people gets
-    // a GenerateSiblingGroup step (pool-rows-first ordering for GenerateInnerFlat).
-    // Expected steps: GenerateSiblingGroup(people, skip_parent_emit=false),
+fn list_link_dataset_decomposes_into_witness_and_assemble() {
+    // events has a list-link field (attendees), people does not.
+    // Because events includes people with a ratio (witness source), people gets
+    // a GenerateLowerCoverGroup step (witness-source-rows-first ordering for GenerateWitness).
+    // Expected steps: GenerateLowerCoverGroup(people, skip_parent_emit=false),
     //                 GenerateDataset(events, skip_emit=true),
-    //                 GenerateInnerFlat(attendees),
-    //                 AssembleNestedInclude(events)
+    //                 GenerateWitness(attendees),
+    //                 AssembleFromWitness(events)
     let steps = plan_for("tests/fixtures/execute/link_content");
 
-    // people: no nested include → must not be skip-emitted (GenerateDataset or GenerateSiblingGroup)
+    // people: no nested include → must not be skip-emitted (GenerateDataset or GenerateLowerCoverGroup)
     let people_not_skipped = steps.iter().any(|s| match s {
         ExecutionStep::GenerateDataset { dataset, skip_emit: false, .. } => dataset.name == "people",
-        ExecutionStep::GenerateSiblingGroup { parent, skip_parent_emit: false, .. } => parent.name == "people",
+        ExecutionStep::GenerateLowerCoverGroup { parent, skip_parent_emit: false, .. } => parent.name == "people",
         _ => false,
     });
     assert!(people_not_skipped, "people has no nested include, must have a non-skipped generation step");
@@ -200,65 +200,65 @@ fn nested_include_dataset_decomposes_into_inner_flat_and_assemble() {
         "events has a nested include field, skip_emit must be true"
     );
 
-    // GenerateInnerFlat for attendees must be present
+    // GenerateWitness for attendees must be present
     assert!(
-        find_step!(steps, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "attendees").is_some(),
-        "expected GenerateInnerFlat step for 'attendees'"
+        find_step!(steps, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "attendees").is_some(),
+        "expected GenerateWitness step for 'attendees'"
     );
 
-    // AssembleNestedInclude for events must be present
+    // AssembleFromWitness for events must be present
     assert!(
-        find_step!(steps, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "events").is_some(),
-        "expected AssembleNestedInclude step for 'events'"
+        find_step!(steps, ExecutionStep::AssembleFromWitness { dataset, .. } if dataset.name == "events").is_some(),
+        "expected AssembleFromWitness step for 'events'"
     );
 
-    // GenerateInnerFlat must come before AssembleNestedInclude
+    // GenerateWitness must come before AssembleFromWitness
     let flat_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "attendees")
-    }).expect("GenerateInnerFlat not found");
+        matches!(s, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "attendees")
+    }).expect("GenerateWitness not found");
     let assemble_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "events")
-    }).expect("AssembleNestedInclude not found");
+        matches!(s, ExecutionStep::AssembleFromWitness { dataset, .. } if dataset.name == "events")
+    }).expect("AssembleFromWitness not found");
     assert!(
         flat_pos < assemble_pos,
-        "GenerateInnerFlat must precede AssembleNestedInclude (flat={flat_pos}, assemble={assemble_pos})"
+        "GenerateWitness must precede AssembleFromWitness (flat={flat_pos}, assemble={assemble_pos})"
     );
 }
 
 #[test]
-fn bernoulli_nested_include_parent_has_skip_parent_emit() {
-    // events is both a Bernoulli parent (vip is its sibling at dist:0.5) and has
-    // a nested include field (picks). It must produce:
-    //   GenerateSiblingGroup(events, skip_parent_emit=true)
-    //   GenerateInnerFlat(picks)
-    //   AssembleNestedInclude(events)
+fn bernoulli_list_link_parent_has_skip_parent_emit() {
+    // events is both a Bernoulli parent (vip is its lower cover member at ratio:0.5) and has
+    // a list-link field (picks). It must produce:
+    //   GenerateLowerCoverGroup(events, skip_parent_emit=true)
+    //   GenerateWitness(picks)
+    //   AssembleFromWitness(events)
     let steps = plan_for("tests/fixtures/execute/bernoulli_link_content");
 
     let group_step = find_step!(
-        steps, ExecutionStep::GenerateSiblingGroup { parent, .. } if parent.name == "events"
+        steps, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name == "events"
     );
     assert!(
-        matches!(group_step, Some(ExecutionStep::GenerateSiblingGroup { skip_parent_emit: true, .. })),
+        matches!(group_step, Some(ExecutionStep::GenerateLowerCoverGroup { skip_parent_emit: true, .. })),
         "events has a nested include field, skip_parent_emit must be true"
     );
 
     assert!(
-        find_step!(steps, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "picks").is_some(),
-        "expected GenerateInnerFlat for 'picks'"
+        find_step!(steps, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "picks").is_some(),
+        "expected GenerateWitness for 'picks'"
     );
     assert!(
-        find_step!(steps, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "events").is_some(),
-        "expected AssembleNestedInclude for 'events'"
+        find_step!(steps, ExecutionStep::AssembleFromWitness { dataset, .. } if dataset.name == "events").is_some(),
+        "expected AssembleFromWitness for 'events'"
     );
 
-    // GenerateSiblingGroup must come before GenerateInnerFlat
+    // GenerateLowerCoverGroup must come before GenerateWitness
     let group_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::GenerateSiblingGroup { parent, .. } if parent.name == "events")
+        matches!(s, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name == "events")
     }).unwrap();
     let flat_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "picks")
+        matches!(s, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "picks")
     }).unwrap();
-    assert!(group_pos < flat_pos, "GenerateSiblingGroup must precede GenerateInnerFlat");
+    assert!(group_pos < flat_pos, "GenerateLowerCoverGroup must precede GenerateWitness");
 }
 
 #[test]
@@ -327,16 +327,16 @@ fn variant_rows_sum_to_parent_and_respect_distribution() {
 }
 
 #[test]
-fn variant_sibling_produces_sibling_groups_and_shared_outputs() {
-    // source has 2 variants (70/30), subset is a Bernoulli sibling at dist:0.4.
-    // Expected: 2 GenerateSiblingGroup steps (one per variant), 2 WriteSharedOutput steps
+fn variant_lower_cover_member_produces_lower_cover_groups_and_shared_outputs() {
+    // source has 2 variants (70/30), subset is a Bernoulli lower cover member at ratio:0.4.
+    // Expected: 2 GenerateLowerCoverGroup steps (one per variant), 2 WriteSharedOutput steps
     // (one for source variants, one for subset accumulation).
     let steps = plan_for("tests/fixtures/execute/variant_sibling");
 
-    let sibling_groups: Vec<_> = steps.iter().filter(|s| {
-        matches!(s, ExecutionStep::GenerateSiblingGroup { parent, .. } if parent.name.starts_with("source__v"))
+    let lower_cover_groups: Vec<_> = steps.iter().filter(|s| {
+        matches!(s, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name.starts_with("source__v"))
     }).collect();
-    assert_eq!(sibling_groups.len(), 2, "expected 2 GenerateSiblingGroup steps for variant parents");
+    assert_eq!(lower_cover_groups.len(), 2, "expected 2 GenerateLowerCoverGroup steps for variant parents");
 
     let write_count = steps.iter().filter(|s| matches!(s, ExecutionStep::WriteSharedOutput { .. })).count();
     assert_eq!(write_count, 2, "expected WriteSharedOutput for source and for subset");
@@ -370,42 +370,42 @@ fn field_variant_expands_to_correct_generate_steps() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn nested_include_collect_produces_correct_step_sequence() {
+fn list_link_collect_produces_correct_step_sequence() {
     // pool: plain dataset (rows: 5) with a collect-target list field.
     // outer: nested-include dataset; content field has refs: [pool.item_name, {bind: pool.collected_labels, reducer: collect}].
     //
     // Expected step order:
     //   GenerateDataset[pool, skip_emit=true]   ← collect target, file write deferred
     //   GenerateDataset[outer, skip_emit=true]  ← has nested include fields
-    //   GenerateInnerFlat[items]
-    //   CollectToPool[items.item → pool.collected_labels]
+    //   GenerateWitness[items]
+    //   AccumulateToLinked[items.item → pool.collected_labels]
     //   EmitDataset[pool]
-    //   AssembleNestedInclude[outer]
+    //   AssembleFromWitness[outer]
     let steps = plan_for("tests/fixtures/plan/nested_collect");
 
     // pool must be generated with skip_emit/skip_parent_emit=true (it is a collect target).
-    // It may appear as GenerateDataset or GenerateSiblingGroup (pool siblings are registered
+    // It may appear as GenerateDataset or GenerateLowerCoverGroup (lower cover members are registered
     // against it), so we accept either — the key invariant is that file write is deferred.
     let pool_skips_emit = steps.iter().any(|s| match s {
         ExecutionStep::GenerateDataset { dataset, skip_emit: true, .. } => dataset.name == "pool",
-        ExecutionStep::GenerateSiblingGroup { parent, skip_parent_emit: true, .. } => parent.name == "pool",
+        ExecutionStep::GenerateLowerCoverGroup { parent, skip_parent_emit: true, .. } => parent.name == "pool",
         _ => false,
     });
     assert!(pool_skips_emit, "pool is a collect target — file write must be deferred (skip_emit/skip_parent_emit=true)");
 
-    // GenerateInnerFlat for 'items' must be present
+    // GenerateWitness for 'items' must be present
     assert!(
-        find_step!(steps, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "items").is_some(),
-        "expected GenerateInnerFlat step for 'items'"
+        find_step!(steps, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "items").is_some(),
+        "expected GenerateWitness step for 'items'"
     );
 
-    // CollectToPool must be present targeting pool.collected_labels
+    // AccumulateToLinked must be present targeting pool.collected_labels
     let collect_step = find_step!(
         steps,
-        ExecutionStep::CollectToPool { source_field, pool_field, .. }
-        if source_field == "item" && pool_field == "collected_labels"
+        ExecutionStep::AccumulateToLinked { source_field, linked_field, .. }
+        if source_field == "item" && linked_field == "collected_labels"
     );
-    assert!(collect_step.is_some(), "expected CollectToPool for item → pool.collected_labels");
+    assert!(collect_step.is_some(), "expected AccumulateToLinked for item → pool.collected_labels");
 
     // EmitDataset for pool must be present
     assert!(
@@ -413,29 +413,29 @@ fn nested_include_collect_produces_correct_step_sequence() {
         "expected EmitDataset step for 'pool'"
     );
 
-    // AssembleNestedInclude for outer must be present
+    // AssembleFromWitness for outer must be present
     assert!(
-        find_step!(steps, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "outer").is_some(),
-        "expected AssembleNestedInclude for 'outer'"
+        find_step!(steps, ExecutionStep::AssembleFromWitness { dataset, .. } if dataset.name == "outer").is_some(),
+        "expected AssembleFromWitness for 'outer'"
     );
 
-    // Ordering: GenerateInnerFlat → CollectToPool → EmitDataset[pool] → AssembleNestedInclude
+    // Ordering: GenerateWitness → AccumulateToLinked → EmitDataset[pool] → AssembleFromWitness
     let flat_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::GenerateInnerFlat { list_field_name, .. } if list_field_name == "items")
-    }).expect("GenerateInnerFlat not found");
+        matches!(s, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "items")
+    }).expect("GenerateWitness not found");
     let collect_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::CollectToPool { pool_field, .. } if pool_field == "collected_labels")
-    }).expect("CollectToPool not found");
+        matches!(s, ExecutionStep::AccumulateToLinked { linked_field, .. } if linked_field == "collected_labels")
+    }).expect("AccumulateToLinked not found");
     let emit_pos = steps.iter().position(|s| {
         matches!(s, ExecutionStep::EmitDataset { dataset, .. } if dataset.name == "pool")
     }).expect("EmitDataset[pool] not found");
     let assemble_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::AssembleNestedInclude { dataset, .. } if dataset.name == "outer")
-    }).expect("AssembleNestedInclude not found");
+        matches!(s, ExecutionStep::AssembleFromWitness { dataset, .. } if dataset.name == "outer")
+    }).expect("AssembleFromWitness not found");
 
-    assert!(flat_pos < collect_pos, "GenerateInnerFlat must precede CollectToPool");
-    assert!(collect_pos < emit_pos,  "CollectToPool must precede EmitDataset[pool]");
-    assert!(emit_pos < assemble_pos, "EmitDataset[pool] must precede AssembleNestedInclude");
+    assert!(flat_pos < collect_pos, "GenerateWitness must precede AccumulateToLinked");
+    assert!(collect_pos < emit_pos,  "AccumulateToLinked must precede EmitDataset[pool]");
+    assert!(emit_pos < assemble_pos, "EmitDataset[pool] must precede AssembleFromWitness");
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +446,7 @@ fn nested_include_collect_produces_correct_step_sequence() {
 fn case2_collect_with_jointly_segmented_pool_errors() {
     // case2_collect_joint_segment: outer links pool (collect binding) and flat_sibling
     // includes pool with ratio:0.5. pool is therefore jointly segmented with flat_sibling
-    // (a non-pool sibling), which violates the v1 Case 2 restriction.
+    // (a non-witness-source lower cover member), which violates the v1 Case 2 restriction.
     let err = plan_err_for("tests/fixtures/plan/case2_collect_joint_segment");
     let msg = err.to_string();
     assert!(

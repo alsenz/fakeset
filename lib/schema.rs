@@ -6,7 +6,7 @@ use crate::models::{Field, FieldType, ParquetDatatype, Schema};
 pub fn schema_to_arrow(schema: &Schema) -> arrow::datatypes::Schema {
     arrow::datatypes::Schema::new(
         schema.iter()
-            .filter(|f| f.expression.is_none() && !f.is_link_content())
+            .filter(|f| f.expression.is_none() && !f.is_list_link())
             .map(field_to_arrow)
             .collect::<Vec<_>>(),
     )
@@ -36,7 +36,7 @@ pub fn field_to_arrow(field: &Field) -> ArrowField {
         FieldType::List => {
             let item_dt = match field.content.as_deref() {
                 None => DataType::Utf8,
-                Some(c) if c.group.is_none() => field_to_arrow(&c.item).data_type().clone(),
+                Some(c) if c.from.is_none() => field_to_arrow(&c.item).data_type().clone(),
                 Some(c) => {
                     let sub: Vec<ArrowField> = c.item.fields.iter().map(field_to_arrow).collect();
                     DataType::Struct(sub.into())

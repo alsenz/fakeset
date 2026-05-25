@@ -429,9 +429,9 @@ pub struct Field {
 
 impl Field {
     /// Returns true when this field is a list whose items are drawn from a linked dataset
-    /// (i.e. `content.group:` is set).
-    pub fn is_link_content(&self) -> bool {
-        self.content.as_deref().is_some_and(|c| c.group.is_some())
+    /// (i.e. `content.from:` is set).
+    pub fn is_list_link(&self) -> bool {
+        self.content.as_deref().is_some_and(|c| c.from.is_some())
     }
 
     /// Returns the type-sourcing ref string — the first non-bind-only target from `refs`, if any.
@@ -469,24 +469,24 @@ pub fn resolve_distributions(dists: &[Option<f64>]) -> Vec<f64> {
     dists.iter().map(|d| d.unwrap_or(free_share)).collect()
 }
 
-/// Call `visitor(field, link, item_fields)` for every link-content field (`content.group:` set)
+/// Call `visitor(field, link, item_fields)` for every list-link field (`content.from:` set)
 /// found by recursing through `fields`, pairing each with the matching link from `links`.
 /// Also recurses into content item fields and object sub-fields.
-pub fn for_each_link_content<'a>(
+pub fn for_each_list_link<'a>(
     links: &'a [Include],
     fields: &'a [Field],
     visitor: &mut impl FnMut(&'a Field, &'a Include, &'a [Field]),
 ) {
     for field in fields {
         if let Some(content) = &field.content {
-            if let Some(group_ref) = &content.group {
-                if let Some(link) = links.iter().find(|l| &l.reference == group_ref) {
+            if let Some(from_ref) = &content.from {
+                if let Some(link) = links.iter().find(|l| &l.reference == from_ref) {
                     visitor(field, link, &content.item.fields);
                 }
             }
-            for_each_link_content(links, &content.item.fields, visitor);
+            for_each_list_link(links, &content.item.fields, visitor);
         }
-        for_each_link_content(links, &field.fields, visitor);
+        for_each_list_link(links, &field.fields, visitor);
     }
 }
 
@@ -510,20 +510,19 @@ pub(crate) fn resolve_include(dataset_path: &Path, file: &str) -> Option<PathBuf
 
 /// Element spec for a `list` type field.
 ///
-/// When `group` is set this is a **nested include**: each list item is a struct whose fields
-/// may be sourced from the pool dataset named by `group` (pool-scoped ref: `ref: <ref>.field`)
-/// or from the enclosing outer row (outer-scoped ref: `ref: field`). The named pool dataset
-/// must be declared in the parent dataset's `links:` list. The nested-include pipeline
-/// (`GenerateInnerFlat` / `AssembleNestedInclude`) handles generation and assembly.
+/// When `from` is set this is a **list-link field**: each list item is a struct whose fields
+/// may be sourced from the linked dataset named by `from` (linked-dataset ref: `ref: <ref>.field`)
+/// or from the enclosing outer row (outer-scoped ref: `ref: field`). The named linked dataset
+/// must be declared in the parent dataset's `links:` list. The witness/assembly pipeline
+/// (`GenerateWitness` / `AssembleFromWitness`) handles generation and assembly.
 ///
-/// When `group` is absent this is a **simple list**: items are generated directly from the
+/// When `from` is absent this is a **scalar list**: items are generated directly from the
 /// `item` field spec, exactly as a plain field would be.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListContent {
-    /// When set, names the link (by its `ref:` value in the dataset's `links:` list) whose
-    /// pre-solved pool-slot rows supply values for pool-scoped ref fields. Marks this as a
-    /// nested include.
-    pub group: Option<String>,
+    /// When set, names the link (by its `ref:` value in the dataset's `links:` list) from
+    /// which list items are drawn. Marks this as a list-link field.
+    pub from: Option<String>,
     /// Project a single field from the linked dataset, producing a scalar list instead of a
     /// list of structs. Value must be `"<link_ref>.<field_name>"`. Mutually exclusive with
     /// explicit `fields` in `item`.
@@ -593,10 +592,10 @@ pub struct SyntheticDataset {
     /// and randomly shuffled into one output.
     pub output_file: Option<String>,
     pub include: Option<Include>,
-    /// Pool/partner datasets for junction or nested-include list sampling.
-    /// Each entry names a dataset (by file + ref) from which atoms draw pool-scoped values.
-    /// A link referenced by a `content.group:` field is a **list link** (nested-include pipeline).
-    /// A link with no `content.group:` reference is a **junction link** (activated in MULT-2).
+    /// Linked datasets for junction or list-link sampling.
+    /// Each entry names a dataset (by file + ref) from which atoms draw linked-dataset values.
+    /// A link referenced by a `content.from:` field is a **list link** (witness/assembly pipeline).
+    /// A link with no `content.from:` reference is a **junction link** (activated in MULT-2).
     #[serde(default)]
     pub links: Vec<Include>,
     #[serde(default)]

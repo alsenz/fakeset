@@ -16,7 +16,7 @@ data:
   - name: picks
     type: list
     content:
-      group: item
+      from: item
       fields:
         - name: item_label
           ref: item.label

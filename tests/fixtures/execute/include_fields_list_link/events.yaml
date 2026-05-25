@@ -15,4 +15,4 @@ data:
   - name: picks
     type: list
     content:
-      group: item
+      from: item

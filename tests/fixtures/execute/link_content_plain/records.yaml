@@ -16,7 +16,7 @@ data:
   - name: entries
     type: list
     content:
-      group: entry
+      from: entry
       fields:
         - name: tag
           ref: entry.tag

@@ -8,7 +8,7 @@ data:
   - name: items
     type: list
     content:
-      group: src
+      from: src
       fields:
         - name: doubled
           expression: "src_val * 2"    # error: expression not supported in rich content

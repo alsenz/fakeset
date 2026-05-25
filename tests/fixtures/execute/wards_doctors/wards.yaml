@@ -13,7 +13,7 @@ data:
   - name: on_call_doctors
     type: list
     content:
-      group: doctor
+      from: doctor
       fields:
         - name: doctor_name
           refs:

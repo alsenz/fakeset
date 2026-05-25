@@ -410,7 +410,7 @@ async fn test_list_field_generates_arrays() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_bernoulli_nested_include_parent_assembles_correctly() {
+async fn test_bernoulli_list_link_parent_assembles_correctly() {
     let out = run("tests/fixtures/execute/bernoulli_link_content").await;
 
     assert_eq!(jsonl_rows(&out, "items").len(), 20, "items should have 20 rows");
@@ -450,7 +450,7 @@ async fn test_bernoulli_nested_include_parent_assembles_correctly() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_plain_fields_in_nested_include_content() {
+async fn test_plain_fields_in_list_link_content() {
     let out = run("tests/fixtures/execute/link_content_plain").await;
 
     let rows = jsonl_rows(&out, "records");
@@ -510,7 +510,7 @@ async fn test_count_normal_produces_variable_length_lists() {
         let samples = row["samples"].as_array().expect("samples should be an array");
         assert!(
             !samples.is_empty(),
-            "_pool_idx sampling should produce at least one item per outer row"
+            "_linked_idx sampling should produce at least one item per outer row"
         );
         for s in samples {
             let val = s["val"].as_f64().expect("val should be a number");
@@ -527,7 +527,7 @@ async fn test_count_normal_produces_variable_length_lists() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_nested_include_refs() {
+async fn test_list_link_refs() {
     let out = run("tests/fixtures/execute/link_content").await;
     let event_rows = jsonl_rows(&out, "events");
 
@@ -576,7 +576,7 @@ async fn test_variant_output_rows_and_values() {
 }
 
 #[tokio::test]
-async fn test_variant_sibling_total_rows() {
+async fn test_variant_lower_cover_total_rows() {
     // source: 100 rows split 70/30 across variants.
     // subset: Bernoulli sibling at dist 0.4 → ~40 rows across both variant groups.
     // source output: 100 rows combined; subset output: ~40 rows combined.
@@ -680,11 +680,11 @@ async fn test_mult1_grandchild_sees_full_batch() {
 }
 
 // ---------------------------------------------------------------------------
-// _slot_idx and _pool_idx sentinel tests
+// _slot_idx and _linked_idx sentinel tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_inner_flat_slot_idx() {
+async fn test_witness_slot_idx() {
     // link_content: events (5 rows) has an attendees list (1–4 items per row).
     // Items are assembled from inner flat batches keyed by _slot_idx.
     // The outer-scoped ref event_title must match the enclosing row's title,
@@ -714,14 +714,14 @@ async fn test_inner_flat_slot_idx() {
 // MULT-2 Stage 5 — Nested-include collect-to-pool (Case 2)
 //
 // wards_doctors: 3 wards, 5 doctors.
-// Each ward has an `on_call_doctors` list (cardinality 2) drawn from doctors via _pool_idx.
-// CollectToPool accumulates doctor_name into doctors.on_call_wards.
+// Each ward has an `on_call_doctors` list (cardinality 2) drawn from doctors via _linked_idx.
+// AccumulateToLinked accumulates doctor_name into doctors.on_call_wards.
 // The total count of ward references across all doctors equals the total atom count
 // (3 wards × 2 atoms each = 6 atoms total).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_nested_include_collect_to_pool() {
+async fn test_list_link_collect_to_linked() {
     let out = run("tests/fixtures/execute/wards_doctors").await;
 
     let doctors = jsonl_rows(&out, "doctors");
@@ -762,7 +762,7 @@ async fn test_nested_include_collect_to_pool() {
     // Sentinels must not appear in output.
     for ward in &wards {
         assert!(ward.get("_slot_idx").is_none(), "_slot_idx must not appear in wards output");
-        assert!(ward.get("_pool_idx").is_none(), "_pool_idx must not appear in wards output");
+        assert!(ward.get("_linked_idx").is_none(), "_linked_idx must not appear in wards output");
     }
 }
 
@@ -858,8 +858,8 @@ async fn test_reinforcement_zero_no_duplicate_pool_rows() {
 // MULT-2 Stage 4 — Junction link collect-to-pool
 //
 // directorships: 5 individuals, 5 organisations, 5 directorships.
-// Each directorship is assigned to one organisation (_pool_idx).
-// CollectToPool accumulates director_name into organisations.directors.
+// Each directorship is assigned to one organisation (_linked_idx).
+// AccumulateToLinked accumulates director_name into organisations.directors.
 // Organisations with zero directorships get default: [] (empty list).
 // ---------------------------------------------------------------------------
 
@@ -892,9 +892,9 @@ async fn test_junction_collect_to_pool() {
     let directorships = jsonl_rows(&out, "directorships");
     assert_eq!(directorships.len(), 5, "directorships should have 5 rows");
 
-    // _pool_idx sentinel must not leak into output.
+    // _linked_idx sentinel must not leak into output.
     for row in &directorships {
-        assert!(row.get("_pool_idx").is_none(), "_pool_idx must not appear in directorships output");
+        assert!(row.get("_linked_idx").is_none(), "_linked_idx must not appear in directorships output");
     }
 }
 

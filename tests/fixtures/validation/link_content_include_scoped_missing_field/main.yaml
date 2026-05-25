@@ -8,7 +8,7 @@ data:
   - name: items
     type: list
     content:
-      group: src
+      from: src
       fields:
         - name: missing
           ref: src.nonexistent    # error: nonexistent does not exist in source

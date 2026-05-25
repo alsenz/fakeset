@@ -9,7 +9,7 @@ data:
     type: list
     count: 3    # error: count cannot be set on a nested-include list field
     content:
-      group: src
+      from: src
       fields:
         - name: label
           ref: src.label

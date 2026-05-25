@@ -19,7 +19,7 @@ data:
   - name: attendees
     type: list
     content:
-      group: person
+      from: person
       fields:
         - name: name
           ref: person.full_name
