@@ -149,7 +149,6 @@ Full design specs and implementation plans live in `specs/`:
 | `specs/done/MULT-2.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-3.md` | **Complete** — implemented and merged |
 | `specs/REFRAME-1.md` | In-progress lattice reframing spec |
-| `specs/JOINT-REFRAME-1.md` | Forward-looking lattice-framing inspiration spec |
 
 ## Planned next steps
 
