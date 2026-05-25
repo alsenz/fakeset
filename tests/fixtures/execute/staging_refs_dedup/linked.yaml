@@ -1,0 +1,13 @@
+name: linked
+format: jsonl
+output_file: linked
+rows: 1
+data:
+  - name: item_name
+    type: string
+    generator: word
+  - name: drawn_by
+    type: list
+    content:
+      type: string
+    default: []

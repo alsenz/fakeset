@@ -9,7 +9,7 @@ A declarative, DAG-structured synthetic dataset generator. Users write YAML sche
 ```bash
 cargo build                  # debug
 cargo build --release        # release binary → target/release/fakeset
-cargo test                   # all unit + integration tests (~173 tests)
+cargo test                   # all unit + integration tests (~174 tests)
 cargo check                  # fast type-check without linking
 ```
 

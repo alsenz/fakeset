@@ -1,0 +1,23 @@
+name: source
+format: jsonl
+output_file: source
+rows: 3
+links:
+  - file: linked.yaml
+    ref: linked_item
+    cardinality: 1
+    reinforcement: 0
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: items
+    type: list
+    content:
+      from: linked_item
+      fields:
+        - name: name
+          refs:
+            - linked_item.item_name
+            - bind: linked_item.drawn_by
+              reducer: collect

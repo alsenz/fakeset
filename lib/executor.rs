@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use arrow::array::{ArrayRef, Float64Array, ListArray, StringArray, StructArray, UInt32Array, new_empty_array};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow::compute::{concat, concat_batches, take};
+use arrow::compute::{concat, concat_batches, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use serde_yaml::Value as YamlValue;
@@ -15,7 +15,7 @@ use datafusion::functions_aggregate::expr_fn::{
 use datafusion::prelude::{col, SessionContext};
 use fake::Fake;
 use parquet::arrow::ArrowWriter;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -471,15 +471,12 @@ fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<Reco
 
 /// Generate the witness batch for one list-link field.
 ///
-/// Each row is one **atom**: a (staging-slot, linked-slot) pair. Column sources:
-///   - linked-scoped refs: the pushed-down linked-slot solution for that atom's `_linked_idx`
-///   - outer-scoped refs: the staging row value for that atom's `_slot_idx`
-///   - plain fields: generated fresh per atom
-///
-/// All atoms sharing the same `_linked_idx` carry identical linked-scoped field values because
-/// they draw from the same pre-solved linked-slot row. This is the push-down mechanism:
-/// the linked node's field schema is resolved once per slot, then referenced by every atom
-/// assigned to that slot.
+/// One witness row per **unique** linked-row draw. Column sources:
+///   - `_linked_idx` (hidden scalar): which linked-batch row this witness row represents
+///   - `_staging_refs` (hidden list): all staging slot indices that drew this linked row
+///   - linked-scoped refs: value taken from the linked batch (same for every draw)
+///   - plain fields: generated once per unique linked row
+///   - outer-scoped refs: **not stored**; resolved from the staging batch at assembly time
 fn execute_witness(
     witness_key: &PathBuf,
     staging_path: &PathBuf,
@@ -493,13 +490,11 @@ fn execute_witness(
     let staging_batch = computed.get(staging_path).ok_or_else(|| {
         anyhow!("witness '{list_field_name}': staging batch not yet computed")
     })?.clone();
-    // linked_batch: one pre-solved row per linked slot. Linked-scoped refs in atom rows
-    // are resolved by indexing into this batch at the atom's assigned _linked_idx.
     let linked_batch = computed.get(linked_path).ok_or_else(|| {
         anyhow!("witness '{list_field_name}': linked-slot batch not yet computed")
     })?.clone();
 
-    // --- Phase 1: assign each atom to a staging slot and a linked slot ---
+    // --- Phase 1: assign each draw to a staging slot and a linked slot ---
     let n_eligible_slots = match include.ratio {
         Some(r) => ((r * linked_batch.num_rows() as f64).round() as usize)
             .min(linked_batch.num_rows()).max(1),
@@ -513,39 +508,61 @@ fn execute_witness(
     let staging_idxs: Vec<u32> = counts.iter().enumerate()
         .flat_map(|(i, &c)| std::iter::repeat(i as u32).take(c))
         .collect();
-    let slot_idx_arr: ArrayRef = Arc::new(UInt32Array::from(staging_idxs.clone()));
-    // slot_assignments: which linked slot each atom row is assigned to (_linked_idx values).
-    // The sampling mode is controlled by include.reinforcement:
-    //   None / 1.0 → uniform with-replacement (existing behaviour)
+    // slot_assignments[k]: which linked row staging slot staging_idxs[k] drew.
+    // Sampling mode controlled by include.reinforcement:
+    //   None / 1.0 → uniform with-replacement
     //   0.0        → Fisher-Yates without-replacement per staging row
     //   r > 1.0    → Polya-urn weighted re-selection per staging row
     let slot_assignments: UInt32Array = {
         let r = include.reinforcement;
         if r == Some(0.0) {
-            // Without-replacement: draw M_n unique linked slots per staging row.
             counts.iter().flat_map(|&m_n| {
                 sample_pool_without_replacement(n_eligible_slots, m_n)
             }).collect::<Vec<u32>>().into()
         } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
-            // Polya-urn: weighted re-selection per staging row.
             counts.iter().flat_map(|&m_n| {
                 sample_pool_weighted(n_eligible_slots, m_n, reinf)
             }).collect::<Vec<u32>>().into()
         } else {
-            // Uniform with-replacement (None or 1.0).
             (0..total)
                 .map(|_| (0u64..n_eligible_slots as u64).fake::<u64>() as u32)
                 .collect::<Vec<u32>>()
                 .into()
         }
     };
-    let linked_idx_arr: ArrayRef = Arc::new(slot_assignments.clone());
-    let rep_indices: UInt32Array = staging_idxs.into();
 
-    // --- Phase 2: build atom columns ---
-    // Linked-scoped refs: apply the pre-solved linked-slot value for the assigned slot.
-    // Outer-scoped refs: replicate the staging-row value for the slot index.
-    // Plain fields: generate fresh per atom.
+    // --- Phase 2: deduplicate draws by linked row ---
+    // Build linked_idx → Vec<staging_slot> using BTreeMap for deterministic order.
+    let mut draw_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for k in 0..total {
+        draw_map
+            .entry(slot_assignments.value(k))
+            .or_default()
+            .push(staging_idxs[k]);
+    }
+    let unique_linked_idxs: Vec<u32> = draw_map.keys().copied().collect();
+    let n_witness = unique_linked_idxs.len();
+
+    // Build _staging_refs ListArray: one list entry per unique linked row.
+    let mut refs_offsets: Vec<i32> = vec![0];
+    let mut refs_values: Vec<u32> = Vec::new();
+    for &linked_idx in &unique_linked_idxs {
+        let slots = &draw_map[&linked_idx];
+        refs_values.extend_from_slice(slots);
+        refs_offsets.push(refs_values.len() as i32);
+    }
+    let staging_refs_array = ListArray::new(
+        Arc::new(ArrowField::new("item", DataType::UInt32, false)),
+        OffsetBuffer::new(ScalarBuffer::from(refs_offsets)),
+        Arc::new(UInt32Array::from(refs_values)),
+        None,
+    );
+    let unique_linked_arr = UInt32Array::from(unique_linked_idxs.clone());
+
+    // --- Phase 3: build witness columns (one value per unique linked row) ---
+    // linked-scoped refs: take from linked batch by unique linked index.
+    // outer-scoped refs: skip — resolved from staging at assembly time.
+    // plain fields: generate once per unique linked row.
     let mut arrow_fields: Vec<ArrowField> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
 
@@ -558,24 +575,80 @@ fn execute_witness(
                 let (_, target_col) = split_ref(ref_str).unwrap();
                 let idx = linked_batch.schema().index_of(target_col)
                     .map_err(|_| anyhow!("column '{target_col}' not found in linked-slot batch"))?;
-                take(linked_batch.column(idx).as_ref(), &slot_assignments, None)?
+                take(linked_batch.column(idx).as_ref(), &unique_linked_arr, None)?
             } else {
-                let idx = staging_batch.schema().index_of(ref_str)
-                    .map_err(|_| anyhow!("outer-scoped column '{ref_str}' not found in staging batch"))?;
-                take(staging_batch.column(idx).as_ref(), &rep_indices, None)?
+                // Outer-scoped: not stored in witness; skip.
+                continue;
             }
         } else {
-            generate_column(field, total, &[])?
+            generate_column(field, n_witness, &[])?
         };
         arrow_fields.push(field_to_arrow(field));
         columns.push(col);
     }
 
+    // --- Phase 4: assemble witness batch ---
     let data_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(arrow_fields)), columns)?;
-    let with_linked = prepend_column(&data_batch, "_linked_idx", linked_idx_arr)?;
-    let witness_batch = prepend_column(&with_linked, "_slot_idx", slot_idx_arr)?;
+    let with_refs = prepend_column(&data_batch, "_staging_refs",
+        Arc::new(staging_refs_array) as ArrayRef)?;
+    let witness_batch = prepend_column(&with_refs, "_linked_idx",
+        Arc::new(UInt32Array::from(unique_linked_idxs)) as ArrayRef)?;
     computed.insert(witness_key.clone(), witness_batch);
     Ok(())
+}
+
+/// Unnest the `_staging_refs` ListArray in a witness batch to produce a flat junction table:
+/// one row per (staging-slot, linked-row) pair. Rows are sorted by `_slot_idx` — required for
+/// the offset-based list-fold in `execute_assemble_from_witness`.
+///
+/// Returns `(junction, slot_idx_arr, witness_row_arr)` where:
+///   - `junction`: `_slot_idx` + replicated content columns (no sentinels)
+///   - `slot_idx_arr`: sorted staging slot indices (one per junction row)
+///   - `witness_row_arr`: witness row index for each junction row (for outer-scoped lookup)
+fn unnest_staging_refs(
+    witness: &RecordBatch,
+) -> Result<(RecordBatch, UInt32Array, UInt32Array)> {
+    let refs_col_idx = witness.schema().index_of("_staging_refs")
+        .map_err(|_| anyhow!("unnest_staging_refs: '_staging_refs' not found in witness"))?;
+    let staging_refs = witness.column(refs_col_idx)
+        .as_any().downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("_staging_refs is not a ListArray"))?;
+
+    let total: usize = (0..witness.num_rows())
+        .map(|r| staging_refs.value(r).len())
+        .sum();
+
+    let mut slot_idxs: Vec<u32> = Vec::with_capacity(total);
+    let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
+    for wr in 0..witness.num_rows() {
+        let refs_slice = staging_refs.value(wr);
+        let refs_arr = refs_slice.as_any().downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow!("_staging_refs list element is not UInt32"))?;
+        for &slot in refs_arr.values() {
+            slot_idxs.push(slot);
+            witness_row_idxs.push(wr as u32);
+        }
+    }
+    let slot_arr = UInt32Array::from(slot_idxs);
+    let witness_row_arr = UInt32Array::from(witness_row_idxs);
+
+    // Sort by slot_idx: required for the offset-based list-fold.
+    let sort_order = sort_to_indices(&slot_arr, None, None)?;
+    let slot_arr_sorted: UInt32Array = take(&slot_arr, &sort_order, None)?
+        .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+    let witness_row_arr_sorted: UInt32Array = take(&witness_row_arr, &sort_order, None)?
+        .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+
+    // Strip sentinels; replicate remaining witness columns per slot.
+    let stripped = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
+    let mut fields = vec![ArrowField::new("_slot_idx", DataType::UInt32, false)];
+    let mut cols: Vec<ArrayRef> = vec![Arc::new(slot_arr_sorted.clone())];
+    for col_idx in 0..stripped.num_columns() {
+        fields.push(stripped.schema().field(col_idx).as_ref().clone());
+        cols.push(take(stripped.column(col_idx).as_ref(), &witness_row_arr_sorted, None)?);
+    }
+    let junction = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?;
+    Ok((junction, slot_arr_sorted, witness_row_arr_sorted))
 }
 
 /// Fold the witness batches produced by `execute_witness` back into the
@@ -592,35 +665,63 @@ async fn execute_assemble_from_witness(
     })?.clone();
 
     for (field_name, witness_key, project_col) in witness_specs {
-        let inner = computed.get(witness_key).ok_or_else(|| {
+        let witness = computed.get(witness_key).ok_or_else(|| {
             anyhow!("assemble from witness '{}': witness for '{field_name}' not yet computed", dataset.name)
         })?.clone();
 
         let staging_n = batch.num_rows();
-        let slot_idx_col = inner.schema().index_of("_slot_idx")
-            .map_err(|_| anyhow!("witness batch missing '_slot_idx' column"))?;
-        let slot_idx_arr = inner.column(slot_idx_col)
+
+        // Unnest _staging_refs to reconstruct the anonymous junction table.
+        let (mut junction, slot_arr_sorted, _witness_row_arr_sorted) =
+            unnest_staging_refs(&witness)?;
+
+        // Identify outer-scoped fields: defined in the content schema but absent from the
+        // witness (because execute_witness skips them). Look them up from the staging batch.
+        let content_field_defs = dataset.data.iter()
+            .find(|f| &f.name == field_name)
+            .and_then(|f| f.content.as_deref())
+            .map(|c| c.item.fields.as_slice())
+            .unwrap_or(&[]);
+        let stripped_witness_cols: HashSet<String> = {
+            let s = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
+            s.schema().fields().iter().map(|f| f.name().clone()).collect()
+        };
+        let staging = batch.clone();
+        for cf in content_field_defs {
+            if stripped_witness_cols.contains(&cf.name) { continue; }
+            if let Some(ref_str) = cf.simple_ref() {
+                // Bare ref (no qualifier) or qualified ref: resolve the column name in staging.
+                let col_name = split_ref(ref_str).map(|(_, c)| c).unwrap_or(ref_str);
+                let stg_idx = staging.schema().index_of(col_name)
+                    .map_err(|_| anyhow!("outer-scoped column '{col_name}' not found in staging batch"))?;
+                let col = take(staging.column(stg_idx).as_ref(), &slot_arr_sorted, None)?;
+                let arrow_field = ArrowField::new(cf.name.as_str(), col.data_type().clone(), true);
+                junction = add_column(junction, arrow_field, col)?;
+            }
+        }
+
+        // Slot-grouped list fold: count rows per slot, build offsets, fold into ListArray.
+        let slot_idx_arr = junction.column(junction.schema().index_of("_slot_idx")
+            .map_err(|_| anyhow!("junction missing '_slot_idx'"))?)
             .as_any().downcast_ref::<UInt32Array>()
-            .ok_or_else(|| anyhow!("_slot_idx is not UInt32"))?;
+            .ok_or_else(|| anyhow!("_slot_idx is not UInt32"))?
+            .clone();
 
         let mut counts = vec![0usize; staging_n];
         for &idx in slot_idx_arr.values() {
             counts[idx as usize] += 1;
         }
 
-        // Strip both sentinels: _slot_idx (slot grouping) and _linked_idx (linked sampling).
-        let inner = strip_linked_idx(strip_slot_idx(inner));
+        let inner = strip_sentinel(junction, "_slot_idx");
         let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
 
         let list_col: ArrayRef = if let Some(col_name) = project_col {
-            // Project: extract a single column and produce a scalar ListArray.
             let col_idx = inner.schema().index_of(col_name.as_str())
                 .map_err(|_| anyhow!("project: column '{col_name}' not found in witness for '{field_name}'"))?;
             let col = inner.column(col_idx).clone();
             let item_field = Arc::new(ArrowField::new("item", col.data_type().clone(), true));
             Arc::new(ListArray::new(item_field, offsets, col, None))
         } else {
-            // Normal: wrap all remaining columns in a StructArray, skipping hidden item fields.
             let hidden_item_cols: HashSet<&str> = dataset.data.iter()
                 .find(|f| &f.name == field_name)
                 .and_then(|f| f.content.as_deref())
@@ -702,9 +803,41 @@ async fn execute_accumulate_to_linked(
     default_val: &YamlValue,
     computed: &mut HashMap<PathBuf, RecordBatch>,
 ) -> Result<()> {
-    let source_batch = computed.get(source_path).ok_or_else(|| {
+    let raw_source = computed.get(source_path).ok_or_else(|| {
         anyhow!("AccumulateToLinked: source batch '{}' not computed", source_path.display())
     })?.clone();
+
+    // If the source is a Stage-4 witness batch (has `_staging_refs`), expand it to a flat
+    // junction table: one row per (staging-slot, linked-row) draw. This restores the K entries
+    // per linked row that the aggregation needs, since the witness carries only 1 row per unique
+    // linked-row draw with `_staging_refs` encoding the back-references.
+    let source_batch = if raw_source.schema().index_of("_staging_refs").is_ok() {
+        let refs_col_idx = raw_source.schema().index_of("_staging_refs")?;
+        let staging_refs = raw_source.column(refs_col_idx)
+            .as_any().downcast_ref::<ListArray>()
+            .ok_or_else(|| anyhow!("AccumulateToLinked: _staging_refs is not a ListArray"))?;
+        let total: usize = (0..raw_source.num_rows())
+            .map(|r| staging_refs.value(r).len())
+            .sum();
+        let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
+        for wr in 0..raw_source.num_rows() {
+            let n = staging_refs.value(wr).len();
+            for _ in 0..n { witness_row_idxs.push(wr as u32); }
+        }
+        let witness_row_arr = UInt32Array::from(witness_row_idxs);
+        // Strip _staging_refs; keep _linked_idx and content columns (replicated per draw).
+        let stripped = strip_sentinel(raw_source, "_staging_refs");
+        let fields: Vec<ArrowField> = stripped.schema().fields().iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let cols: Vec<ArrayRef> = stripped.columns().iter()
+            .map(|c| take(c.as_ref(), &witness_row_arr, None))
+            .collect::<Result<_, _>>()?;
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?
+    } else {
+        raw_source
+    };
+
     let linked_batch = computed.get(linked_path).ok_or_else(|| {
         anyhow!("AccumulateToLinked: linked batch '{}' not computed", linked_path.display())
     })?.clone();

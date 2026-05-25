@@ -1244,41 +1244,436 @@ staging nodes and staging lower cover groups. `skip_emit` / `skip_parent_emit` f
 
 ---
 
-### Stage 4 — `_staging_refs` witness schema
+### Stage 4 — `_staging_refs` witness schema ✓ Complete
 
-The core structural change. Currently the witness batch (inner flat) is a junction table:
-one row per (source-slot, linked-row) pair, carrying `_slot_idx` + `_linked_idx` + linked
-fields. After this stage the witness has the linked dataset's schema plus a hidden
-`_staging_refs: List<UInt32>` column — one witness row per unique linked-row draw.
+The core structural change. The witness batch is now one row per **unique** linked-row draw,
+with `_staging_refs: List<UInt32>` recording all source-slot indices that drew that linked row.
+The old junction-table model (one row per (source-slot, linked-row) pair with `_slot_idx +
+_linked_idx + inner content fields`) has been replaced.
 
-**`executor.rs` — `execute_witness`**
-- Produce one row per unique linked row drawn (not per draw)
-- Add `_staging_refs` as a `ListArray<UInt32>`: each entry lists the `_slot_idx` values
-  of every source slot that drew this linked row
-- The `_linked_idx` column is now internal to the sampling loop; it is not present in the
-  produced batch
-- Sampling loop: for each source slot, for each draw, record `(linked_row_idx, slot_idx)`;
-  after all draws, group by `linked_row_idx` and fold `slot_idx` into `_staging_refs`
+*Implemented in `lib/executor.rs`: `execute_witness`, `unnest_staging_refs`,
+`execute_assemble_from_witness`, `execute_accumulate_to_linked`. New fixture:
+`tests/fixtures/execute/staging_refs_dedup/`. New test:
+`test_staging_refs_deduplicates_linked_rows`. All 174 tests pass.*
 
-**`executor.rs` — `execute_assemble_from_witness`**
-- Read witness batch; unnest `_staging_refs` to reconstruct (source-slot, linked-row) pairs
-- The unnested table is the execution-artifact junction table (anonymous; no longer named)
-- Continue with existing list-fold and expression-evaluation logic
+---
 
-**`executor.rs` — `execute_accumulate_to_linked`**
-- Update `group_by` from `"_linked_idx"` to `_staging_refs` unnesting: aggregate `source_field`
-  values across all source slots that reference each linked row
-- The GroupBy key is now the witness row index rather than `_linked_idx`
+#### Stage 4 — Current vs target witness schema
 
-**Test fixtures**
-- `tests/fixtures/execute/rich_list/` — witness batch shape changes; update expected outputs
-- `tests/fixtures/execute/bernoulli_rich_list/` — same
-- `tests/fixtures/execute/rich_list_plain/` — same
-- `tests/fixtures/execute/hidden_collect_binding/` — `_staging_refs` grouping changes
-- New test: verify `_staging_refs` list contents for a known input
+**Current** (junction table, `total` rows = Σ cardinalities):
 
-**Deliverable**: All tests pass with updated fixtures; `_staging_refs` is the canonical
-witness-to-staging join column.
+```
+_slot_idx:  UInt32            — which staging slot made this draw
+_linked_idx: UInt32           — which linked batch row was drawn
+<content fields>              — one value per draw (linked-scoped, outer-scoped, or plain)
+```
+
+**Target** (one row per unique linked-row draw, ≤ `linked_batch.len()` rows):
+
+```
+_linked_idx: UInt32           — which linked batch row this witness row represents (hidden)
+_staging_refs: List<UInt32>   — all staging slot indices that drew this linked row (hidden)
+<linked-scoped content fields>  — value taken from linked batch (same for every draw)
+<plain content fields>          — generated once per unique linked row
+```
+
+Outer-scoped content fields (those whose `simple_ref()` resolves in the staging batch rather
+than the linked batch) are **not stored in the witness**. They are looked up from the staging
+batch at assembly time using the per-slot index recovered by unnesting `_staging_refs`.
+
+---
+
+#### Stage 4 — `lib/executor.rs` — `execute_witness`
+
+**Phase 1 — sampling** (unchanged logic, new variable names for clarity):
+
+```rust
+// All existing sampling code (n_eligible_slots, counts, slot_assignments, staging_idxs)
+// remains exactly as-is. The output is still two flat arrays:
+//   staging_idxs[k]: which staging slot made draw k  (same as before)
+//   slot_assignments[k]: which linked row was drawn   (same as before)
+let total = counts.iter().sum::<usize>();
+```
+
+**Phase 2 — deduplication: group by linked row**:
+
+```rust
+// Build linked_idx → Vec<slot_idx> using a BTreeMap so order is deterministic.
+let mut draw_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+for k in 0..total {
+    draw_map
+        .entry(slot_assignments[k])
+        .or_default()
+        .push(staging_idxs[k]);
+}
+// draw_map keys are unique linked indices (sorted); values are the staging slots that drew each.
+let unique_linked_idxs: Vec<u32> = draw_map.keys().copied().collect();
+let n_witness = unique_linked_idxs.len();
+
+// Build _staging_refs ListArray.
+let mut refs_offsets: Vec<i32> = vec![0];
+let mut refs_values: Vec<u32> = Vec::new();
+for &linked_idx in &unique_linked_idxs {
+    let slots = &draw_map[&linked_idx];
+    refs_values.extend_from_slice(slots);
+    refs_offsets.push(refs_values.len() as i32);
+}
+let staging_refs_array = ListArray::new(
+    Arc::new(ArrowField::new("item", DataType::UInt32, false)),
+    OffsetBuffer::new(ScalarBuffer::from(refs_offsets)),
+    Arc::new(UInt32Array::from(refs_values)),
+    None,
+);
+let unique_linked_arr = UInt32Array::from(unique_linked_idxs.clone());
+```
+
+**Phase 3 — build witness columns** (iterate over `unique_linked_idxs`, one value per unique linked row):
+
+For each `field` in `inner_fields`:
+
+```rust
+let col: ArrayRef = if let Some(ref_str) = field.simple_ref() {
+    let is_linked_scoped = split_ref(ref_str)
+        .map(|(rp, _)| include.reference == rp)
+        .unwrap_or(false);
+    if is_linked_scoped {
+        // Linked-scoped: take the linked batch value for each unique linked row.
+        let (_, target_col) = split_ref(ref_str).unwrap();
+        let idx = linked_batch.schema().index_of(target_col)?;
+        take(linked_batch.column(idx).as_ref(), &unique_linked_arr, None)?
+    } else {
+        // Outer-scoped: not stored in witness; skip this field.
+        continue;
+    }
+} else {
+    // Plain: generate one fresh value per unique linked row.
+    generate_column(field, n_witness, &[])?
+};
+arrow_fields.push(field_to_arrow(field));
+columns.push(col);
+```
+
+**Phase 4 — assemble witness batch**:
+
+```rust
+let data_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(arrow_fields)), columns)?;
+// Prepend _staging_refs (hidden list column), then _linked_idx (hidden scalar).
+let with_refs = prepend_column(&data_batch, "_staging_refs",
+    Arc::new(staging_refs_array) as ArrayRef)?;
+let witness_batch = prepend_column(&with_refs, "_linked_idx",
+    Arc::new(UInt32Array::from(unique_linked_idxs)) as ArrayRef)?;
+computed.insert(witness_key.clone(), witness_batch);
+```
+
+The witness batch no longer carries `_slot_idx`. The `_slot_idx` values are encoded inside
+each witness row's `_staging_refs` list.
+
+---
+
+#### Stage 4 — `lib/executor.rs` — `execute_assemble_from_witness`
+
+The assembly now **unnests `_staging_refs`** to reconstruct the anonymous junction table,
+then proceeds with the existing slot-grouped list-fold logic.
+
+**New helper — `unnest_staging_refs`**:
+
+```rust
+/// Unnest the `_staging_refs` ListArray in `witness` to produce a flat junction table:
+/// one row per (staging-slot, linked-row) pair. Returns the junction table and the
+/// `slot_idx_arr` / `witness_row_arr` index arrays used to build it.
+///
+/// Columns in the returned batch:
+///   _slot_idx: UInt32    — derived from _staging_refs entry values
+///   <inner content fields from witness, replicated per _staging_refs entry>
+///
+/// Outer-scoped fields (absent from witness) are NOT in this batch; callers supply them
+/// by looking up staging_batch[slot_idx] after receiving `slot_idx_arr`.
+fn unnest_staging_refs(
+    witness: &RecordBatch,
+) -> Result<(RecordBatch, UInt32Array, UInt32Array)>
+```
+
+Implementation of `unnest_staging_refs`:
+
+```rust
+let refs_col_idx = witness.schema().index_of("_staging_refs")?;
+let staging_refs = witness.column(refs_col_idx)
+    .as_any().downcast_ref::<ListArray>()
+    .ok_or_else(|| anyhow!("_staging_refs is not a ListArray"))?;
+
+let total: usize = (0..witness.num_rows())
+    .map(|r| staging_refs.value(r).len())
+    .sum();
+
+let mut slot_idxs: Vec<u32> = Vec::with_capacity(total);
+let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
+for wr in 0..witness.num_rows() {
+    let refs_slice = staging_refs.value(wr);
+    let refs_arr = refs_slice.as_any().downcast_ref::<UInt32Array>().unwrap();
+    for &slot in refs_arr.values() {
+        slot_idxs.push(slot);
+        witness_row_idxs.push(wr as u32);
+    }
+}
+let slot_arr = UInt32Array::from(slot_idxs);
+let witness_row_arr = UInt32Array::from(witness_row_idxs);
+
+// Sort pairs by slot_idx so rows are slot-grouped (required by offset-based fold).
+let sort_order = arrow::compute::sort_to_indices(
+    &(Arc::new(slot_arr.clone()) as ArrayRef), None, None)?;
+let slot_arr_sorted: UInt32Array = take(&slot_arr, &sort_order, None)?
+    .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+let witness_row_arr_sorted: UInt32Array = take(&witness_row_arr, &sort_order, None)?
+    .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+
+// Strip _linked_idx and _staging_refs; replicate remaining witness columns.
+let stripped = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
+let mut fields = vec![ArrowField::new("_slot_idx", DataType::UInt32, false)];
+let mut cols: Vec<ArrayRef> = vec![Arc::new(slot_arr_sorted.clone())];
+for col_idx in 0..stripped.num_columns() {
+    fields.push(stripped.schema().field(col_idx).as_ref().clone());
+    cols.push(take(stripped.column(col_idx).as_ref(), &witness_row_arr_sorted, None)?);
+}
+let junction = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?;
+Ok((junction, slot_arr_sorted, witness_row_arr_sorted))
+```
+
+**Updated body of `execute_assemble_from_witness`**:
+
+For each `(field_name, witness_key, project_col)` in `witness_specs`:
+
+```rust
+let witness = computed[witness_key].clone();
+let staging = computed[staging_path].clone();
+let staging_n = staging.num_rows();
+
+let (mut junction, slot_arr_sorted, witness_row_arr_sorted) =
+    unnest_staging_refs(&witness)?;
+
+// Identify outer-scoped fields: present in dataset's content definition but absent from
+// the witness batch (after sentinel stripping). Look them up from the staging batch.
+let content_field_defs = dataset.data.iter()
+    .find(|f| &f.name == field_name)
+    .and_then(|f| f.content.as_deref())
+    .map(|c| c.item.fields.as_slice())
+    .unwrap_or(&[]);
+let link_ref = dataset.data.iter()
+    .find(|f| &f.name == field_name)
+    .and_then(|f| f.content.as_deref()?.from.as_deref())
+    .and_then(|from_ref| dataset.links.iter().find(|l| l.reference == from_ref))
+    .map(|l| l.reference.as_str())
+    .unwrap_or("");
+
+let stripped_witness_cols: HashSet<&str> = {
+    let s = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
+    s.schema().fields().iter().map(|f| f.name().as_str()).collect()
+};
+for cf in content_field_defs {
+    if stripped_witness_cols.contains(cf.name.as_str()) { continue; }
+    // Field is outer-scoped: look up from staging batch by slot_idx.
+    if let Some(ref_str) = cf.simple_ref() {
+        let col_name = split_ref(ref_str).map(|(_, c)| c).unwrap_or(ref_str);
+        let stg_idx = staging.schema().index_of(col_name)
+            .map_err(|_| anyhow!("outer-scoped column '{col_name}' not found in staging batch"))?;
+        let col = take(staging.column(stg_idx).as_ref(), &slot_arr_sorted, None)?;
+        let arrow_field = ArrowField::new(cf.name.as_str(), col.data_type().clone(), true);
+        junction = add_column(junction, arrow_field, col)?;
+    }
+}
+
+// From here: existing slot-grouped fold logic, operating on `junction` instead of `inner`.
+// `_slot_idx` replaces the old `_slot_idx` sentinel; strip it to get pure content columns.
+let slot_idx_arr = junction.column(junction.schema().index_of("_slot_idx")?)
+    .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+
+let mut counts = vec![0usize; staging_n];
+for &idx in slot_idx_arr.values() {
+    counts[idx as usize] += 1;
+}
+
+let inner = strip_sentinel(junction, "_slot_idx");  // content columns only
+let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
+// ... existing project_col / struct-fold logic unchanged from here ...
+```
+
+The `strip_linked_idx(strip_slot_idx(...))` calls are removed; `_slot_idx` is the only
+sentinel left in `junction` (already sorted), and there is no `_linked_idx` in the
+junction table.
+
+---
+
+#### Stage 4 — `lib/executor.rs` — `execute_accumulate_to_linked`
+
+The source batch is now a witness batch (has `_staging_refs` and `_linked_idx` as scalar
+columns). It must be expanded to the junction table before aggregating, so that the
+reducer sees **one row per draw** (not one row per unique linked row).
+
+Add a pre-step at the top of the function body:
+
+```rust
+// If the source batch is a Stage-4 witness (has _staging_refs), expand it to the
+// anonymous junction table before aggregating. The junction table has one row per
+// (staging-slot, linked-row) pair, with _linked_idx replicated per draw — exactly
+// the shape the existing aggregation logic expects.
+let source_batch = if source_batch.schema().index_of("_staging_refs").is_ok() {
+    let (junction, _, witness_row_arr_sorted) = unnest_staging_refs(&source_batch)?;
+    // _linked_idx is in source_batch but not in junction; add it back (replicated).
+    let linked_idx_src_idx = source_batch.schema().index_of("_linked_idx")?;
+    let linked_idx_replicated =
+        take(source_batch.column(linked_idx_src_idx).as_ref(), &witness_row_arr_sorted, None)?;
+    add_column(junction, ArrowField::new("_linked_idx", DataType::UInt32, false),
+               linked_idx_replicated)?
+} else {
+    source_batch
+};
+// The rest of the function is unchanged: group by "_linked_idx", aggregate source_field.
+```
+
+Wait — `witness_row_arr_sorted` from `unnest_staging_refs` is sorted by `slot_idx`. For the
+`AccumulateToLinked` aggregate there is no requirement that rows be sorted (DataFusion handles
+grouping); we only need the rows expanded. Use `unnest_staging_refs` for the expansion, then
+add `_linked_idx` back via `take` with the (unsorted) `witness_row_arr`.
+
+Revised (sort-free version for `AccumulateToLinked`):
+
+```rust
+let source_batch = if source_batch.schema().index_of("_staging_refs").is_ok() {
+    // Expand witness to junction table: one row per (slot, linked-row) draw.
+    let refs_col_idx = source_batch.schema().index_of("_staging_refs")?;
+    let staging_refs = source_batch.column(refs_col_idx)
+        .as_any().downcast_ref::<ListArray>().unwrap();
+    let total: usize = (0..source_batch.num_rows())
+        .map(|r| staging_refs.value(r).len()).sum();
+    let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
+    for wr in 0..source_batch.num_rows() {
+        let refs_slice = staging_refs.value(wr);
+        let n = refs_slice.as_any().downcast_ref::<UInt32Array>().unwrap().len();
+        for _ in 0..n { witness_row_idxs.push(wr as u32); }
+    }
+    let witness_row_arr = UInt32Array::from(witness_row_idxs);
+    // Build junction by replicating each witness row per its _staging_refs count.
+    // Include _linked_idx (scalar in witness → replicated in junction).
+    let stripped = strip_sentinel(source_batch.clone(), "_staging_refs");
+    let mut fields = stripped.schema().fields().iter()
+        .map(|f| f.as_ref().clone()).collect::<Vec<_>>();
+    let mut cols = stripped.columns().iter()
+        .map(|c| take(c.as_ref(), &witness_row_arr, None))
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?
+} else {
+    source_batch
+};
+// Existing aggregation: ctx.register_batch("src", source_batch)? ...
+// group_by = "_linked_idx" — unchanged.
+```
+
+The `_staging_refs` column is stripped before replication; `_linked_idx` is kept and
+replicated (it is a scalar in the witness, one per unique linked row, so after replication
+each junction row correctly identifies its linked batch position).
+
+---
+
+#### Stage 4 — `lib/executor.rs` — helper changes
+
+**`strip_sentinel`** (new general-purpose helper, supersedes `strip_slot_idx` and
+`strip_linked_idx`):
+
+```rust
+fn strip_sentinel(batch: RecordBatch, name: &str) -> RecordBatch {
+    let Ok(idx) = batch.schema().index_of(name) else { return batch };
+    let mut fields: Vec<Arc<ArrowField>> = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    fields.remove(idx);
+    columns.remove(idx);
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+        .expect("strip_sentinel: schema/column mismatch")
+}
+```
+
+Replace the existing `strip_slot_idx` and `strip_linked_idx` functions with calls to
+`strip_sentinel`. Update all callers.
+
+---
+
+#### Stage 4 — `lib/plan.rs`
+
+No changes to `ExecutionStep` variants. The `AccumulateToLinked.group_by` field remains
+`"_linked_idx"` — the pre-expansion step in `execute_accumulate_to_linked` ensures
+`_linked_idx` is present in the expanded junction table.
+
+No changes to `GenerateWitness`. The `inner_fields` vec still carries all content field
+definitions (including outer-scoped); `execute_witness` now skips outer-scoped fields
+when building the witness batch, so the executor implicitly handles the categorisation
+without requiring a plan-level change.
+
+---
+
+#### Stage 4 — `src/main.rs`
+
+No changes needed. No new `ExecutionStep` variants.
+
+---
+
+#### Stage 4 — Tests
+
+**Tests that remain valid without changes** (behaviour preserved):
+
+| Test | Why unchanged |
+|------|---------------|
+| `test_list_link_refs` | Outer-scoped `event_title` correctly resolved per slot in assembly |
+| `test_witness_slot_idx` | Same fixture; observable output identical |
+| `test_plain_fields_in_list_link_content` | Plain fields exist in output; tests don't assert per-slot uniqueness |
+| `test_bernoulli_list_link_parent_assembles_correctly` | All-linked-scoped content; unnesting produces same junction |
+| `test_list_link_collect_to_linked` | Unnesting restores K junction rows per linked row; count preserved |
+| `test_hidden_collect_binding_excluded_but_collect_fires` | Same collect count via unnesting |
+
+**Existing test that needs comment update** (`test_witness_slot_idx`):
+The comment "assembled from inner flat batches keyed by `_slot_idx`" should become
+"assembled from witness batches via `_staging_refs` unnesting; outer-scoped refs resolved
+from staging per slot". No assertion changes.
+
+**New test — `test_staging_refs_deduplicates_linked_rows`**:
+
+Design: use a 1-row linked dataset and `reinforcement: 0` (without-replacement) with
+`cardinality: 1`. Three staging rows → each draws the only linked row → witness has exactly
+1 row with `_staging_refs = [0, 1, 2]`.
+
+Verify:
+1. Output has 3 list entries (one per staging row, each with the single linked row)
+2. The output list column exists and each entry has exactly 1 item
+3. The linked dataset's collect field (if present) has exactly 3 accumulated entries
+
+Fixture: `tests/fixtures/execute/staging_refs_dedup/` — a new fixture pair:
+- `linked.yaml`: 1 row, collect-target field
+- `source.yaml`: 3 rows, `links: [{file: linked.yaml, reinforcement: 0, cardinality: 1}]`,
+  list field `content: {from: linked}` with linked-scoped + collect binding
+
+This fixture also serves as the regression test if `_staging_refs` deduplication is ever
+broken.
+
+---
+
+#### Stage 4 — Verification
+
+```bash
+cargo test   # all existing tests pass; new test passes
+```
+
+Spot-check: run a fixture with `--print-plan`, then run with output, and verify that:
+- Witness batch row count ≤ linked batch row count (deduplication happened)
+- Each output list has the correct number of items (matching cardinality × staging rows)
+- Linked-scoped content fields have the linked batch values
+- Outer-scoped fields (e.g. `event_title`) match the enclosing staging row's value
+
+**Known behavioural change**: plain (generator-based) content fields now carry one generated
+value per unique linked-row draw instead of one per draw. If two staging slots draw the same
+linked row, both their list entries share the same plain-field value for that linked row. This
+is correct under the witness-per-linked-row model and is not tested for per-slot uniqueness
+by any existing test.
+
+**Deliverable**: All tests pass; `_staging_refs` is the canonical witness-to-staging join
+column; `_linked_idx` is a scalar per witness row; outer-scoped content fields resolved at
+assembly; plain fields deduplicated by linked row.
 
 ---
 

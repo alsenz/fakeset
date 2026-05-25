@@ -686,9 +686,9 @@ async fn test_mult1_grandchild_sees_full_batch() {
 #[tokio::test]
 async fn test_witness_slot_idx() {
     // link_content: events (5 rows) has an attendees list (1–4 items per row).
-    // Items are assembled from inner flat batches keyed by _slot_idx.
-    // The outer-scoped ref event_title must match the enclosing row's title,
-    // proving _slot_idx correctly assigns each item to its outer row.
+    // Items are assembled from witness batches via _staging_refs unnesting; outer-scoped
+    // refs are resolved from the staging batch per slot. The outer-scoped ref event_title
+    // must match the enclosing row's title, proving slot assignment is correct.
     let out = run("tests/fixtures/execute/link_content").await;
     let rows = jsonl_rows(&out, "events");
     assert_eq!(rows.len(), 5, "events should have 5 rows");
@@ -1065,4 +1065,48 @@ async fn test_hidden_collect_binding_excluded_but_collect_fires() {
         "collect binding should have fired; pool.seen_in should be non-empty across rows");
     assert_eq!(total_seen, 6,
         "3 outer rows × 2 atoms = 6 total collected entries; got {total_seen}");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 — _staging_refs witness deduplication
+//
+// staging_refs_dedup: source (3 rows) links to linked (1 row) with
+// reinforcement: 0 (without-replacement) and cardinality: 1.
+// All 3 source rows draw the same single linked row → witness has exactly 1 row
+// with _staging_refs = [0, 1, 2].
+//
+// Verifies:
+//   1. source output has 3 rows, each with a 1-item `items` list
+//   2. all items' `name` equals the single linked row's `item_name`
+//   3. linked.drawn_by has exactly 3 entries (one per source row that drew it)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_staging_refs_deduplicates_linked_rows() {
+    let out = run("tests/fixtures/execute/staging_refs_dedup").await;
+
+    let source_rows = jsonl_rows(&out, "source");
+    assert_eq!(source_rows.len(), 3, "source should have 3 rows");
+
+    let linked_rows = jsonl_rows(&out, "linked");
+    assert_eq!(linked_rows.len(), 1, "linked should have 1 row");
+    let linked_item_name = linked_rows[0]["item_name"].as_str()
+        .expect("linked.item_name should be a string");
+
+    // Each source row has exactly 1 item, and its name matches the single linked row.
+    for row in &source_rows {
+        let items = row["items"].as_array().expect("items should be a list");
+        assert_eq!(items.len(), 1,
+            "cardinality: 1 with 1 linked row → 1 item per source row; got {}", items.len());
+        let name = items[0]["name"].as_str().expect("item.name should be a string");
+        assert_eq!(name, linked_item_name,
+            "item.name must equal the single linked row's item_name (linked-scoped ref)");
+    }
+
+    // The collect binding accumulates 3 source-row references into linked.drawn_by.
+    let drawn_by = linked_rows[0]["drawn_by"].as_array()
+        .expect("linked.drawn_by should be a list");
+    assert_eq!(drawn_by.len(), 3,
+        "all 3 source rows drew the single linked row → drawn_by must have 3 entries; got {}",
+        drawn_by.len());
 }
