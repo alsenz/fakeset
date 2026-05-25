@@ -179,25 +179,24 @@ fn list_link_dataset_decomposes_into_witness_and_assemble() {
     // events has a list-link field (attendees), people does not.
     // Because events includes people with a ratio (witness source), people gets
     // a GenerateLowerCoverGroup step (witness-source-rows-first ordering for GenerateWitness).
-    // Expected steps: GenerateLowerCoverGroup(people, skip_parent_emit=false),
-    //                 GenerateDataset(events, skip_emit=true),
+    // Expected steps: GenerateLowerCoverGroup(people) or GenerateDataset(people),
+    //                 GenerateStagingNode(events),
     //                 GenerateWitness(attendees),
     //                 AssembleFromWitness(events)
     let steps = plan_for("tests/fixtures/execute/link_content");
 
-    // people: no nested include → must not be skip-emitted (GenerateDataset or GenerateLowerCoverGroup)
-    let people_not_skipped = steps.iter().any(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, skip_emit: false, .. } => dataset.name == "people",
-        ExecutionStep::GenerateLowerCoverGroup { parent, skip_parent_emit: false, .. } => parent.name == "people",
+    // people: no list-link fields → must have a normal (non-staging) generation step
+    let people_not_staging = steps.iter().any(|s| match s {
+        ExecutionStep::GenerateDataset { dataset, .. } => dataset.name == "people",
+        ExecutionStep::GenerateLowerCoverGroup { parent, .. } => parent.name == "people",
         _ => false,
     });
-    assert!(people_not_skipped, "people has no nested include, must have a non-skipped generation step");
+    assert!(people_not_staging, "people has no list-link fields, must have a non-staging generation step");
 
-    // events: has nested include → skip_emit must be true
-    let events_step = find_step!(steps, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "events");
+    // events: has list-link field → must have a GenerateStagingNode step (not GenerateDataset)
     assert!(
-        matches!(events_step, Some(ExecutionStep::GenerateDataset { skip_emit: true, .. })),
-        "events has a nested include field, skip_emit must be true"
+        find_step!(steps, ExecutionStep::GenerateStagingNode { dataset, .. } if dataset.name == "events").is_some(),
+        "events has a list-link field, must have a GenerateStagingNode step"
     );
 
     // GenerateWitness for attendees must be present
@@ -226,20 +225,17 @@ fn list_link_dataset_decomposes_into_witness_and_assemble() {
 }
 
 #[test]
-fn bernoulli_list_link_parent_has_skip_parent_emit() {
+fn bernoulli_list_link_parent_produces_staging_lower_cover_group() {
     // events is both a Bernoulli parent (vip is its lower cover member at ratio:0.5) and has
     // a list-link field (picks). It must produce:
-    //   GenerateLowerCoverGroup(events, skip_parent_emit=true)
+    //   GenerateStagingLowerCoverGroup(events)
     //   GenerateWitness(picks)
     //   AssembleFromWitness(events)
     let steps = plan_for("tests/fixtures/execute/bernoulli_link_content");
 
-    let group_step = find_step!(
-        steps, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name == "events"
-    );
     assert!(
-        matches!(group_step, Some(ExecutionStep::GenerateLowerCoverGroup { skip_parent_emit: true, .. })),
-        "events has a nested include field, skip_parent_emit must be true"
+        find_step!(steps, ExecutionStep::GenerateStagingLowerCoverGroup { parent, .. } if parent.name == "events").is_some(),
+        "events has a list-link field and lower cover, must have a GenerateStagingLowerCoverGroup step"
     );
 
     assert!(
@@ -251,9 +247,9 @@ fn bernoulli_list_link_parent_has_skip_parent_emit() {
         "expected AssembleFromWitness for 'events'"
     );
 
-    // GenerateLowerCoverGroup must come before GenerateWitness
+    // GenerateStagingLowerCoverGroup must come before GenerateWitness
     let group_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name == "events")
+        matches!(s, ExecutionStep::GenerateStagingLowerCoverGroup { parent, .. } if parent.name == "events")
     }).unwrap();
     let flat_pos = steps.iter().position(|s| {
         matches!(s, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "picks")
@@ -375,23 +371,27 @@ fn list_link_collect_produces_correct_step_sequence() {
     // outer: nested-include dataset; content field has refs: [pool.item_name, {bind: pool.collected_labels, reducer: collect}].
     //
     // Expected step order:
-    //   GenerateDataset[pool, skip_emit=true]   ← collect target, file write deferred
-    //   GenerateDataset[outer, skip_emit=true]  ← has nested include fields
+    //   GenerateDataset[pool, defer_emit=true]  ← collect target, file write deferred
+    //   GenerateStagingNode[outer]              ← has list-link fields
     //   GenerateWitness[items]
     //   AccumulateToLinked[items.item → pool.collected_labels]
     //   EmitDataset[pool]
     //   AssembleFromWitness[outer]
     let steps = plan_for("tests/fixtures/plan/nested_collect");
 
-    // pool must be generated with skip_emit/skip_parent_emit=true (it is a collect target).
-    // It may appear as GenerateDataset or GenerateLowerCoverGroup (lower cover members are registered
-    // against it), so we accept either — the key invariant is that file write is deferred.
-    let pool_skips_emit = steps.iter().any(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, skip_emit: true, .. } => dataset.name == "pool",
-        ExecutionStep::GenerateLowerCoverGroup { parent, skip_parent_emit: true, .. } => parent.name == "pool",
+    // pool must be generated with deferred file write (it is a collect target).
+    // It may appear as GenerateDataset(defer_emit=true), GenerateStagingNode,
+    // GenerateStagingLowerCoverGroup, or GenerateLowerCoverGroup(defer_emit=true) —
+    // the key invariant is that file write is deferred to the EmitDataset step
+    // following AccumulateToLinked.
+    let pool_defers_emit = steps.iter().any(|s| match s {
+        ExecutionStep::GenerateDataset { dataset, defer_emit: true, .. } => dataset.name == "pool",
+        ExecutionStep::GenerateStagingNode { dataset, .. } => dataset.name == "pool",
+        ExecutionStep::GenerateStagingLowerCoverGroup { parent, .. } => parent.name == "pool",
+        ExecutionStep::GenerateLowerCoverGroup { parent, defer_emit: true, .. } => parent.name == "pool",
         _ => false,
     });
-    assert!(pool_skips_emit, "pool is a collect target — file write must be deferred (skip_emit/skip_parent_emit=true)");
+    assert!(pool_defers_emit, "pool is a collect target — file write must be deferred");
 
     // GenerateWitness for 'items' must be present
     assert!(

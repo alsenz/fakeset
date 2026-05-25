@@ -106,6 +106,21 @@ async fn main() -> Result<()> {
 fn print_plan(plan: &ExecutionPlan) {
     for (i, step) in plan.steps.iter().enumerate() {
         match step {
+            ExecutionStep::GenerateStagingNode { dataset, rows, prefills, .. } => {
+                println!(
+                    "[{}] staging node: {} ({} rows, {})",
+                    i + 1, dataset.name, rows, dataset.format
+                );
+                for field in &dataset.data {
+                    print_field(field, 4);
+                }
+                for p in prefills {
+                    let src = p.from_path.file_stem()
+                        .and_then(|s: &std::ffi::OsStr| s.to_str())
+                        .unwrap_or("?");
+                    println!("    inherits: {}.{} → {}", src, p.from_column, p.into_column);
+                }
+            }
             ExecutionStep::GenerateDataset { dataset, rows, prefills, .. } => {
                 println!(
                     "[{}] generate: {} ({} rows, {})",
@@ -118,7 +133,29 @@ fn print_plan(plan: &ExecutionPlan) {
                     let src = p.from_path.file_stem()
                         .and_then(|s: &std::ffi::OsStr| s.to_str())
                         .unwrap_or("?");
-                    println!("    prefill: {}.{} → {}", src, p.from_column, p.into_column);
+                    println!("    inherits: {}.{} → {}", src, p.from_column, p.into_column);
+                }
+            }
+            ExecutionStep::GenerateStagingLowerCoverGroup { parent, segments, members, .. } => {
+                let total: usize = segments.iter().map(|s| s.rows).sum();
+                println!(
+                    "[{}] staging lower cover group: {} ({} rows across {} segments, {})",
+                    i + 1, parent.name, total, segments.len(), parent.format
+                );
+                for seg in segments {
+                    let names: Vec<&str> = seg.members.iter()
+                        .filter_map(|p: &PathBuf| p.file_stem().and_then(|s: &std::ffi::OsStr| s.to_str()))
+                        .collect();
+                    let label = if names.is_empty() {
+                        "(parent-only)".to_string()
+                    } else {
+                        format!("{{{}}}", names.join(", "))
+                    };
+                    println!("    segment {} → {} rows", label, seg.rows);
+                }
+                println!("    members:");
+                for m in members {
+                    println!("      {} ({})", m.dataset.name, m.dataset.format);
                 }
             }
             ExecutionStep::GenerateLowerCoverGroup { parent, segments, members, .. } => {

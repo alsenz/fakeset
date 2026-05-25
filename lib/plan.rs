@@ -15,7 +15,7 @@ const DEFAULT_ROWS: usize = 100;
 /// Wires a pre-generated column from an already-computed batch into a field of
 /// the dataset being generated. Produced from `ref_field` strings at plan time;
 /// consumed by the executor so ref columns are never re-generated (inherited field).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InheritedField {
     /// Canonical path of the already-generated dataset.
     pub from_path: PathBuf,
@@ -29,25 +29,40 @@ pub struct InheritedField {
 #[derive(Debug)]
 pub enum ExecutionStep {
     /// Generate one dataset, optionally pre-filling ref columns from already-computed batches.
-    /// When `skip_emit` is true the dataset has list-link fields: the scalar batch is stored
-    /// in `computed` for `GenerateWitness` to read, and `AssembleFromWitness` does the emit.
+    /// Evaluates expressions and emits immediately, unless `defer_emit` is true (collect-target
+    /// deferral: expressions are evaluated but the file write is deferred to `EmitDataset`).
     GenerateDataset {
         path: PathBuf,
         dataset: Arc<SyntheticDataset>,
         rows: usize,
         prefills: Vec<InheritedField>,
-        skip_emit: bool,
+        defer_emit: bool,
+    },
+    /// Staging node: generates scalar (non-list) fields only. No expression evaluation, no emit.
+    /// `AssembleFromWitness` adds list columns, evaluates expressions, and emits.
+    GenerateStagingNode {
+        path: PathBuf,
+        dataset: Arc<SyntheticDataset>,
+        rows: usize,
+        prefills: Vec<InheritedField>,
     },
     /// Generate a segmented parent and fan row segments out to lower cover members.
-    /// When `skip_parent_emit` is true the parent has list-link fields: expressions and emit
-    /// are deferred to `AssembleFromWitness`; only the shuffled scalar batch is stored in
-    /// `computed`.
+    /// Evaluates parent expressions and emits immediately, unless `defer_emit` is true
+    /// (collect-target deferral: file write deferred to `EmitDataset`).
     GenerateLowerCoverGroup {
         parent_path: PathBuf,
         parent: Arc<SyntheticDataset>,
         segments: Vec<Segment>,
         members: Vec<LowerCoverMember>,
-        skip_parent_emit: bool,
+        defer_emit: bool,
+    },
+    /// Staging counterpart of `GenerateLowerCoverGroup`.
+    /// Parent has list-link fields; expressions and emit are deferred to `AssembleFromWitness`.
+    GenerateStagingLowerCoverGroup {
+        parent_path: PathBuf,
+        parent: Arc<SyntheticDataset>,
+        segments: Vec<Segment>,
+        members: Vec<LowerCoverMember>,
     },
     /// Generate the witness batch for one list-link field.
     ///
@@ -437,28 +452,33 @@ pub fn build_plan(
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, |rich| {
-                        ExecutionStep::GenerateLowerCoverGroup {
-                            parent_path: vpath,
-                            parent: c,
-                            segments,
-                            members: members_with_output,
-                            skip_parent_emit: rich,
-                        }
-                    });
+                    let (s_vpath, s_c) = (vpath.clone(), c.clone());
+                    let (s_segs, s_mbrs) = (segments.clone(), members_with_output.clone());
+                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets,
+                        || ExecutionStep::GenerateStagingLowerCoverGroup {
+                            parent_path: s_vpath, parent: s_c,
+                            segments: s_segs, members: s_mbrs,
+                        },
+                        |defer| ExecutionStep::GenerateLowerCoverGroup {
+                            parent_path: vpath, parent: c,
+                            segments, members: members_with_output, defer_emit: defer,
+                        },
+                    );
                 } else {
                     track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, |rich| {
-                        ExecutionStep::GenerateDataset {
-                            path: vpath,
-                            dataset: c,
-                            rows: variant_rows,
-                            prefills: vec![],
-                            skip_emit: rich,
-                        }
-                    });
+                    let (s_vpath, s_c) = (vpath.clone(), c.clone());
+                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets,
+                        || ExecutionStep::GenerateStagingNode {
+                            path: s_vpath, dataset: s_c,
+                            rows: variant_rows, prefills: vec![],
+                        },
+                        |_| ExecutionStep::GenerateDataset {
+                            path: vpath, dataset: c,
+                            rows: variant_rows, prefills: vec![], defer_emit: false,
+                        },
+                    );
                 }
             }
             continue;
@@ -474,15 +494,18 @@ pub fn build_plan(
             let d = Arc::new(dataset.clone());
             let mbrs = members.clone();
             let is_collect_target = collect_targets.contains(path);
-            push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, |rich| {
-                ExecutionStep::GenerateLowerCoverGroup {
-                    parent_path: p,
-                    parent: d,
-                    segments,
-                    members: mbrs,
-                    skip_parent_emit: rich,
-                }
-            });
+            let (s_p, s_d) = (p.clone(), d.clone());
+            let (s_segs, s_mbrs) = (segments.clone(), mbrs.clone());
+            push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets,
+                || ExecutionStep::GenerateStagingLowerCoverGroup {
+                    parent_path: s_p, parent: s_d,
+                    segments: s_segs, members: s_mbrs,
+                },
+                |defer| ExecutionStep::GenerateLowerCoverGroup {
+                    parent_path: p, parent: d,
+                    segments, members: mbrs, defer_emit: defer,
+                },
+            );
             // Junction link members: emit AccumulateToLinked + EmitDataset after the group step.
             for m in members {
                 if m.is_witness_source { continue; }
@@ -497,15 +520,16 @@ pub fn build_plan(
         let prefills = compute_prefills(path, datasets, &lower_cover_set);
         let rows = row_counts[path];
         let is_collect_target = collect_targets.contains(path);
-        push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, |rich| {
-            ExecutionStep::GenerateDataset {
-                path: p,
-                dataset: d,
-                rows,
-                prefills,
-                skip_emit: rich,
-            }
-        });
+        let (s_p, s_d) = (p.clone(), d.clone());
+        let s_prefills = prefills.clone();
+        push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets,
+            || ExecutionStep::GenerateStagingNode {
+                path: s_p, dataset: s_d, rows, prefills: s_prefills,
+            },
+            |defer| ExecutionStep::GenerateDataset {
+                path: p, dataset: d, rows, prefills, defer_emit: defer,
+            },
+        );
         emit_top_level_collect_steps(dataset, path, datasets, &mut steps);
     }
 
@@ -521,20 +545,25 @@ fn witness_key(staging_path: &Path, field_name: &str) -> PathBuf {
 }
 
 /// Push a step plus any follow-on witness steps if `dataset` has list-link fields.
-/// `skip_emit_extra` is ORed with the list-link `rich` flag — when either is true the
-/// main step's skip flag is set and expression evaluation / file emit are deferred.
+///
+/// When the dataset has list-link fields, `make_staging()` is called and the resulting
+/// staging step is pushed, followed by all witness/assemble steps. When the dataset has no
+/// list-link fields, `make_normal(defer_emit)` is called instead (for collect-target
+/// deferral, `defer_emit` is passed through; for normal datasets it is `false`).
 fn push_with_list_link_steps(
     steps: &mut Vec<ExecutionStep>,
     dataset: &SyntheticDataset,
     path: &Path,
-    skip_emit_extra: bool,
+    defer_emit: bool,
     all_datasets: &HashMap<PathBuf, SyntheticDataset>,
-    make_step: impl FnOnce(bool) -> ExecutionStep,
+    make_staging: impl FnOnce() -> ExecutionStep,
+    make_normal: impl FnOnce(bool) -> ExecutionStep,
 ) {
-    let has_list_link = dataset.data.iter().any(|f| f.is_list_link());
-    steps.push(make_step(has_list_link || skip_emit_extra));
-    if has_list_link {
+    if dataset.data.iter().any(|f| f.is_list_link()) {
+        steps.push(make_staging());
         emit_witness_steps(dataset, path, all_datasets, steps);
+    } else {
+        steps.push(make_normal(defer_emit));
     }
 }
 

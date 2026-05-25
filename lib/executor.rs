@@ -44,38 +44,27 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
 
     for step in &plan.steps {
         match step {
-            ExecutionStep::GenerateDataset { path, dataset, rows, prefills, skip_emit } => {
-                let prefill_map = resolve_prefills(prefills, &computed);
-                let batch = generate_prefilled_batch(&dataset.data, *rows, &prefill_map)?;
-                let has_list_link = dataset.data.iter().any(|f| f.is_list_link());
-                if *skip_emit && has_list_link {
-                    // Scalar-only intermediate; AssembleFromWitness adds list columns and emits.
-                    computed.insert(path.clone(), batch);
-                } else {
-                    // Evaluate expressions for both normal emit and collect-target deferral
-                    // (collect targets have skip_emit=true but no list-link fields).
-                    let batch = evaluate_expressions(batch, dataset.as_ref()).await?;
-                    // Inject _linked_idx for junction datasets (link without include).
-                    // The full batch (with _linked_idx) is kept in `computed` for AccumulateToLinked;
-                    // _linked_idx is stripped before emitting.
-                    let batch = inject_linked_idx(&batch, path, dataset.as_ref(), &computed)?;
-                    let output = filter_hidden_columns(
-                        strip_linked_idx(batch.clone()),
-                        &dataset.data,
-                    ).await?;
-                    computed.insert(path.clone(), batch);
-                    if !*skip_emit {
-                        emit_batch(output, &dataset.format, &dataset.output_file, &mut shared)?;
-                    }
-                    // When skip_emit is true (collect target): batch stored, file write deferred
-                    // to the EmitDataset step that follows AccumulateToLinked.
-                }
+            ExecutionStep::GenerateStagingNode { path, dataset, rows, prefills } => {
+                execute_dataset_core(
+                    true, false, path, dataset.as_ref(), *rows, prefills,
+                    &mut computed, &mut shared,
+                ).await?;
             }
-            ExecutionStep::GenerateLowerCoverGroup {
-                parent_path, parent, segments, members, skip_parent_emit,
-            } => {
-                execute_lower_cover_group(
-                    parent_path, parent.as_ref(), segments, members, *skip_parent_emit,
+            ExecutionStep::GenerateDataset { path, dataset, rows, prefills, defer_emit } => {
+                execute_dataset_core(
+                    false, *defer_emit, path, dataset.as_ref(), *rows, prefills,
+                    &mut computed, &mut shared,
+                ).await?;
+            }
+            ExecutionStep::GenerateStagingLowerCoverGroup { parent_path, parent, segments, members } => {
+                execute_lower_cover_group_core(
+                    true, false, parent_path, parent.as_ref(), segments, members,
+                    &mut computed, &mut parent_computed, &mut shared,
+                ).await?;
+            }
+            ExecutionStep::GenerateLowerCoverGroup { parent_path, parent, segments, members, defer_emit } => {
+                execute_lower_cover_group_core(
+                    false, *defer_emit, parent_path, parent.as_ref(), segments, members,
                     &mut computed, &mut parent_computed, &mut shared,
                 ).await?;
             }
@@ -145,12 +134,57 @@ fn resolve_prefills(
 // Lower cover group execution
 // ---------------------------------------------------------------------------
 
-async fn execute_lower_cover_group(
+/// Shared core for `GenerateStagingNode` (`is_staging=true`) and `GenerateDataset`
+/// (`is_staging=false`). When staging, stores the scalar batch in `computed` with no
+/// expression evaluation or emit. When not staging, evaluates expressions, handles
+/// `_linked_idx` injection for junction links, and either emits or defers based on
+/// `defer_emit` (collect-target deferral).
+async fn execute_dataset_core(
+    is_staging: bool,
+    defer_emit: bool,
+    path: &Path,
+    dataset: &SyntheticDataset,
+    rows: usize,
+    prefills: &[InheritedField],
+    computed: &mut HashMap<PathBuf, RecordBatch>,
+    shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
+) -> Result<()> {
+    let prefill_map = resolve_prefills(prefills, computed);
+    let batch = generate_prefilled_batch(&dataset.data, rows, &prefill_map)?;
+    if is_staging {
+        // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
+        // expressions, and emits.
+        computed.insert(path.to_path_buf(), batch);
+    } else {
+        // Evaluate expressions for both normal emit and collect-target deferral.
+        let batch = evaluate_expressions(batch, dataset).await?;
+        // Inject _linked_idx for junction datasets (link without include).
+        // The full batch (with _linked_idx) is kept in `computed` for AccumulateToLinked;
+        // _linked_idx is stripped before emitting.
+        let batch = inject_linked_idx(&batch, path, dataset, computed)?;
+        let output = filter_hidden_columns(
+            strip_linked_idx(batch.clone()),
+            &dataset.data,
+        ).await?;
+        computed.insert(path.to_path_buf(), batch);
+        if !defer_emit {
+            emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
+        }
+        // When defer_emit is true (collect target): batch stored, file write deferred
+        // to the EmitDataset step that follows AccumulateToLinked.
+    }
+    Ok(())
+}
+
+/// Shared core for `GenerateStagingLowerCoverGroup` (`is_staging=true`) and
+/// `GenerateLowerCoverGroup` (`is_staging=false`).
+async fn execute_lower_cover_group_core(
+    is_staging: bool,
+    defer_emit: bool,
     path: &Path,
     dataset: &SyntheticDataset,
     segments: &[Segment],
     members: &[LowerCoverMember],
-    skip_parent_emit: bool,
     computed: &mut HashMap<PathBuf, RecordBatch>,
     parent_computed: &mut HashSet<PathBuf>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
@@ -263,21 +297,19 @@ async fn execute_lower_cover_group(
         combine_and_shuffle(all, &dataset.data, &dataset.name).await?
     };
 
-    let has_list_link = dataset.data.iter().any(|f| f.is_list_link());
-    if skip_parent_emit && has_list_link {
+    if is_staging {
         // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
         // expressions, and emits.
         computed.insert(path.to_path_buf(), parent_shuffled);
     } else {
-        // For both normal emit and collect-target deferral (skip_parent_emit=true, no list-link
-        // fields): evaluate expressions now; file write is either done immediately or deferred
-        // to the EmitDataset step that follows AccumulateToLinked.
         let parent_shuffled = evaluate_expressions(parent_shuffled, dataset).await?;
         let parent_output = filter_hidden_columns(parent_shuffled.clone(), &dataset.data).await?;
         computed.insert(path.to_path_buf(), parent_shuffled);
-        if !skip_parent_emit {
+        if !defer_emit {
             emit_batch(parent_output, &dataset.format, &dataset.output_file, shared)?;
         }
+        // When defer_emit is true (collect target): batch stored, file write deferred
+        // to the EmitDataset step that follows AccumulateToLinked.
     }
     parent_computed.insert(path.to_path_buf());
 

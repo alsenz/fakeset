@@ -1114,8 +1114,8 @@ push_with_list_link_steps(
 // Lower cover group:
 push_with_list_link_steps(
     &mut steps, dataset, path, /*defer_emit=*/false, datasets,
-    || ExecutionStep::GenerateStagingLowerCoverGroup { parent_path: p.clone(), parent: d.clone(), segments: segs.clone(), members: sibs.clone() },
-    |_| ExecutionStep::GenerateLowerCoverGroup { parent_path: p, parent: d, segments: segs, members: sibs },
+    || ExecutionStep::GenerateStagingLowerCoverGroup { parent_path: p.clone(), parent: d.clone(), segments: segs.clone(), members: members.clone() },
+    |_| ExecutionStep::GenerateLowerCoverGroup { parent_path: p, parent: d, segments: segs, members },
 );
 ```
 
@@ -1212,7 +1212,20 @@ Add `print_plan` arms for the two new variants:
 respectively, prefixed with "staging ".)
 
 Remove `skip_emit` and `skip_parent_emit` from destructuring in existing arms (fields no
-longer exist).
+longer exist). `src/main.rs` uses `..` wildcards in all match arms, so no structural change
+is needed there — only adding the two new arms.
+
+---
+
+#### Stage 3 — `tests/plan_tests.rs`
+
+Three tests pattern-match on `skip_emit` / `skip_parent_emit` and must be updated:
+
+| Test | Change needed |
+|------|---------------|
+| `list_link_dataset_decomposes_into_witness_and_assemble` | `GenerateDataset { skip_emit: false, .. }` → `GenerateDataset { .. }`; `GenerateLowerCoverGroup { skip_parent_emit: false, .. }` → `GenerateLowerCoverGroup { .. }`; `GenerateDataset { skip_emit: true, .. }` → `GenerateStagingNode { .. }` |
+| `bernoulli_list_link_parent_has_skip_parent_emit` | `GenerateLowerCoverGroup { skip_parent_emit: true, .. }` → `GenerateStagingLowerCoverGroup { .. }`; rename function to `bernoulli_list_link_parent_produces_staging_lower_cover_group` |
+| `list_link_collect_produces_correct_step_sequence` | `GenerateDataset { skip_emit: true, .. }` → `GenerateStagingNode { .. }`; `GenerateLowerCoverGroup { skip_parent_emit: true, .. }` → `GenerateStagingLowerCoverGroup { .. }`; update assertion messages accordingly |
 
 ---
 
@@ -1293,11 +1306,6 @@ is one paired witness per staging segment atom.
 - `ExecutionStep::AssembleFromWitness.witness_specs`: each entry now carries a `Vec<witness_key>`
   (one per staging segment) rather than a single key
 - Union witness batches before unnesting `_staging_refs` and assembling lists
-
-**`GenerateSiblingGroup.skip_parent_emit`** (if not already resolved in Stage 3):
-- The sibling group's parent, when it has list links, is now a staging node; the
-  `GenerateSiblingGroup` step becomes `GenerateStagingSiblingGroup` or carries
-  `role: Staging`
 
 **New fixture**: `tests/fixtures/execute/segmented_list_link/` — source dataset with two
 include-based lower cover members (triggering Bernoulli factoring) and one list-link field;
