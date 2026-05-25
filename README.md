@@ -17,11 +17,15 @@ the plan in dependency order using [Apache DataFusion](https://datafusion.apache
 |---|---|
 | **parent** (parent-by-inclusion) | A dataset that is *included by* another — the less-constrained, broader population. |
 | **child** (child-by-inclusion) | A dataset that *includes* another — the more-constrained, narrower population. |
-| **sibling** | Two datasets that share a common parent-by-inclusion. |
-| **preceding** (preceding-by-execution) | Generated first by the executor. Children are always preceding. |
-| **subsequent** (subsequent-by-execution) | Generated later by the executor. Parents are always subsequent. |
+| **lower cover** | The set of datasets that directly include a given parent. |
+| **lower cover group** | A parent together with its lower cover; planned as a unit via Bernoulli factoring. |
+| **linked dataset** | The target of a `links:` stanza — the dataset whose rows are drawn as list items. |
+| **staging node** | Internal node holding scalar non-list fields while list items are being assembled. |
+| **witness node** | Atom node carrying the linked dataset's schema; one row per unique linked-row draw. |
+| **preceding** (preceding-by-execution) | Generated first. Atoms are always preceding. |
+| **subsequent** (subsequent-by-execution) | Generated later. Parents and assembly nodes are always subsequent. |
 
-The rule is: **parents are subsequent, children are preceding.**  Siblings may execute in parallel unless another inclusion path creates a dependency between them.
+The rule is: **the most-constrained nodes (atoms) are generated first; parents and assembly nodes are assembled from them.**
 
 ### Why a topologically sorted DAG?
 
@@ -45,18 +49,19 @@ than enforced after the fact.
 When writing definition files, think of `include` as constraint specialisation:
 "I am a more constrained subset of my parent's population."
 
-### Sibling segmentation
+### Lower cover segmentation (Bernoulli factoring)
 
-When two or more datasets include the same parent they become *siblings* of
-that parent.  The executor uses **sibling segmentation** to partition the
-parent's rows: each sibling gets a segment whose size matches its declared
-marginal `ratio`.  All siblings participate — even those with `ratio: 1.0`,
-whose field constraints must enter conflict pruning jointly with their siblings'.
+When two or more datasets include the same parent they form the parent's
+**lower cover**.  fakeset uses **Bernoulli factoring** to partition the
+parent's rows: each lower cover member gets a segment whose size matches its
+declared marginal `ratio`.  All lower cover members participate — even those
+with `ratio: 1.0` — because their field constraints must enter conflict pruning
+jointly.
 
 Under the hood, `fakeset` starts from a product-independence prior (each
-sibling's membership is an independent Bernoulli trial), then applies
+member's row membership is an independent Bernoulli trial), then applies
 Iterative Proportional Fitting (IPF) to restore the declared marginals exactly.
-This makes sibling segmentation correct for both independent-overlap cases
+This makes segmentation correct for both independent-overlap cases
 (e.g. two optional flags) and mutually exclusive categorical cases (e.g.
 small/medium/large company tiers whose fractions sum to 1).
 
@@ -65,19 +70,6 @@ include:
   file: customers.yaml
   ratio: 0.05   # marginal row-membership probability (Bernoulli)
 ```
-
-```yaml
-content:
-  include:
-    file: events.yaml
-    ratio: 0.5       # fraction of the include pool eligible for sampling
-    cardinality: {min: 1, max: 4}   # items drawn per outer row
-```
-
-The distinction is in what the segment contributes: a top-level sibling writes
-its rows as a standalone output file; a `content.include` pool sibling places
-qualifying rows at the front of the parent batch for list-item sampling but
-produces no output file of its own.
 
 ## YAML schema
 
@@ -115,19 +107,20 @@ data:                    # flat list of field definitions
       name: item
       type: string
       generator: word
-  - name: events          # nested include — items are structs drawn from an included dataset
+  - name: events          # list-link field — items are structs drawn from the linked dataset
     type: list
     content:
-      include:
-        file: events.yaml
-        ref: event
-        ratio: 0.5                  # fraction of event rows eligible for sampling
-        cardinality: {min: 0, max: 3}   # items drawn per outer row
-      fields:                       # struct fields for each list item
+      from: event         # draw items from the "event" linked dataset
+      fields:             # struct fields for each list item
         - name: event_id
-          refs: event.id            # sourced from the included dataset
+          refs: event.id  # sourced from the linked dataset
         - name: label
-          type: string              # generated fresh per item
+          type: string    # generated fresh per witness row
+
+links:
+  - file: events.yaml
+    ref: event
+    cardinality: {min: 0, max: 3}   # items drawn per outer row
 ```
 
 Supported field types: `number`, `boolean`, `string`, `object`, `list`, `date`, `date_time`, `variant`.

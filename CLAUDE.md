@@ -23,50 +23,56 @@ Output goes to `./output/` (gitignored).
 ## Glossary
 
 These terms have precise meanings in this codebase — use them consistently.
+The full theoretical framing is in `specs/REFRAME-1.md`.
 
 | Term | Meaning |
 |------|---------|
+| **concept semi-lattice** | The partial order over all datasets where `A ≤ B` means "A is a more-constrained subset of B's population". Every pair of datasets with a common ancestor has a meet (greatest lower bound). |
+| **element / node** | One member of the semi-lattice. "Node" is preferred when emphasising graph structure; "element" for order-theoretic properties. |
+| **⊥ (bottom)** | The empty concept — the unsatisfiable constraint set. Bernoulli segments that prune to zero rows represent ⊥ and are dropped. |
+| **atom** | An element that covers ⊥ directly — the most-constrained node in a component. Atoms are generated first. |
 | **parent** (parent-by-inclusion) | A dataset that is *included by* another — the less-constrained, broader population. |
 | **child** (child-by-inclusion) | A dataset that *includes* another — the more-constrained, narrower population. |
-| **sibling** | Two or more datasets that share a common parent-by-inclusion. |
-| **preceding** (preceding-by-execution) | Generated first. Children are always preceding. |
-| **subsequent** (subsequent-by-execution) | Generated after. Parents are always subsequent. |
-| **sibling group** | A parent together with all its siblings; planned as a unit via segmentation. |
-| **segment** | One subset of a parent's rows that belongs to a particular combination of siblings. |
-| **pool sibling** | A sibling arising from a nested-include `content: {group: <ref>}` field — contributes constraints to the parent's segments but produces no standalone output file. |
-| **nested include** | A `list` field whose items are structs drawn from an included dataset (as opposed to a simple scalar list). |
-| **inner flat** | The intermediate flat `RecordBatch` (with `_slot_idx` and `_pool_idx`) produced for one nested include field before assembly into `ListArray` columns. Each row is one **atom**. |
-| **atom** | One joint (outer-slot, pool-slot) pairing in an inner flat batch. Atoms are the most-constrained nodes in the lattice; they are fully generated before either the outer or the pool dataset is assembled. |
-| **pool slot** | One row in the pre-solved pool-slot batch (`pool_slots` in `computed`). Pool pre-generation materialises pushed-down constraint solutions — one row per eligible pool slot — so that atom generation can draw consistent pool-scoped values without regenerating them per atom. |
-| **prefill** | A column pre-populated from an already-computed child batch into the parent's batch, wiring up ref fields so they are never regenerated. |
+| **lower cover** | The set of elements that directly include a given parent element (formerly "siblings"). |
+| **lower cover group** | A parent together with its lower cover; planned as a unit via Bernoulli factoring (formerly "sibling group"). |
+| **segment** | One subset of a parent element's rows that belongs to a particular combination of lower cover members. |
+| **staging node** | A virtual node that holds the scalar non-list fields of a source dataset while its witness and assembly nodes are being built. No output file. |
+| **witness node** | An atom carrying the linked dataset's schema. One witness row per unique linked-row draw. A hidden `_staging_refs: List<UInt32>` column maps each witness row back to the staging source slots that drew it. |
+| **assembly node** | A virtual node above the staging node that folds witness rows into list columns, evaluates expressions, and emits the final output. |
+| **source slot** | One row of a staging batch, identified by `_slot_idx`. |
+| **linked dataset** | The target of a `links:` stanza (formerly "pool dataset"). |
+| **seed edge** | The execution edge from linked dataset atoms to the witness node — the draw that populates witness rows from the linked dataset. |
+| **inherited field** | A column pre-populated from an already-computed child batch into the parent's batch, wiring up ref fields so they are never regenerated (formerly "prefill"). |
+| **preceding** (preceding-by-execution) | Generated first. Atoms are always preceding. |
+| **subsequent** (subsequent-by-execution) | Generated after. Parents and assembly nodes are always subsequent. |
 
-## Core architectural tenet
+## Core architectural framing
 
-**Children by inclusion AND by linking are always executed first; parents and pool datasets are assembled from them.**
+fakeset is built around a **concept semi-lattice**: a partial order where `A ≤ B` means "dataset A is a more-constrained subset of B's population". An `include:` stanza expresses constraint specialisation — not data dependency. A child is a narrower, more-constrained cut of its parent's population. A `links:` stanza introduces a *linked dataset* — a target from which list items are drawn per outer row, governed by the witness/assembly pipeline.
 
-An `include` is a *constraint specialisation*, not a data dependency. A child is a more-constrained subset of its parent's population. A `link` introduces a pool partner — a dataset sampled per atom row — which is also more constrained than the junction or outer dataset that draws from it. In both cases the tenet holds: all child/linked datasets are fully generated before the outer or parent dataset is assembled from their rows.
+This framing is specified in full in `specs/REFRAME-1.md`. In brief: every dataset is a node in the semi-lattice; every pair of nodes with a shared ancestor has a **meet** (greatest lower bound); the most-constrained nodes — those covering ⊥ directly — are **atoms**, generated first.
 
-The datasets form a **lattice of joint atoms**. The algorithm has two symmetric phases:
+The algorithm has two symmetric phases:
 
-1. **Push down** — field definitions, type constraints, and ref bindings propagate *down* the lattice toward the most-constrained leaf nodes (atoms). Pool pre-generation materialises pushed-down pool-slot constraint solutions — one pre-solved row per eligible pool slot — so that atoms can draw consistent pool-scoped values without regenerating them per atom. This is not executing the pool dataset; it is pre-solving the constraints that atoms inherit from it.
+1. **Push down** — field definitions, type constraints, and ref bindings propagate *down* the lattice toward atoms. For linked datasets, the staging node pre-generates scalar fields before the witness (atom) is generated.
 
-2. **Accumulate up** — generated atom values propagate *up* the lattice toward parents and pool nodes. For include relationships this is `grow_parent_from_children` (DataFusion LEFT JOIN on `_row_idx`). For collect bindings (MULT-2) this is `CollectToPool` — the symmetric operation that accumulates atom-level values back into pool-node fields.
+2. **Accumulate up** — generated atom values propagate *up* the lattice toward parents and linked nodes. For include relationships this is `grow_parent_from_children` (DataFusion LEFT JOIN on `_row_idx`). For collect bindings this is `AccumulateToLinked` — the symmetric operation that accumulates atom-level values back into linked-dataset fields.
 
-The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so the deepest leaves (most constrained) are always generated before their parents. When a parent field matches a child's field (by ref-wiring or same name), the child's column is inherited directly; fields with no child source are generated fresh. This logic lives in `executor.rs::grow_parent_from_children`.
+The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so atoms are always generated before their parents. When a parent field matches a child's field (by ref-wiring or same name), the child's column is *inherited* directly; fields with no child source are generated fresh. This logic lives in `executor.rs::grow_parent_from_children`.
 
-*Theoretical note:* all generator invocations could conceptually happen in parallel — the algorithm's serialisation is purely a scheduling constraint imposed by the prefill lattice. The interesting work is resolving which pre-solved values propagate to which nodes and in what order.
+*Theoretical note:* all generator invocations could conceptually happen in parallel — the algorithm's serialisation is purely a scheduling constraint imposed by the inherited-field lattice. The interesting work is resolving which pre-solved values propagate to which nodes and in what order.
 
-## Sibling segmentation
+## Lower cover segmentation (Bernoulli factoring)
 
-When two or more datasets include the same parent they become siblings and their rows must be partitioned consistently. All siblings participate — including those with `ratio: 1.0` (every parent row) — because their field constraints must enter conflict pruning jointly. This is the exponential-explosion problem: N siblings → 2^N possible membership subsets.
+When two or more datasets include the same parent they form the parent's **lower cover** and their rows must be partitioned consistently. All lower cover members participate — including those with `ratio: 1.0` — because their field constraints must enter conflict pruning jointly. This is the exponential-explosion problem: N lower cover members → 2^N possible membership subsets.
 
 `segment.rs::plan_segments` controls the explosion with three steps:
 
 1. **Product-Bernoulli prior** — enumerate all 2^N subsets, weight each by the product of marginal (in/out) probabilities.
-2. **Conflict pruning** — zero out any subset whose field constraints are mutually contradictory (e.g. two siblings both pinning `status` to different constants). Rows from zeroed subsets are redistributed to surviving subsets.
+2. **Conflict pruning** — zero out any subset whose field constraints are mutually contradictory (e.g. two lower cover members both pinning `status` to different constants). Rows from zeroed subsets are redistributed to surviving subsets.
 3. **IPF (Iterative Proportional Fitting)** — scale the surviving weights so declared marginals are exactly restored, then apply Bernoulli rounding to integer row counts.
 
-The default cap is 16 siblings per group (65,536 subsets); override with `--max-siblings`. Raising it costs RAM quadratically.
+The default cap is 16 lower cover members per group (65,536 subsets); override with `--max-lower-cover`. Raising it costs RAM quadratically.
 
 ## Execution pipeline
 
@@ -80,16 +86,19 @@ load YAML files
   → expand_field_variants      (variant fields → concrete global variants)
   → resolve_refs       (push field types and merged constraints DOWN the lattice to child/ref targets)
   → apply_global_locales       (stamp locale onto locale-aware fields)
-  → build_plan         (resolve row counts, sibling groups, prefill wiring, collect targets → ExecutionPlan)
+  → build_plan         (resolve row counts, lower cover groups, inherited-field wiring, collect targets → ExecutionPlan)
   → execute            (generate atoms leaf-first; accumulate values UP the lattice; write output files)
 ```
 
 `build_plan` produces a flat list of `ExecutionStep` variants:
 
-- `GenerateDataset` — simple dataset, no siblings.
-- `GenerateSiblingGroup` — parent + siblings planned together via segmentation.
-- `GenerateInnerFlat` — flat intermediate for one nested include field.
-- `AssembleNestedInclude` — fold inner-flat batches into `ListArray` columns, evaluate expressions, emit.
+- `GenerateDataset` — dataset with no list links; generates, evaluates, and emits in one step.
+- `GenerateStagingNode` — dataset with list links; generates scalar batch only, stores in `computed`, no expression evaluation, no emit.
+- `GenerateLowerCoverGroup` — parent + lower cover planned together via Bernoulli factoring; parent emits directly when it has no list links.
+- `GenerateStagingLowerCoverGroup` — staging counterpart of `GenerateLowerCoverGroup`; parent has list links, so emit is deferred to `AssembleFromWitness`.
+- `GenerateWitness` — generates the witness batch (one row per source-slot × linked-row draw).
+- `AssembleFromWitness` — folds witness batches into `ListArray` columns, evaluates expressions, emits the final output.
+- `AccumulateToLinked` — accumulates atom-level values into linked-dataset fields (collect bindings); followed by `EmitDataset` for the updated linked dataset.
 - `WriteSharedOutput` — union + shuffle all accumulated batches for a shared output file, write once.
 
 ## Module map
@@ -97,18 +106,18 @@ load YAML files
 | Module | Responsibility |
 |--------|---------------|
 | `lib.rs` | Public API: `load_all_datasets`, YAML discovery |
-| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, the nested-include visitor, and lattice-traversal helpers |
+| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, the list-link visitor, and lattice-traversal helpers |
 | `graph.rs` | `build_dag` — petgraph DAG construction and topo-sort |
 | `validate.rs` | Schema validation: structural rules, ref checks, expression ordering |
 | `expand_variants.rs` | Expand `type: variant` fields into concrete global `variants:` entries |
 | `expressions.rs` | `pull_down_expression_deps`, identifier extraction for validation |
 | `rewrite.rs` | `resolve_refs` (ref chain resolution, constraint merging), `apply_global_locales`, `apply_locale_to_schema` |
 | `constraints.rs` | `FieldConstraints`, `Satisfiable`, `Merge`, `validate_field_constraints` |
-| `segment.rs` | `plan_segments` — Bernoulli weights, conflict pruning, IPF, rounding |
-| `plan.rs` | `build_plan` — row counts, sibling groups, `ExecutionPlan` / `ExecutionStep` |
+| `segment.rs` | `plan_segments` — Bernoulli weights, conflict pruning, IPF, rounding. `LowerCoverMember` and `Segment` types. |
+| `plan.rs` | `build_plan` — row counts, lower cover groups, inherited-field wiring, collect targets → `ExecutionPlan` / `ExecutionStep` |
 | `schema.rs` | `schema_to_arrow`, `field_to_arrow`, `parquet_datatype_to_arrow` — Arrow schema conversion |
 | `generator.rs` | `generate_column`, `sample_count` — per-field fake data generation via fake-rs |
-| `executor.rs` | `execute` — interprets the plan; all DataFusion and Arrow batch operations |
+| `executor.rs` | `execute` — interprets the plan; staging node generation, witness generation, assembly, `grow_parent_from_children`, `AccumulateToLinked`. All DataFusion and Arrow batch operations. |
 
 ## DataFusion usage
 
@@ -130,9 +139,9 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 - **Doc comments welcome** — `///` comments documenting public functions, structs, and fields are encouraged. Inline comments should only explain non-obvious *why* (hidden constraints, invariants, workarounds) — not *what* the code does, which well-named identifiers already convey.
 - **No `sql_safe_name`** — DataFusion column names are double-quoted in SQL strings (`"field_name"`), so arbitrary field names are safe without sanitisation.
 - **`_row_idx` sentinel** — a `UInt32` 0..n column prepended to batches for positional JOIN keying inside `grow_parent_from_children`; stripped from all outputs.
-- **`_slot_idx` sentinel** *(MULT-1 addition; renames `_outer_idx`)* — a `UInt32` driver-parent slot index present in all child/inner-flat batches. In nested include lists: which outer row each item belongs to (used by `AssembleNestedInclude`). In top-level cardinality: which parent-row slot each multiplied child row belongs to. Both are the same concept — unified in MULT-1. Retained in `computed` for grandchild access; stripped from emitted output by `filter_hidden_columns`.
-- **`_pool_idx` sentinel** *(MULT-1 addition)* — a `UInt32` column in inner flat batches recording which pool row was sampled (index into the eligible pool slice). Persisted in MULT-1 for MULT-2's collect-to-pool mechanism.
-- **Pool rows come first** — when a parent has pool siblings, their rows occupy the leading positions in the combined batch so `GenerateInnerFlat`'s `n_eligible_slots` boundary correctly identifies eligible pool slots. This positional convention applies only to the current non-collect path; MULT-2's collect path uses an explicit pool batch parameter instead.
+- **`_slot_idx` sentinel** — a `UInt32` staging-node slot index present in all witness and child batches — which source slot each atom row belongs to. Used by `AssembleFromWitness` to fold witness rows into per-slot lists. Also used in top-level cardinality batches to record which parent-row slot each child row belongs to. Retained in `computed` for grandchild access; stripped from emitted output by `filter_hidden_columns`.
+- **`_linked_idx` sentinel** — a `UInt32` column in witness batches recording which linked-dataset row was drawn (index into the eligible linked batch). Persisted for `AccumulateToLinked` collect bindings.
+- **Linked rows preceding staging rows** — when a dataset has witness-source lower cover members, the linked-dataset rows occupy the leading positions in the combined batch so `GenerateWitness`'s `n_eligible_slots` boundary correctly identifies eligible linked-dataset slots.
 
 ## Known flaky test
 
@@ -152,10 +161,10 @@ Full design specs and implementation plans live in `specs/`:
 
 ## Planned next steps
 
-- **DF5** — make `execute_inner_flat` async; use DataFusion to shuffle and limit the pool batch before Arrow-based with-replacement sampling.
+- **DF5** — make `execute_witness` async; use DataFusion to shuffle and limit the linked batch before Arrow-based with-replacement sampling.
 - **DF4** — write output via DataFusion `DataSink`; needs care around single-file vs partitioned output.
 - **T1** — unit tests for `generate_column` per field type.
-- **branch-and-bound segment enumeration** — replace the dense 2^N weight pass in `plan_segments` with an O(K·N) lattice traversal for large sibling groups.
+- **branch-and-bound segment enumeration** — replace the dense 2^N weight pass in `plan_segments` with an O(K·N) lattice traversal for large lower cover groups.
 
 ## Future work (needs planning)
 - **REL** — model relationships induced by nested lists
