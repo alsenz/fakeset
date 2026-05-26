@@ -345,24 +345,23 @@ pub(crate) fn lower_cover_field_constraints(member: &LowerCoverMember) -> HashMa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Field, FieldType, Format, Range, RefsSpec};
+    use crate::models::{Field, FieldType, Format, RefsSpec};
     use serde_yaml::Value as YamlValue;
 
     fn make_member(path: &str, ratio: f64, ref_constraints: Vec<(&str, FieldConstraints)>) -> LowerCoverMember {
         let fields = ref_constraints
             .into_iter()
-            .map(|(fname, fc)| Field {
-                name: fname.to_string(),
-                field_type: Some(FieldType::String),
-                refs: Some(RefsSpec::Single(format!("parent_ref.{fname}"))),
-                generator: fc.generator,
-                range: if fc.min.is_some() || fc.max.is_some() {
-                    Some(Range { min: fc.min, max: fc.max })
-                } else {
-                    None
-                },
-                value: fc.value,
-                ..Default::default()
+            .map(|(fname, fc)| {
+                let range = fc.to_range();
+                Field {
+                    name: fname.to_string(),
+                    field_type: Some(FieldType::String),
+                    refs: Some(RefsSpec::Single(format!("parent_ref.{fname}"))),
+                    generator: fc.generator,
+                    range,
+                    value: fc.value,
+                    ..Default::default()
+                }
             })
             .collect();
 

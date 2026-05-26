@@ -28,7 +28,9 @@ use datafusion::functions_aggregate::expr_fn::{
     min as df_min,
     sum as df_sum,
 };
-use datafusion::prelude::{col, SessionContext};
+use datafusion::prelude::{col, Expr, SessionContext};
+use datafusion::common::Column;
+use datafusion::logical_expr::JoinType;
 use fake::Fake;
 use parquet::arrow::ArrowWriter;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -186,10 +188,7 @@ async fn execute_dataset_core(
         // The full batch (with _linked_idx) is kept in `computed` for AccumulateToLinked;
         // _linked_idx is stripped before emitting.
         let batch = inject_linked_idx(&batch, path, dataset, computed)?;
-        let output = filter_hidden_columns(
-            strip_linked_idx(batch.clone()),
-            &dataset.data,
-        ).await?;
+        let output = filter_hidden_columns(strip_sentinel(batch.clone(), "_linked_idx"), &dataset.data)?;
         computed.insert(path.to_path_buf(), batch);
         if !defer_emit {
             emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
@@ -342,7 +341,7 @@ async fn execute_lower_cover_group_core(
         computed.insert(path.to_path_buf(), parent_shuffled);
     } else {
         let parent_shuffled = evaluate_expressions(parent_shuffled, dataset).await?;
-        let parent_output = filter_hidden_columns(parent_shuffled.clone(), &dataset.data).await?;
+        let parent_output = filter_hidden_columns(parent_shuffled.clone(), &dataset.data)?;
         computed.insert(path.to_path_buf(), parent_shuffled);
         if !defer_emit {
             emit_batch(parent_output, &dataset.format, &dataset.output_file, shared)?;
@@ -382,9 +381,9 @@ async fn execute_lower_cover_group_core(
         // The linked batch must already be in `computed` (DAG link-edge ordering guarantees this).
         let m_shuffled = inject_linked_idx(&m_shuffled, &m.path, &m.dataset, computed)?;
         let m_output = filter_hidden_columns(
-            strip_linked_idx(strip_slot_idx(m_shuffled.clone())),
+            strip_sentinel(strip_sentinel(m_shuffled.clone(), "_slot_idx"), "_linked_idx"),
             &m.dataset.data,
-        ).await?;
+        )?;
         computed.insert(m.path.clone(), m_shuffled);
         emit_batch(m_output, &m.dataset.format, &m.dataset.output_file, shared)?;
     }
@@ -433,7 +432,7 @@ async fn grow_parent_from_children(
             }
             // Rule 2: same-name field, not a cross-ref pointing elsewhere.
             let is_cross_ref = child_field.simple_ref()
-                .map_or(false, |r| r.starts_with(prefix.as_str()));
+                .is_some_and(|r| r.starts_with(prefix.as_str()));
             if !is_cross_ref && parent_schema.iter().any(|pf| pf.name == child_field.name) {
                 sources.entry(child_field.name.clone())
                     .or_insert_with(|| (alias.clone(), child_field.name.clone()));
@@ -458,6 +457,10 @@ async fn grow_parent_from_children(
     }
     let skel = RecordBatch::try_new(Arc::new(ArrowSchema::new(skel_fields)), skel_cols)?;
 
+    if active.is_empty() {
+        return Ok(skel);
+    }
+
     // Register all batches in a fresh context.
     let ctx = SessionContext::new();
     ctx.register_batch("skel", skel)?;
@@ -465,28 +468,32 @@ async fn grow_parent_from_children(
         ctx.register_batch(&format!("c{ci}"), prepend_row_index(child_batch)?)?;
     }
 
-    // SELECT clause: one expression per active parent field.
-    let select: String = active.iter().map(|f| {
+    // LEFT JOIN skeleton with each child on skel._row_idx = c{i}._row_idx.
+    // join_on with qualified Column::new refs avoids ambiguity when chained joins
+    // accumulate multiple _row_idx columns in the left-side schema.
+    let skel_row_idx = Expr::Column(Column::new(Some("skel"), "_row_idx"));
+    let mut df = ctx.table("skel").await?;
+    for ci in 0..child_batches.len() {
+        let alias = format!("c{ci}");
+        let rhs = ctx.table(&alias).await?;
+        let on_expr = skel_row_idx.clone().eq(
+            Expr::Column(Column::new(Some(alias.as_str()), "_row_idx"))
+        );
+        df = df.join_on(rhs, JoinType::Left, [on_expr])?;
+    }
+
+    // Project to exactly the active parent fields, qualified by table to preserve case.
+    let select_exprs: Vec<Expr> = active.iter().map(|f| {
         if let Some((alias, child_col)) = sources.get(f.name.as_str()) {
-            format!(r#"{alias}."{child_col}" AS "{}""#, f.name)
+            Expr::Column(Column::new(Some(alias.as_str()), child_col.as_str()))
+                .alias(f.name.as_str())
         } else {
-            format!(r#"skel."{0}" AS "{0}""#, f.name)
+            Expr::Column(Column::new(Some("skel"), f.name.as_str()))
+                .alias(f.name.as_str())
         }
-    }).collect::<Vec<_>>().join(", ");
+    }).collect();
 
-    // LEFT JOIN chain on row index gives positional correspondence.
-    let joins: String = (0..child_batches.len())
-        .map(|ci| format!("LEFT JOIN c{ci} ON skel._row_idx = c{ci}._row_idx"))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let sql = if select.is_empty() {
-        "SELECT * FROM skel".to_string()
-    } else {
-        format!("SELECT {select} FROM skel {joins}")
-    };
-
-    let batches = ctx.sql(&sql).await?.collect().await?;
+    let batches = df.select(select_exprs)?.collect().await?;
     let schema = batches.first().map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(schema_to_arrow(parent_schema)));
     Ok(concat_batches(&schema, &batches)?)
@@ -851,13 +858,14 @@ async fn execute_assemble_from_witness(
             .and_then(|f| f.content.as_deref())
             .map(|c| c.item.fields.as_slice())
             .unwrap_or(&[]);
-        let stripped_witness_cols: HashSet<String> = {
-            let s = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
-            s.schema().fields().iter().map(|f| f.name().clone()).collect()
-        };
+        let witness_schema = witness.schema();
+        let stripped_witness_cols: HashSet<&str> = witness_schema.fields().iter()
+            .map(|f| f.name().as_str())
+            .filter(|&n| n != "_linked_idx" && n != "_staging_refs")
+            .collect();
         let staging = batch.clone();
         for cf in content_field_defs {
-            if stripped_witness_cols.contains(&cf.name) { continue; }
+            if stripped_witness_cols.contains(cf.name.as_str()) { continue; }
             if let Some(ref_str) = cf.simple_ref() {
                 // Bare ref (no qualifier) or qualified ref: resolve the column name in staging.
                 let col_name = split_ref(ref_str).map(|(_, c)| c).unwrap_or(ref_str);
@@ -918,7 +926,7 @@ async fn execute_assemble_from_witness(
     }
 
     let batch = evaluate_expressions(batch, dataset).await?;
-    let output = filter_hidden_columns(batch.clone(), &dataset.data).await?;
+    let output = filter_hidden_columns(batch.clone(), &dataset.data)?;
     computed.insert(staging_path.clone(), batch);
     emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
     Ok(())
@@ -1048,14 +1056,12 @@ async fn execute_accumulate_to_linked(
     }
 
     // Build the replacement column.
+    // For the FIRST accumulation into a (linked_path, linked_field) pair, discard any
+    // generator-produced initial values. For SUBSEQUENT calls (multi-segment staging),
+    // carry forward already-accumulated values so all segments combine rather than overwrite.
+    let is_first = accumulated_fields.insert((linked_path.clone(), linked_field.to_string()));
     let new_col: ArrayRef = match reducer {
         Reducer::Collect => {
-            // Collect: build a ListArray. For the FIRST accumulation into a (linked_path,
-            // linked_field) pair, discard any generator-produced initial values and use an
-            // empty fallback for unmapped rows. For SUBSEQUENT calls (multi-segment staging),
-            // carry forward the already-accumulated values so items from all segments are
-            // combined rather than the later call overwriting the earlier one.
-            let is_first = accumulated_fields.insert((linked_path.clone(), linked_field.to_string()));
             let element_type = match agg_values_col.data_type() {
                 DataType::List(f) => f.data_type().clone(),
                 other => bail!("AccumulateToLinked: expected List from array_agg, got {other:?}"),
@@ -1101,7 +1107,6 @@ async fn execute_accumulate_to_linked(
             // Subsequent accumulations (multi-segment staging): commutative reducers (Sum/Max/Min)
             // combine element-wise with the existing value; TakeOne keeps the existing value
             // unchanged (= "take whichever segment captured it first").
-            let is_first = accumulated_fields.insert((linked_path.clone(), linked_field.to_string()));
             if !is_first && matches!(reducer, Reducer::TakeOne) {
                 existing_linked_col.clone()
             } else if !is_first {
@@ -1203,7 +1208,7 @@ async fn execute_emit_dataset(
     let batch = computed.get(path).ok_or_else(|| {
         anyhow!("EmitDataset: batch at '{}' not computed", path.display())
     })?.clone();
-    let output = filter_hidden_columns(batch, &dataset.data).await?;
+    let output = filter_hidden_columns(batch, &dataset.data)?;
     emit_batch(output, &dataset.format, &dataset.output_file, shared)
 }
 
@@ -1284,18 +1289,6 @@ fn sample_linked_weighted(linked_n: usize, count: usize, reinforcement: f64) -> 
         weights[chosen] *= reinforcement;
     }
     result
-}
-
-/// Strip `_slot_idx` from a batch, leaving data columns intact.
-/// Used to remove the sentinel before emitting lower cover member output while retaining it in `computed`.
-fn strip_slot_idx(batch: RecordBatch) -> RecordBatch {
-    strip_sentinel(batch, "_slot_idx")
-}
-
-/// Strip `_linked_idx` from a batch before emitting a junction dataset's output.
-/// The full batch (including `_linked_idx`) is retained in `computed` for `AccumulateToLinked`.
-fn strip_linked_idx(batch: RecordBatch) -> RecordBatch {
-    strip_sentinel(batch, "_linked_idx")
 }
 
 fn strip_sentinel(batch: RecordBatch, sentinel: &str) -> RecordBatch {
@@ -1506,29 +1499,18 @@ async fn evaluate_expressions(
 /// Remove columns marked `hidden` from a batch before writing output.
 /// The full batch (including hidden columns) is kept in `computed` for inherited
 /// field wiring; only the filtered batch is written to output.
-async fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordBatch> {
+fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordBatch> {
     if !fields.iter().any(|f| f.hidden) {
         return Ok(batch);
     }
-
     let hidden: HashSet<&str> = fields.iter()
         .filter(|f| f.hidden)
         .map(|f| f.name.as_str())
         .collect();
-
-    let ctx = SessionContext::new();
-    let df = ctx.read_batch(batch)?;
-    let visible: Vec<datafusion::prelude::Expr> = df.schema()
-        .fields()
-        .iter()
-        .filter(|af| !hidden.contains(af.name().as_str()))
-        .map(|af| datafusion::prelude::col(af.name()))
+    let visible: Vec<usize> = (0..batch.num_columns())
+        .filter(|&i| !hidden.contains(batch.schema().field(i).name().as_str()))
         .collect();
-
-    let batches = df.select(visible)?.collect().await?;
-    let schema = batches.first().map(|b| b.schema())
-        .unwrap_or_else(|| Arc::new(ArrowSchema::empty()));
-    Ok(concat_batches(&schema, &batches)?)
+    Ok(batch.project(&visible)?)
 }
 
 // ---------------------------------------------------------------------------

@@ -79,10 +79,12 @@ impl From<&Field> for FieldConstraints {
     }
 }
 
-impl From<FieldConstraints> for Option<Range> {
-    fn from(fc: FieldConstraints) -> Self {
-        if fc.min.is_some() || fc.max.is_some() {
-            Some(Range { min: fc.min, max: fc.max })
+impl FieldConstraints {
+    /// Convert the numeric bounds in this constraint set to a `Range`, returning `None`
+    /// when neither bound is set.
+    pub fn to_range(&self) -> Option<Range> {
+        if self.min.is_some() || self.max.is_some() {
+            Some(Range { min: self.min, max: self.max })
         } else {
             None
         }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constraints::validate_field_constraints;
 use crate::expressions::extract_identifiers;
-use crate::models::{resolve_include, split_ref, CountSpec, Field, FieldType, FieldVariant, Include, RefBinding, Reducer, Schema, SyntheticDataset};
+use crate::models::{resolve_include, split_ref, CountSpec, Field, FieldType, FieldVariant, Generator, Include, Locale, RefBinding, Reducer, Schema, SyntheticDataset};
 
 /// Validate all loaded datasets, returning any non-fatal warnings.
 /// Hard errors (e.g. `rows` set alongside `ratio`) are returned as `Err`.
@@ -156,7 +156,7 @@ fn validate_dataset(
             if let Some(ref from_ref) = content.from {
                 if let Some(link) = dataset.links.iter().find(|l| &l.reference == from_ref) {
                     let content_path = format!("{field_path}[]");
-                    validate_project(content, link, &content_path, path, dataset, all)?;
+                    validate_project(content, link, &content_path, path, all)?;
                     validate_list_link_content(&content_path, link, &content.item.fields, path, dataset, all, warnings)?;
                 }
             }
@@ -175,6 +175,19 @@ fn validate_dataset(
     Ok(())
 }
 
+fn validate_locale_generator(path: &str, locale: Option<&Locale>, generator: Option<&Generator>) -> Result<()> {
+    if locale.is_some() {
+        match generator {
+            None => bail!("field '{path}': `locale` requires `generator` to be set"),
+            Some(g) if !g.supports_locale() => bail!(
+                "field '{path}': generator `{g}` does not support locale selection"
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Result<()> {
     // Expression fields are fully self-contained: no type, ref, or generation constraints.
     if field.expression.is_some() {
@@ -184,8 +197,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         if field.simple_ref().is_some() {
             bail!("field '{path}': `expression` cannot be combined with `ref`");
         }
-        let has_range = field.range.as_ref().map(|r| r.min.is_some() || r.max.is_some()).unwrap_or(false);
-        if field.generator.is_some() || has_range {
+        if field.generator.is_some() || field.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some()) {
             bail!("field '{path}': `expression` cannot be combined with `generator` or `range`");
         }
         if field.value.is_some() {
@@ -222,17 +234,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     let range_min = field.range.as_ref().and_then(|r| r.min);
     let range_max = field.range.as_ref().and_then(|r| r.max);
 
-    if field.locale.is_some() {
-        match &field.generator {
-            None => bail!(
-                "field '{path}': `locale` requires `generator` to be set"
-            ),
-            Some(g) if !g.supports_locale() => bail!(
-                "field '{path}': generator `{g}` does not support locale selection"
-            ),
-            Some(_) => {}
-        }
-    }
+    validate_locale_generator(path, field.locale.as_ref(), field.generator.as_ref())?;
 
     // Type-dependent checks require a known type — deferred to the rewrite step for ref fields.
     if field.simple_ref().is_some() {
@@ -444,15 +446,7 @@ fn validate_list_link_content(
 
         // Basic constraint checks.
         validate_field_constraints(&fpath, field)?;
-        if field.locale.is_some() {
-            match &field.generator {
-                None => bail!("field '{fpath}': `locale` requires `generator` to be set"),
-                Some(g) if !g.supports_locale() => bail!(
-                    "field '{fpath}': generator `{g}` does not support locale selection"
-                ),
-                Some(_) => {}
-            }
-        }
+        validate_locale_generator(&fpath, field.locale.as_ref(), field.generator.as_ref())?;
         if let (Some(g), Some(ft)) = (&field.generator, &field.field_type) {
             if !g.valid_for(ft) {
                 bail!("field '{fpath}': generator `{g}` is not valid for type `{ft}`");
@@ -462,7 +456,7 @@ fn validate_list_link_content(
     Ok(())
 }
 
-fn validate_field_variant(path: &str, choice: &FieldVariant, warnings: &mut Vec<String>) -> Result<()> {
+fn validate_field_variant(path: &str, choice: &FieldVariant, _warnings: &mut Vec<String>) -> Result<()> {
     if let Some(ft) = &choice.field_type {
         if *ft == FieldType::Variant {
             bail!("field variant '{path}': nested `type: variant` is not supported");
@@ -473,8 +467,7 @@ fn validate_field_variant(path: &str, choice: &FieldVariant, warnings: &mut Vec<
         if choice.generator.is_some() {
             bail!("field variant '{path}': `value` and `generator` cannot both be set");
         }
-        let has_range = choice.range.as_ref().map_or(false, |r| r.min.is_some() || r.max.is_some());
-        if has_range {
+        if choice.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some()) {
             bail!("field variant '{path}': `value` and `range` cannot both be set");
         }
     }
@@ -487,15 +480,7 @@ fn validate_field_variant(path: &str, choice: &FieldVariant, warnings: &mut Vec<
         }
     }
 
-    if choice.locale.is_some() {
-        match &choice.generator {
-            None => bail!("field variant '{path}': `locale` requires `generator` to be set"),
-            Some(g) if !g.supports_locale() => bail!(
-                "field variant '{path}': generator `{g}` does not support locale selection"
-            ),
-            Some(_) => {}
-        }
-    }
+    validate_locale_generator(path, choice.locale.as_ref(), choice.generator.as_ref())?;
 
     if let (Some(g), Some(ft)) = (&choice.generator, &choice.field_type) {
         if !g.valid_for(ft) {
@@ -505,15 +490,14 @@ fn validate_field_variant(path: &str, choice: &FieldVariant, warnings: &mut Vec<
 
     // Must be able to determine the concrete type at expansion time.
     let can_infer_type = choice.field_type.is_some()
-        || choice.range.as_ref().map_or(false, |r| r.min.is_some() || r.max.is_some())
-        || choice.value.as_ref().map_or(false, |v| v.is_string() || v.is_number() || v.is_bool());
+        || choice.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some())
+        || choice.value.as_ref().is_some_and(|v| v.is_string() || v.is_number() || v.is_bool());
     if !can_infer_type {
         bail!(
             "field variant '{path}': cannot determine type — set `type`, `value`, or `range`"
         );
     }
 
-    let _ = warnings; // reserved for future use
     Ok(())
 }
 
@@ -788,7 +772,6 @@ fn validate_project(
     link: &Include,
     content_path: &str,
     dataset_path: &Path,
-    dataset: &SyntheticDataset,
     all: &HashMap<PathBuf, SyntheticDataset>,
 ) -> Result<()> {
     let Some(ref proj) = content.project else { return Ok(()) };
@@ -834,7 +817,6 @@ fn validate_project(
         );
     }
 
-    let _ = dataset; // suppress unused warning
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constraints::Merge;
 use crate::constraints::FieldConstraints;
-use crate::models::{resolve_include, split_ref, Field, Include, Locale, Range, RefsSpec, SyntheticDataset};
+use crate::models::{resolve_include, split_ref, Field, Include, Locale, RefsSpec, SyntheticDataset};
 
 const MAX_REF_CHAIN_DEPTH: usize = 32;
 
@@ -277,15 +277,12 @@ fn resolve_field(
         )
     })?;
 
+    let range = merged.to_range();
     Ok(Field {
         name: field_name.to_string(),
         field_type: base.field_type.clone(),
         generator: merged.generator,
-        range: if merged.min.is_some() || merged.max.is_some() {
-            Some(Range { min: merged.min, max: merged.max })
-        } else {
-            None
-        },
+        range,
         value: merged.value,
         fields: base.fields.clone(),
         content: base.content.clone(),
@@ -379,15 +376,12 @@ fn resolve_list_link_content_field(
         )
     })?;
 
+    let range = merged.to_range();
     Ok(Field {
         name: field.name.clone(),
         field_type: target.field_type.clone(),
         generator: merged.generator,
-        range: if merged.min.is_some() || merged.max.is_some() {
-            Some(Range { min: merged.min, max: merged.max })
-        } else {
-            None
-        },
+        range,
         value: merged.value,
         fields: target.fields.clone(),
         content: target.content.clone(),

@@ -153,9 +153,11 @@ fn build_delta_field(path: &[String], variant: &FieldVariant, outer_parquet: Opt
 fn infer_field_type(variant: &FieldVariant) -> Option<FieldType> {
     variant.field_type.clone()
         .or_else(|| {
-            let has_bounds = variant.range.as_ref()
-                .map_or(false, |r| r.min.is_some() || r.max.is_some());
-            if has_bounds { Some(FieldType::Number) } else { None }
+            if variant.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some()) {
+                Some(FieldType::Number)
+            } else {
+                None
+            }
         })
         .or_else(|| {
             variant.value.as_ref().and_then(|v| {
