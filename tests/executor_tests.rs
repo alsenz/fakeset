@@ -131,7 +131,7 @@ async fn test_bernoulli_conflicting_siblings_fan_out_correctly() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Prefill wiring — ref field values flow from includer to includee
+// 4. Inherited field wiring — ref field values flow from includer to includee
 //
 // derived includes source (no distribution), derived.id refs src.id.
 // Topo order: derived first (includer), source second (includee).
@@ -411,7 +411,7 @@ async fn test_list_field_generates_arrays() {
 
 #[tokio::test]
 async fn test_bernoulli_list_link_parent_assembles_correctly() {
-    let out = run("tests/fixtures/execute/bernoulli_link_content").await;
+    let out = run("tests/fixtures/execute/bernoulli_list_link").await;
 
     assert_eq!(jsonl_rows(&out, "items").len(), 20, "items should have 20 rows");
 
@@ -451,7 +451,7 @@ async fn test_bernoulli_list_link_parent_assembles_correctly() {
 
 #[tokio::test]
 async fn test_plain_fields_in_list_link_content() {
-    let out = run("tests/fixtures/execute/link_content_plain").await;
+    let out = run("tests/fixtures/execute/list_link_flat").await;
 
     let rows = jsonl_rows(&out, "records");
     assert_eq!(rows.len(), 5, "records should have 5 rows");
@@ -528,7 +528,7 @@ async fn test_count_normal_produces_variable_length_lists() {
 
 #[tokio::test]
 async fn test_list_link_refs() {
-    let out = run("tests/fixtures/execute/link_content").await;
+    let out = run("tests/fixtures/execute/list_link").await;
     let event_rows = jsonl_rows(&out, "events");
 
     assert_eq!(event_rows.len(), 5, "events should have 5 rows");
@@ -685,11 +685,11 @@ async fn test_mult1_grandchild_sees_full_batch() {
 
 #[tokio::test]
 async fn test_witness_slot_idx() {
-    // link_content: events (5 rows) has an attendees list (1–4 items per row).
+    // list_link: events (5 rows) has an attendees list (1–4 items per row).
     // Items are assembled from witness batches via _staging_refs unnesting; outer-scoped
     // refs are resolved from the staging batch per slot. The outer-scoped ref event_title
     // must match the enclosing row's title, proving slot assignment is correct.
-    let out = run("tests/fixtures/execute/link_content").await;
+    let out = run("tests/fixtures/execute/list_link").await;
     let rows = jsonl_rows(&out, "events");
     assert_eq!(rows.len(), 5, "events should have 5 rows");
     for row in &rows {
@@ -711,7 +711,7 @@ async fn test_witness_slot_idx() {
 }
 
 // ---------------------------------------------------------------------------
-// MULT-2 Stage 5 — Nested-include collect-to-pool (Case 2)
+// MULT-2 Stage 5 — Nested-include collect-to-linked (Case 2)
 //
 // wards_doctors: 3 wards, 5 doctors.
 // Each ward has an `on_call_doctors` list (cardinality 2) drawn from doctors via _linked_idx.
@@ -820,6 +820,37 @@ async fn test_scalar_reducers_sum_max_min_take_first() {
 }
 
 // ---------------------------------------------------------------------------
+// Stage 5.5 — cumulative scalar reducer across Bernoulli segments
+//
+// segmented_scalar_reduce: game (3 rows, total: number default 0),
+// plays (10 rows, list field played_games from game cardinality 2,
+//   content field score: value 5 bind game.total reducer sum).
+// child_a (ratio 0.4) and child_b (ratio 0.6) include plays, creating two segments.
+//
+// Conservation law: every draw contributes score=5 to exactly one game row.
+// With 10 plays × cardinality 2 = 20 draws, sum(game.total) = 20 × 5 = 100.
+// Without the fix, the second segment's AccumulateToLinked would overwrite game rows
+// from the first segment with the default (0), breaking the conservation law.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_segmented_scalar_sum_accumulates_correctly() {
+    let out = run("tests/fixtures/execute/segmented_scalar_reduce").await;
+
+    let games = jsonl_rows(&out, "game");
+    assert_eq!(games.len(), 3, "game should have 3 rows");
+
+    // Conservation law: every draw (10 plays × cardinality 2) contributes 5 to some game row.
+    let grand_total: f64 = games.iter()
+        .map(|g| g["total"].as_f64().expect("game.total should be a number"))
+        .sum();
+    assert!(
+        (grand_total - 100.0).abs() < 0.001,
+        "sum(game.total) should equal 10 plays × 2 cardinality × score 5 = 100; got {grand_total}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // MULT-2 Stage 6 — reinforcement: 0 (without-replacement sampling)
 //
 // no_replacement: pool (5 rows), outer (4 rows).
@@ -828,7 +859,7 @@ async fn test_scalar_reducers_sum_max_min_take_first() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_reinforcement_zero_no_duplicate_pool_rows() {
+async fn test_reinforcement_zero_no_duplicate_linked_rows() {
     let out = run("tests/fixtures/execute/no_replacement").await;
 
     let rows = jsonl_rows(&out, "outer");
@@ -855,7 +886,46 @@ async fn test_reinforcement_zero_no_duplicate_pool_rows() {
 }
 
 // ---------------------------------------------------------------------------
-// MULT-2 Stage 4 — Junction link collect-to-pool
+// Stage 6 — Uniform max-cap with reinforcement:0
+//
+// no_replacement_max_cap: linked (4 rows), outer (5 rows).
+// link: cardinality:{min:1, max:10}, reinforcement: 0.
+// max:10 exceeds n_eligible=4. Each outer row must have 1–4 items (capped at 4)
+// and no duplicate linked ids within a row.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_no_replacement_max_cap() {
+    let out = run("tests/fixtures/execute/no_replacement_max_cap").await;
+
+    let rows = jsonl_rows(&out, "outer");
+    assert_eq!(rows.len(), 5, "outer should have 5 rows");
+
+    for (i, row) in rows.iter().enumerate() {
+        let items = row["items"].as_array()
+            .unwrap_or_else(|| panic!("outer[{i}].items should be a list; got: {row}"));
+        assert!(
+            items.len() <= 4,
+            "outer[{i}]: items count ({}) must be ≤ n_eligible=4 (runtime cap applied); got: {items:?}",
+            items.len()
+        );
+        assert!(
+            !items.is_empty(),
+            "outer[{i}]: items count must be ≥ 1 (min cardinality); got 0"
+        );
+        let ids: Vec<&str> = items.iter()
+            .map(|item| item["id"].as_str().expect("id should be a string"))
+            .collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(), ids.len(),
+            "outer[{i}]: reinforcement:0 must produce no duplicate ids within one row; got: {ids:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MULT-2 Stage 4 — Junction link collect-to-linked
 //
 // directorships: 5 individuals, 5 organisations, 5 directorships.
 // Each directorship is assigned to one organisation (_linked_idx).
@@ -864,7 +934,7 @@ async fn test_reinforcement_zero_no_duplicate_pool_rows() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_junction_collect_to_pool() {
+async fn test_junction_collect_to_linked() {
     let out = run("tests/fixtures/execute/directorships").await;
 
     let orgs = jsonl_rows(&out, "organisations");
@@ -895,6 +965,49 @@ async fn test_junction_collect_to_pool() {
     // _linked_idx sentinel must not leak into output.
     for row in &directorships {
         assert!(row.get("_linked_idx").is_none(), "_linked_idx must not appear in directorships output");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Case 1 — Junction link with no collect and no list field
+//
+// junction_no_collect: departments (10 rows), employees (30 rows).
+// employees links to departments via a plain 1:1 junction (cardinality: 1, no collect,
+// no list field). Each employee draws one department; _linked_idx is assigned internally
+// but must not appear in the output.
+//
+// The ref fields (dept_id, dept_name) resolve their type from the linked dataset but
+// are not wired to the specific drawn row's values — they're generated fresh.
+// The meaningful invariants are: row count, _linked_idx not leaked, fields present.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_junction_link_with_no_collect_produces_correct_rows() {
+    let out = run("tests/fixtures/execute/junction_no_collect").await;
+
+    let depts = jsonl_rows(&out, "departments");
+    assert_eq!(depts.len(), 10, "departments should have 10 rows");
+
+    let employees = jsonl_rows(&out, "employees");
+    assert_eq!(employees.len(), 30, "employees should have 30 rows");
+
+    for row in &employees {
+        // _linked_idx sentinel must not leak into output.
+        assert!(row.get("_linked_idx").is_none(), "_linked_idx must not appear in employees output");
+
+        // Ref fields exist and are non-empty strings (type resolved from linked dataset).
+        assert!(
+            row["emp_id"].as_str().map_or(false, |s| !s.is_empty()),
+            "emp_id should be a non-empty string"
+        );
+        assert!(
+            row["dept_id"].as_str().map_or(false, |s| !s.is_empty()),
+            "dept_id should be a non-empty string"
+        );
+        assert!(
+            row["dept_name"].as_str().map_or(false, |s| !s.is_empty()),
+            "dept_name should be a non-empty string"
+        );
     }
 }
 
@@ -1109,4 +1222,48 @@ async fn test_staging_refs_deduplicates_linked_rows() {
     assert_eq!(drawn_by.len(), 3,
         "all 3 source rows drew the single linked row → drawn_by must have 3 entries; got {}",
         drawn_by.len());
+}
+
+// Stage 5 — Per-segment witness correctness
+//
+// segmented_list_link: source (10 rows) has two lower cover members child_a (ratio:0.4)
+// and child_b (ratio:0.6), making source a segmented staging node. Each segment generates
+// its own GenerateWitness step covering only its slots. The assembled source output must:
+//   1. Have exactly 10 rows
+//   2. Each row must have an `items` list with exactly 2 elements (cardinality: 2)
+//   3. child_a rows must all have tag "A"; child_b rows must all have tag "B"
+//
+// This verifies that per-segment witness generation and assembly produce the correct
+// slot assignments without index-out-of-bounds panics.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_segmented_list_link_assembles_correctly() {
+    let out = run("tests/fixtures/execute/segmented_list_link").await;
+
+    let source_rows = jsonl_rows(&out, "source");
+    assert_eq!(source_rows.len(), 10, "source should have 10 rows");
+
+    for (i, row) in source_rows.iter().enumerate() {
+        let items = row["items"].as_array()
+            .unwrap_or_else(|| panic!("source row {i}: 'items' should be an array"));
+        assert_eq!(items.len(), 2,
+            "source row {i}: cardinality:2 → each row should have 2 items; got {}", items.len());
+        for item in items {
+            assert!(item["label"].is_string(),
+                "source row {i}: each item should have a string 'label' field");
+        }
+    }
+
+    let child_a = jsonl_rows(&out, "child_a");
+    let child_b = jsonl_rows(&out, "child_b");
+    assert!(!child_a.is_empty(), "child_a should have rows");
+    assert!(!child_b.is_empty(), "child_b should have rows");
+
+    for row in &child_a {
+        assert_eq!(row["tag"].as_str().unwrap_or(""), "A", "child_a rows must have tag='A'");
+    }
+    for row in &child_b {
+        assert_eq!(row["tag"].as_str().unwrap_or(""), "B", "child_b rows must have tag='B'");
+    }
 }

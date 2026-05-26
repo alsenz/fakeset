@@ -135,7 +135,7 @@ fn test_resolve_refs_for_list_link_content_field() {
     //   name: ref: person.full_name  (include-scoped — type inherited from people.full_name: string)
     //   event_title: type: string, ref: title  (outer-scoped — left as-is)
     // After resolve_refs the include-scoped field should carry field_type: String.
-    let paths = vec![PathBuf::from("tests/fixtures/execute/link_content")];
+    let paths = vec![PathBuf::from("tests/fixtures/execute/list_link")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     validate(&datasets).expect("should pass validation");
     let resolved = resolve_refs(&datasets).expect("should resolve refs");

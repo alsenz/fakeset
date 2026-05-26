@@ -1,5 +1,21 @@
+//! Execution engine. Interprets the `ExecutionPlan` produced by `plan::build_plan`:
+//! generates staging nodes, witness nodes (atoms in the semi-lattice), and assembly
+//! nodes; accumulates witness values back into linked datasets via `AccumulateToLinked`;
+//! and writes output files.
+//!
+//! ## Sentinel column lifecycle
+//!
+//! Several hidden columns carry positional bookkeeping across steps. They are produced and
+//! consumed as follows:
+//!
+//! | Column | Type | Produced by | Consumed by | Stripped by |
+//! |--------|------|-------------|-------------|-------------|
+//! | `_row_idx` | `UInt32` | `grow_parent_from_children` | same (JOIN key) | same (never leaves the function) |
+//! | `_slot_idx` | `UInt32` | `execute_lower_cover_group_core` (member batches) | `AssembleFromWitness` (fold into lists) | `strip_slot_idx` before member emit |
+//! | `_staging_refs` | `List<UInt32>` | `execute_witness` | `execute_assemble_from_witness` (fold) | stripped during assembly |
+//! | `_linked_idx` | `UInt32` | `inject_linked_idx` (junction) / `execute_witness` | `execute_accumulate_to_linked` | `strip_linked_idx` before junction emit |
 use anyhow::{anyhow, bail, Result};
-use arrow::array::{ArrayRef, Float64Array, ListArray, StringArray, StructArray, UInt32Array, new_empty_array};
+use arrow::array::{Array, ArrayRef, Float64Array, ListArray, StringBuilder, StringArray, StructArray, UInt32Array, new_empty_array};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{concat, concat_batches, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -23,15 +39,15 @@ use std::sync::Arc;
 use crate::constraints::FieldConstraints;
 use crate::generator::{generate_column, sample_count};
 use crate::schema::{field_to_arrow, schema_to_arrow};
-use crate::models::{resolve_include, split_ref, CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset};
+use crate::models::{eligible_linked_rows, resolve_include, split_ref, CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset};
 use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField};
 use crate::segment::{LowerCoverMember, Segment};
 
 /// Execute the plan produced by `plan::build_plan`, writing outputs to `output_dir`.
 ///
 /// Each step is interpreted in order with no branching on dataset shape:
-/// row counts, sibling segments, and prefill wiring are all pre-resolved in
-/// the plan.
+/// row counts, lower cover segments, and inherited field wiring are all pre-resolved
+/// in the plan.
 pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
@@ -41,18 +57,23 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
     // Datasets generated *as lower cover members* are not reusable across separate variant groups.
     let mut parent_computed: HashSet<PathBuf> = HashSet::new();
     let mut shared: HashMap<String, (Format, Vec<RecordBatch>)> = HashMap::new();
+    // Tracks which (linked_path, linked_field) pairs have had their first AccumulateToLinked call.
+    // The first call always replaces generated values; subsequent calls accumulate cumulatively.
+    let mut accumulated_fields: HashSet<(PathBuf, String)> = HashSet::new();
 
     for step in &plan.steps {
         match step {
-            ExecutionStep::GenerateStagingNode { path, dataset, rows, prefills } => {
+            // --- Push-down phase: generate datasets and staging nodes (scalar fields only
+            //     for nodes with list-links), fan rows to lower cover members. ---
+            ExecutionStep::GenerateStagingNode { path, dataset, rows, inherited } => {
                 execute_dataset_core(
-                    true, false, path, dataset.as_ref(), *rows, prefills,
+                    true, false, path, dataset.as_ref(), *rows, inherited,
                     &mut computed, &mut shared,
                 ).await?;
             }
-            ExecutionStep::GenerateDataset { path, dataset, rows, prefills, defer_emit } => {
+            ExecutionStep::GenerateDataset { path, dataset, rows, inherited, defer_emit } => {
                 execute_dataset_core(
-                    false, *defer_emit, path, dataset.as_ref(), *rows, prefills,
+                    false, *defer_emit, path, dataset.as_ref(), *rows, inherited,
                     &mut computed, &mut shared,
                 ).await?;
             }
@@ -71,15 +92,17 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
             ExecutionStep::GenerateWitness {
                 witness_key, staging_path, list_field_name,
                 inner_fields, include, cardinality,
-                linked_path,
+                linked_path, slot_start, slot_count, segment_constraints,
             } => {
                 execute_witness(
                     witness_key, staging_path, list_field_name,
                     inner_fields, include, cardinality,
-                    linked_path,
+                    linked_path, *slot_start, *slot_count, segment_constraints,
                     &mut computed,
                 )?;
             }
+            // --- Accumulate-up phase: fold witness rows into list columns, propagate
+            //     collected values back to linked datasets, emit final output files. ---
             ExecutionStep::AssembleFromWitness { staging_path, dataset, witness_specs } => {
                 execute_assemble_from_witness(
                     staging_path, dataset.as_ref(), witness_specs,
@@ -92,6 +115,7 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                 execute_accumulate_to_linked(
                     source_path, source_field, linked_path, linked_field, group_by, reducer, default_val,
                     &mut computed,
+                    &mut accumulated_fields,
                 ).await?;
             }
             ExecutionStep::EmitDataset { path, dataset } => {
@@ -112,15 +136,15 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Prefill resolution
+// Inherited field resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_prefills(
-    prefills: &[InheritedField],
+fn resolve_inherited_fields(
+    inherited: &[InheritedField],
     computed: &HashMap<PathBuf, RecordBatch>,
 ) -> HashMap<String, Vec<ArrayRef>> {
     let mut map: HashMap<String, Vec<ArrayRef>> = HashMap::new();
-    for ps in prefills {
+    for ps in inherited {
         let Some(batch) = computed.get(&ps.from_path) else { continue };
         let Ok(col_idx) = batch.schema().index_of(&ps.from_column) else { continue };
         map.entry(ps.into_column.clone())
@@ -145,12 +169,12 @@ async fn execute_dataset_core(
     path: &Path,
     dataset: &SyntheticDataset,
     rows: usize,
-    prefills: &[InheritedField],
+    inherited: &[InheritedField],
     computed: &mut HashMap<PathBuf, RecordBatch>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
-    let prefill_map = resolve_prefills(prefills, computed);
-    let batch = generate_prefilled_batch(&dataset.data, rows, &prefill_map)?;
+    let inherited_map = resolve_inherited_fields(inherited, computed);
+    let batch = generate_with_inherited(&dataset.data, rows, &inherited_map)?;
     if is_staging {
         // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
         // expressions, and emits.
@@ -200,6 +224,9 @@ async fn execute_lower_cover_group_core(
     // n_eligible_slots boundary correctly identifies linked-member rows.
     let mut witness_source_parent_batches: Vec<RecordBatch> = Vec::new();
     let mut non_witness_source_parent_batches: Vec<RecordBatch> = Vec::new();
+    // For staging nodes: collect batches in segment declaration order (no shuffle).
+    // Row order determines slot indices used by per-segment GenerateWitness.
+    let mut ordered_staging_batches: Vec<RecordBatch> = Vec::new();
     let mut member_buffers: HashMap<PathBuf, Vec<RecordBatch>> = HashMap::new();
     let mut slot_offset: usize = 0;
 
@@ -213,7 +240,11 @@ async fn execute_lower_cover_group_core(
         if seg.members.is_empty() {
             // Parent-only segment: no child rows to inherit — generate fresh.
             let parent_seg = generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?;
-            non_witness_source_parent_batches.push(parent_seg);
+            if is_staging {
+                ordered_staging_batches.push(parent_seg);
+            } else {
+                non_witness_source_parent_batches.push(parent_seg);
+            }
         } else {
             // Witness-source members contribute constraints but produce no standalone batches.
             // Separate them from real (flat) members before generating children.
@@ -278,7 +309,9 @@ async fn execute_lower_cover_group_core(
                 ).await?
             };
 
-            if seg_has_witness_source {
+            if is_staging {
+                ordered_staging_batches.push(parent_seg);
+            } else if seg_has_witness_source {
                 witness_source_parent_batches.push(parent_seg);
             } else {
                 non_witness_source_parent_batches.push(parent_seg);
@@ -287,9 +320,15 @@ async fn execute_lower_cover_group_core(
         slot_offset += seg.rows;
     }
 
-    // Linked-rows-preceding-staging-rows: witness-source members occupy the leading positions
-    // in the combined parent batch so GenerateWitness's n_eligible_slots boundary selects them.
-    let parent_shuffled = if has_witness_sources && !witness_source_parent_batches.is_empty() {
+    // For staging nodes: concatenate in segment declaration order (no shuffle).
+    // For non-staging: witness-source rows first, then shuffled remainder.
+    let parent_shuffled = if is_staging {
+        // Row order determines slot indices used by per-segment GenerateWitness steps.
+        let arrow_schema = ordered_staging_batches.first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(schema_to_arrow(&dataset.data)));
+        concat_batches(&arrow_schema, &ordered_staging_batches)?
+    } else if has_witness_sources && !witness_source_parent_batches.is_empty() {
         combine_witness_source_first(witness_source_parent_batches, non_witness_source_parent_batches, &dataset.data, &dataset.name).await?
     } else {
         let mut all = witness_source_parent_batches;
@@ -353,7 +392,10 @@ async fn execute_lower_cover_group_core(
     Ok(())
 }
 
-/// Grow the parent batch for one segment from the already-generated child rows.
+/// Accumulate-up step for include relationships: inherit child column values into parent rows.
+///
+/// In semi-lattice terms, this is the upward propagation step — child (more-constrained)
+/// values flow into the parent (less-constrained) batch so they are never re-generated.
 ///
 /// Expressed as a DataFusion JOIN: a skeleton batch (fresh-generated rule-3 columns +
 /// `_row_idx`) is LEFT-JOINed with each child batch (also prepended with `_row_idx`).
@@ -469,6 +511,130 @@ fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<Reco
 // Witness generation
 // ---------------------------------------------------------------------------
 
+/// Filter a batch to rows where every constrained field satisfies its `FieldConstraints`.
+/// Returns `(filtered_batch, surviving_row_indices)` — the surviving indices are positions
+/// in the original (unfiltered) batch, enabling callers to map back to original indices.
+fn filter_batch_by_constraints(
+    batch: &RecordBatch,
+    constraints: &HashMap<String, FieldConstraints>,
+) -> Result<(RecordBatch, Vec<u32>)> {
+    if constraints.is_empty() {
+        let surviving: Vec<u32> = (0..batch.num_rows() as u32).collect();
+        return Ok((batch.clone(), surviving));
+    }
+
+    let mut mask: Vec<bool> = vec![true; batch.num_rows()];
+    for (field_name, fc) in constraints {
+        let Ok(col_idx) = batch.schema().index_of(field_name) else { continue };
+        let col = batch.column(col_idx);
+        for row in 0..batch.num_rows() {
+            if mask[row] {
+                mask[row] = row_satisfies_field_constraints(col, row, fc);
+            }
+        }
+    }
+
+    let surviving: Vec<u32> = (0..batch.num_rows() as u32)
+        .filter(|&i| mask[i as usize])
+        .collect();
+    let indices = UInt32Array::from(surviving.clone());
+    let fields: Vec<Arc<ArrowField>> = batch.schema().fields().to_vec();
+    let cols: Vec<ArrayRef> = batch.columns().iter()
+        .map(|c| take(c.as_ref(), &indices, None))
+        .collect::<std::result::Result<_, _>>()?;
+    let filtered = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?;
+    Ok((filtered, surviving))
+}
+
+/// Check whether the value at `row` in `col` satisfies the given `FieldConstraints`.
+fn row_satisfies_field_constraints(col: &ArrayRef, row: usize, fc: &FieldConstraints) -> bool {
+    use arrow::array::{BooleanArray, StringArray};
+
+    if let Some(ref val) = fc.value {
+        match val {
+            YamlValue::String(expected) => {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    if !col.is_null(row) && arr.value(row) != expected.as_str() {
+                        return false;
+                    }
+                }
+            }
+            YamlValue::Number(n) => {
+                if let Some(expected) = n.as_f64() {
+                    if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                        if !col.is_null(row) && (arr.value(row) - expected).abs() > 1e-9 {
+                            return false;
+                        }
+                    }
+                }
+            }
+            YamlValue::Bool(expected) => {
+                if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                    if !col.is_null(row) && arr.value(row) != *expected {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+        let v = arr.value(row);
+        if let Some(min) = fc.min {
+            if v < min { return false; }
+        }
+        if let Some(max) = fc.max {
+            if v > max { return false; }
+        }
+    }
+
+    true
+}
+
+/// Deduplicate raw draw assignments into the `_linked_idx` / `_staging_refs` structure.
+///
+/// Given the flat draw results from Phase 1 of witness generation, maps each draw back
+/// to its original eligible-linked index (`surviving_indices` reverses the constraint
+/// filter), groups staging slots by linked row, and builds the `_staging_refs` ListArray
+/// (one entry per unique linked row, containing the staging slot indices that drew it).
+///
+/// Returns `(unique_linked_idxs, staging_refs_array)`:
+/// - `unique_linked_idxs`: sorted unique eligible-linked-batch row indices (keys for `take`)
+/// - `staging_refs_array`: `List<UInt32>` — entry i = all staging slots that drew linked row i
+fn build_witness_dedup(
+    slot_assignments: &UInt32Array,
+    staging_idxs: &[u32],
+    surviving_indices: &[u32],
+    total: usize,
+) -> (Vec<u32>, ListArray) {
+    // Map filtered index → original eligible_linked index → _linked_idx value,
+    // accumulating staging slots per linked row. BTreeMap keeps deterministic order.
+    let mut draw_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for k in 0..total {
+        let original_linked_idx = surviving_indices[slot_assignments.value(k) as usize];
+        draw_map
+            .entry(original_linked_idx)
+            .or_default()
+            .push(staging_idxs[k]);
+    }
+    let unique_linked_idxs: Vec<u32> = draw_map.keys().copied().collect();
+
+    let mut refs_offsets: Vec<i32> = vec![0];
+    let mut refs_values: Vec<u32> = Vec::new();
+    for &linked_idx in &unique_linked_idxs {
+        refs_values.extend_from_slice(&draw_map[&linked_idx]);
+        refs_offsets.push(refs_values.len() as i32);
+    }
+    let staging_refs_array = ListArray::new(
+        Arc::new(ArrowField::new("item", DataType::UInt32, false)),
+        OffsetBuffer::new(ScalarBuffer::from(refs_offsets)),
+        Arc::new(UInt32Array::from(refs_values)),
+        None,
+    );
+    (unique_linked_idxs, staging_refs_array)
+}
+
 /// Generate the witness batch for one list-link field.
 ///
 /// One witness row per **unique** linked-row draw. Column sources:
@@ -485,30 +651,48 @@ fn execute_witness(
     include: &Include,
     cardinality: &CountSpec,
     linked_path: &PathBuf,
+    slot_start: usize,
+    slot_count: usize,
+    segment_constraints: &HashMap<String, FieldConstraints>,
     computed: &mut HashMap<PathBuf, RecordBatch>,
 ) -> Result<()> {
-    let staging_batch = computed.get(staging_path).ok_or_else(|| {
-        anyhow!("witness '{list_field_name}': staging batch not yet computed")
-    })?.clone();
+    if !computed.contains_key(staging_path) {
+        return Err(anyhow!("witness '{list_field_name}': staging batch not yet computed"));
+    }
     let linked_batch = computed.get(linked_path).ok_or_else(|| {
         anyhow!("witness '{list_field_name}': linked-slot batch not yet computed")
     })?.clone();
 
     // --- Phase 1: assign each draw to a staging slot and a linked slot ---
-    let n_eligible_slots = match include.ratio {
-        Some(r) => ((r * linked_batch.num_rows() as f64).round() as usize)
-            .min(linked_batch.num_rows()).max(1),
-        None => linked_batch.num_rows(),
-    };
+    // Eligible linked rows: apply ratio to determine the eligible prefix, then filter
+    // by segment constraints to restrict to rows matching this segment's field constraints.
+    let n_eligible_pre_filter = eligible_linked_rows(linked_batch.num_rows(), include.ratio);
+    let eligible_linked = linked_batch.slice(0, n_eligible_pre_filter);
+    let (filtered_linked, surviving_indices) =
+        filter_batch_by_constraints(&eligible_linked, segment_constraints)?;
+    let n_eligible = filtered_linked.num_rows();
 
-    let n = staging_batch.num_rows();
-    let counts: Vec<usize> = (0..n).map(|_| sample_count(cardinality)).collect();
+    let n = slot_count;
+    // If no linked rows survive constraint filtering, produce an empty witness (all slots
+    // get empty lists). Otherwise sample normally.
+    let counts: Vec<usize> = if n_eligible == 0 {
+        vec![0; n]
+    } else {
+        (0..n).map(|_| {
+            let m_n = sample_count(cardinality);
+            // Clamp to n_eligible for without-replacement so Uniform max values that
+            // exceed the (constraint-filtered) eligible size don't panic the sampler.
+            if include.reinforcement == Some(0.0) { m_n.min(n_eligible) } else { m_n }
+        }).collect()
+    };
     let total: usize = counts.iter().sum();
 
+    // Staging slot indices are ABSOLUTE (relative to the full staging batch), not relative
+    // to this segment — so AssembleFromWitness can fold them into the correct list positions.
     let staging_idxs: Vec<u32> = counts.iter().enumerate()
-        .flat_map(|(i, &c)| std::iter::repeat(i as u32).take(c))
+        .flat_map(|(i, &c)| std::iter::repeat((slot_start + i) as u32).take(c))
         .collect();
-    // slot_assignments[k]: which linked row staging slot staging_idxs[k] drew.
+    // slot_assignments[k]: index into `filtered_linked` for draw k.
     // Sampling mode controlled by include.reinforcement:
     //   None / 1.0 → uniform with-replacement
     //   0.0        → Fisher-Yates without-replacement per staging row
@@ -517,50 +701,28 @@ fn execute_witness(
         let r = include.reinforcement;
         if r == Some(0.0) {
             counts.iter().flat_map(|&m_n| {
-                sample_pool_without_replacement(n_eligible_slots, m_n)
+                sample_linked_without_replacement(n_eligible, m_n)
             }).collect::<Vec<u32>>().into()
         } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
             counts.iter().flat_map(|&m_n| {
-                sample_pool_weighted(n_eligible_slots, m_n, reinf)
+                sample_linked_weighted(n_eligible, m_n, reinf)
             }).collect::<Vec<u32>>().into()
         } else {
             (0..total)
-                .map(|_| (0u64..n_eligible_slots as u64).fake::<u64>() as u32)
+                .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
                 .collect::<Vec<u32>>()
                 .into()
         }
     };
 
     // --- Phase 2: deduplicate draws by linked row ---
-    // Build linked_idx → Vec<staging_slot> using BTreeMap for deterministic order.
-    let mut draw_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for k in 0..total {
-        draw_map
-            .entry(slot_assignments.value(k))
-            .or_default()
-            .push(staging_idxs[k]);
-    }
-    let unique_linked_idxs: Vec<u32> = draw_map.keys().copied().collect();
+    let (unique_linked_idxs, staging_refs_array) =
+        build_witness_dedup(&slot_assignments, &staging_idxs, &surviving_indices, total);
     let n_witness = unique_linked_idxs.len();
-
-    // Build _staging_refs ListArray: one list entry per unique linked row.
-    let mut refs_offsets: Vec<i32> = vec![0];
-    let mut refs_values: Vec<u32> = Vec::new();
-    for &linked_idx in &unique_linked_idxs {
-        let slots = &draw_map[&linked_idx];
-        refs_values.extend_from_slice(slots);
-        refs_offsets.push(refs_values.len() as i32);
-    }
-    let staging_refs_array = ListArray::new(
-        Arc::new(ArrowField::new("item", DataType::UInt32, false)),
-        OffsetBuffer::new(ScalarBuffer::from(refs_offsets)),
-        Arc::new(UInt32Array::from(refs_values)),
-        None,
-    );
     let unique_linked_arr = UInt32Array::from(unique_linked_idxs.clone());
 
     // --- Phase 3: build witness columns (one value per unique linked row) ---
-    // linked-scoped refs: take from linked batch by unique linked index.
+    // linked-scoped refs: take from eligible_linked by unique linked index.
     // outer-scoped refs: skip — resolved from staging at assembly time.
     // plain fields: generate once per unique linked row.
     let mut arrow_fields: Vec<ArrowField> = Vec::new();
@@ -573,9 +735,9 @@ fn execute_witness(
                 .unwrap_or(false);
             if is_linked_scoped {
                 let (_, target_col) = split_ref(ref_str).unwrap();
-                let idx = linked_batch.schema().index_of(target_col)
+                let idx = eligible_linked.schema().index_of(target_col)
                     .map_err(|_| anyhow!("column '{target_col}' not found in linked-slot batch"))?;
-                take(linked_batch.column(idx).as_ref(), &unique_linked_arr, None)?
+                take(eligible_linked.column(idx).as_ref(), &unique_linked_arr, None)?
             } else {
                 // Outer-scoped: not stored in witness; skip.
                 continue;
@@ -656,7 +818,7 @@ fn unnest_staging_refs(
 async fn execute_assemble_from_witness(
     staging_path: &PathBuf,
     dataset: &SyntheticDataset,
-    witness_specs: &[(String, PathBuf, Option<String>)],
+    witness_specs: &[(String, Vec<PathBuf>, Option<String>)],
     computed: &mut HashMap<PathBuf, RecordBatch>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
@@ -664,10 +826,17 @@ async fn execute_assemble_from_witness(
         anyhow!("assemble from witness '{}': staging batch not yet computed", dataset.name)
     })?.clone();
 
-    for (field_name, witness_key, project_col) in witness_specs {
-        let witness = computed.get(witness_key).ok_or_else(|| {
-            anyhow!("assemble from witness '{}': witness for '{field_name}' not yet computed", dataset.name)
-        })?.clone();
+    for (field_name, witness_keys, project_col) in witness_specs {
+        // Collect and union all per-segment witness batches for this field.
+        let witness_batches: Vec<RecordBatch> = witness_keys.iter()
+            .map(|key| computed.get(key).cloned().ok_or_else(|| {
+                anyhow!("assemble from witness '{}': witness segment for '{field_name}' not computed", dataset.name)
+            }))
+            .collect::<Result<Vec<_>>>()?;
+        let witness_schema = witness_batches.first()
+            .ok_or_else(|| anyhow!("assemble from witness '{}': no witness batches for '{field_name}'", dataset.name))?
+            .schema();
+        let witness = concat_batches(&witness_schema, &witness_batches)?;
 
         let staging_n = batch.num_rows();
 
@@ -802,6 +971,7 @@ async fn execute_accumulate_to_linked(
     reducer: &Reducer,
     default_val: &YamlValue,
     computed: &mut HashMap<PathBuf, RecordBatch>,
+    accumulated_fields: &mut HashSet<(PathBuf, String)>,
 ) -> Result<()> {
     let raw_source = computed.get(source_path).ok_or_else(|| {
         anyhow!("AccumulateToLinked: source batch '{}' not computed", source_path.display())
@@ -854,7 +1024,7 @@ async fn execute_accumulate_to_linked(
         Reducer::Sum       => df_sum(col(source_field)).alias("__agg"),
         Reducer::Max       => df_max(col(source_field)).alias("__agg"),
         Reducer::Min       => df_min(col(source_field)).alias("__agg"),
-        Reducer::TakeFirst => df_first_value(col(source_field), vec![]).alias("__agg"),
+        Reducer::TakeOne   => df_first_value(col(source_field), vec![]).alias("__agg"),
     };
     let ctx = SessionContext::new();
     ctx.register_batch("src", source_batch)?;
@@ -880,24 +1050,40 @@ async fn execute_accumulate_to_linked(
     // Build the replacement column.
     let new_col: ArrayRef = match reducer {
         Reducer::Collect => {
-            // Collect: build a ListArray; unmapped linked rows get an empty list.
+            // Collect: build a ListArray. For the FIRST accumulation into a (linked_path,
+            // linked_field) pair, discard any generator-produced initial values and use an
+            // empty fallback for unmapped rows. For SUBSEQUENT calls (multi-segment staging),
+            // carry forward the already-accumulated values so items from all segments are
+            // combined rather than the later call overwriting the earlier one.
+            let is_first = accumulated_fields.insert((linked_path.clone(), linked_field.to_string()));
             let element_type = match agg_values_col.data_type() {
                 DataType::List(f) => f.data_type().clone(),
                 other => bail!("AccumulateToLinked: expected List from array_agg, got {other:?}"),
             };
             let agg_list = agg_values_col.as_any().downcast_ref::<ListArray>()
                 .ok_or_else(|| anyhow!("AccumulateToLinked: __agg column is not a ListArray"))?;
+            // For subsequent calls, carry forward existing accumulated items.
+            let existing_list = if !is_first {
+                existing_linked_col.as_any().downcast_ref::<ListArray>()
+            } else {
+                None
+            };
             let item_field = Arc::new(ArrowField::new("item", element_type.clone(), true));
             let mut offsets: Vec<i32> = vec![0];
             let mut child_slices: Vec<ArrayRef> = Vec::new();
             for linked_row in 0..linked_n {
+                let mut row_len = 0i32;
+                if let Some(existing) = existing_list {
+                    let ex = existing.value(linked_row);
+                    row_len += ex.len() as i32;
+                    child_slices.push(ex);
+                }
                 if let Some(&agg_row) = idx_map.get(&(linked_row as u32)) {
                     let slice = agg_list.value(agg_row);
-                    offsets.push(offsets.last().unwrap() + slice.len() as i32);
+                    row_len += slice.len() as i32;
                     child_slices.push(slice);
-                } else {
-                    offsets.push(*offsets.last().unwrap());
                 }
+                offsets.push(offsets.last().unwrap() + row_len);
             }
             let child_array: ArrayRef = if child_slices.is_empty() {
                 new_empty_array(&element_type)
@@ -909,21 +1095,28 @@ async fn execute_accumulate_to_linked(
             Arc::new(ListArray::new(item_field, offsets_buf, child_array, None))
         }
         _ => {
-            // Scalar reducers (Sum, Max, Min, TakeFirst): mapped linked rows get the aggregated
-            // value; unmapped linked rows get the field's declared `default_val`.
-            //
-            // Implementation: concatenate [agg_col, default_col] into a combined array, then
-            // `take` with indices that point into agg_col for mapped rows and into default_col
-            // for unmapped rows.
-            let agg_n = agg_batch.num_rows();
-            let take_indices: UInt32Array = (0..linked_n as u32).map(|linked_row| {
-                idx_map.get(&linked_row)
-                    .map(|&agg_row| agg_row as u32)
-                    .unwrap_or(agg_n as u32 + linked_row)
-            }).collect::<Vec<u32>>().into();
-            let default_col = yaml_value_to_array(default_val, existing_linked_col.data_type(), linked_n);
-            let combined = concat(&[agg_values_col.as_ref(), default_col.as_ref()])?;
-            take(combined.as_ref(), &take_indices, None)?
+            // Scalar reducers (Sum, Max, Min, TakeOne).
+            // First accumulation: mapped rows get the aggregated value; unmapped rows get the
+            // field's declared `default_val`.
+            // Subsequent accumulations (multi-segment staging): commutative reducers (Sum/Max/Min)
+            // combine element-wise with the existing value; TakeOne keeps the existing value
+            // unchanged (= "take whichever segment captured it first").
+            let is_first = accumulated_fields.insert((linked_path.clone(), linked_field.to_string()));
+            if !is_first && matches!(reducer, Reducer::TakeOne) {
+                existing_linked_col.clone()
+            } else if !is_first {
+                accumulate_scalar_cumulative(reducer, &existing_linked_col, &agg_values_col, &idx_map, linked_n)?
+            } else {
+                let agg_n = agg_batch.num_rows();
+                let take_indices: UInt32Array = (0..linked_n as u32).map(|linked_row| {
+                    idx_map.get(&linked_row)
+                        .map(|&agg_row| agg_row as u32)
+                        .unwrap_or(agg_n as u32 + linked_row)
+                }).collect::<Vec<u32>>().into();
+                let default_col = yaml_value_to_array(default_val, existing_linked_col.data_type(), linked_n);
+                let combined = concat(&[agg_values_col.as_ref(), default_col.as_ref()])?;
+                take(combined.as_ref(), &take_indices, None)?
+            }
         }
     };
 
@@ -934,6 +1127,68 @@ async fn execute_accumulate_to_linked(
     columns[linked_col_idx] = new_col;
     computed.insert(linked_path.clone(), RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?);
     Ok(())
+}
+
+/// Element-wise combination of an existing linked-field column with new aggregated values,
+/// for commutative scalar reducers (Sum, Max, Min) on a subsequent `AccumulateToLinked` call.
+///
+/// For each linked row: if that row has a new aggregated value (present in `idx_map`), combine
+/// the existing value with the new one using `reducer`; otherwise keep the existing value
+/// unchanged. This preserves contributions from earlier segments when the same linked field is
+/// accumulated across multiple Bernoulli segments.
+fn accumulate_scalar_cumulative(
+    reducer: &Reducer,
+    existing_col: &ArrayRef,
+    agg_values_col: &ArrayRef,
+    idx_map: &HashMap<u32, usize>,
+    linked_n: usize,
+) -> Result<ArrayRef> {
+    match existing_col.data_type() {
+        DataType::Float64 => {
+            let existing = existing_col.as_any().downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: existing column is not Float64"))?;
+            let agg = agg_values_col.as_any().downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: agg column is not Float64"))?;
+            let result: Vec<f64> = (0..linked_n as u32).map(|linked_row| {
+                let ev = if existing.is_null(linked_row as usize) { 0.0 } else { existing.value(linked_row as usize) };
+                if let Some(&agg_row) = idx_map.get(&linked_row) {
+                    let av = if agg.is_null(agg_row) { 0.0 } else { agg.value(agg_row) };
+                    match reducer {
+                        Reducer::Sum => ev + av,
+                        Reducer::Max => f64::max(ev, av),
+                        Reducer::Min => f64::min(ev, av),
+                        _ => ev,
+                    }
+                } else {
+                    ev
+                }
+            }).collect();
+            Ok(Arc::new(Float64Array::from(result)))
+        }
+        DataType::Utf8 => {
+            let existing = existing_col.as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: existing column is not Utf8"))?;
+            let agg = agg_values_col.as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: agg column is not Utf8"))?;
+            let mut builder = StringBuilder::new();
+            for linked_row in 0..linked_n as u32 {
+                let ev = if existing.is_null(linked_row as usize) { "" } else { existing.value(linked_row as usize) };
+                if let Some(&agg_row) = idx_map.get(&linked_row) {
+                    let av = if agg.is_null(agg_row) { "" } else { agg.value(agg_row) };
+                    let chosen = match reducer {
+                        Reducer::Max => if av > ev { av } else { ev },
+                        Reducer::Min => if av < ev { av } else { ev },
+                        _ => ev,
+                    };
+                    builder.append_value(chosen);
+                } else {
+                    builder.append_value(ev);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        other => bail!("accumulate_scalar_cumulative: unsupported data type {other:?} for reducer"),
+    }
 }
 
 /// Emit the batch at `path` from `computed` to an output file.
@@ -966,7 +1221,7 @@ fn generate_fresh_batch(
 
 /// Generate M_n rows per parent-row slot, tagging each with `_slot_idx = slot_offset + i`.
 /// The canonical (one-row-per-slot) batch is handled separately by `grow_parent_from_children`;
-/// this function produces the expanded output batch for the sibling's own output file.
+/// this function produces the expanded output batch for the lower cover member's output file.
 fn generate_expanded_batch(
     fields: &Schema,
     slot_count: usize,
@@ -993,29 +1248,29 @@ fn generate_expanded_batch(
 }
 
 // ---------------------------------------------------------------------------
-// Pool sampling helpers
+// Linked-dataset sampling helpers
 // ---------------------------------------------------------------------------
 
-/// Sample `count` indices from `[0, pool_size)` without replacement (Fisher-Yates).
+/// Sample `count` indices from `[0, linked_n)` without replacement (Fisher-Yates).
 ///
-/// Panics if `count > pool_size` — callers must enforce the planning-time check.
-fn sample_pool_without_replacement(pool_size: usize, count: usize) -> Vec<u32> {
-    assert!(count <= pool_size, "sample_pool_without_replacement: count {count} > pool_size {pool_size}");
-    let mut indices: Vec<u32> = (0..pool_size as u32).collect();
+/// Panics if `count > linked_n` — callers must enforce the planning-time check.
+fn sample_linked_without_replacement(linked_n: usize, count: usize) -> Vec<u32> {
+    assert!(count <= linked_n, "sample_linked_without_replacement: count {count} > linked_n {linked_n}");
+    let mut indices: Vec<u32> = (0..linked_n as u32).collect();
     for i in 0..count {
-        let j = (i as u64..pool_size as u64).fake::<u64>() as usize;
+        let j = (i as u64..linked_n as u64).fake::<u64>() as usize;
         indices.swap(i, j);
     }
     indices[..count].to_vec()
 }
 
-/// Sample `count` indices from `[0, pool_size)` with Polya-urn weighting.
+/// Sample `count` indices from `[0, linked_n)` with Polya-urn weighting.
 ///
 /// Each initially-uniform weight is multiplied by `reinforcement` after selection,
 /// making previously-selected indices more likely to be selected again.
 /// `reinforcement > 1.0` produces clumping; `reinforcement = 1.0` degenerates to uniform.
-fn sample_pool_weighted(pool_size: usize, count: usize, reinforcement: f64) -> Vec<u32> {
-    let mut weights: Vec<f64> = vec![1.0; pool_size];
+fn sample_linked_weighted(linked_n: usize, count: usize, reinforcement: f64) -> Vec<u32> {
+    let mut weights: Vec<f64> = vec![1.0; linked_n];
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
         let total: f64 = weights.iter().sum();
@@ -1032,7 +1287,7 @@ fn sample_pool_weighted(pool_size: usize, count: usize, reinforcement: f64) -> V
 }
 
 /// Strip `_slot_idx` from a batch, leaving data columns intact.
-/// Used to remove the sentinel before emitting sibling output while retaining it in `computed`.
+/// Used to remove the sentinel before emitting lower cover member output while retaining it in `computed`.
 fn strip_slot_idx(batch: RecordBatch) -> RecordBatch {
     strip_sentinel(batch, "_slot_idx")
 }
@@ -1076,16 +1331,13 @@ fn inject_linked_idx(
         let Some(linked_path) = resolve_include(path, &link.file) else { continue };
         let Some(linked_batch) = computed.get(&linked_path) else { continue };
         let n_linked = linked_batch.num_rows();
-        let n_eligible = match link.ratio {
-            Some(r) => ((r * n_linked as f64).round() as usize).clamp(1, n_linked),
-            None    => n_linked,
-        };
+        let n_eligible = eligible_linked_rows(n_linked, link.ratio);
         let n_rows = batch.num_rows();
         let r = link.reinforcement;
         let assignments: Vec<u32> = if r == Some(0.0) {
-            sample_pool_without_replacement(n_eligible, n_rows)
+            sample_linked_without_replacement(n_eligible, n_rows)
         } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
-            sample_pool_weighted(n_eligible, n_rows, reinf)
+            sample_linked_weighted(n_eligible, n_rows, reinf)
         } else {
             (0..n_rows)
                 .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
@@ -1097,20 +1349,20 @@ fn inject_linked_idx(
     Ok(batch.clone())
 }
 
-fn generate_prefilled_batch(
+fn generate_with_inherited(
     schema: &Schema,
     rows: usize,
-    prefills: &HashMap<String, Vec<ArrayRef>>,
+    inherited: &HashMap<String, Vec<ArrayRef>>,
 ) -> Result<RecordBatch> {
-    generate_batch(schema, rows, prefills, &HashMap::new())
+    generate_batch(schema, rows, inherited, &HashMap::new())
 }
 
 /// Generate a batch for `schema`. Fields in `overrides` have their constraints
-/// replaced before generation; fields in `prefills` prepend pre-computed values.
+/// replaced before generation; fields in `inherited` prepend pre-computed values.
 fn generate_batch(
     schema: &Schema,
     rows: usize,
-    prefills: &HashMap<String, Vec<ArrayRef>>,
+    inherited: &HashMap<String, Vec<ArrayRef>>,
     overrides: &HashMap<String, FieldConstraints>,
 ) -> Result<RecordBatch> {
     let arrow_schema = Arc::new(schema_to_arrow(schema));
@@ -1118,7 +1370,7 @@ fn generate_batch(
         .iter()
         .filter(|f| f.expression.is_none() && !f.is_list_link())
         .map(|f| {
-            let prefix = prefills.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
+            let prefix = inherited.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
             let effective = overrides.get(&f.name).map(|fc| apply_constraints(f, fc));
             generate_column(effective.as_ref().unwrap_or(f), rows, prefix)
         })
@@ -1252,8 +1504,8 @@ async fn evaluate_expressions(
 }
 
 /// Remove columns marked `hidden` from a batch before writing output.
-/// The full batch (including hidden columns) is kept in `computed` for prefill
-/// wiring; only the filtered batch is written to output.
+/// The full batch (including hidden columns) is kept in `computed` for inherited
+/// field wiring; only the filtered batch is written to output.
 async fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordBatch> {
     if !fields.iter().any(|f| f.hidden) {
         return Ok(batch);

@@ -1,3 +1,6 @@
+//! Execution plan builder. `build_plan` resolves row counts, lower cover groups,
+//! inherited-field wiring, and collect targets into a flat list of `ExecutionStep`s
+//! that `executor::execute` interprets in order.
 use anyhow::Result;
 use petgraph::visit::Topo;
 use std::collections::{HashMap, HashSet};
@@ -5,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use serde_yaml::Value as YamlValue;
 
+use crate::constraints::FieldConstraints;
 use crate::segment::{plan_segments, LowerCoverMember, Segment};
 use crate::graph::DatasetGraph;
-use crate::models::{expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Locale, Reducer, RefBinding, Schema, SyntheticDataset, VariantSchema};
+use crate::models::{eligible_linked_rows, expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Locale, Reducer, RefBinding, Schema, SyntheticDataset, VariantSchema};
 use crate::rewrite::apply_locale_to_schema;
 
 const DEFAULT_ROWS: usize = 100;
@@ -28,14 +32,14 @@ pub struct InheritedField {
 /// A single unit of execution work.
 #[derive(Debug)]
 pub enum ExecutionStep {
-    /// Generate one dataset, optionally pre-filling ref columns from already-computed batches.
+    /// Generate one dataset, optionally inheriting ref columns from already-computed batches.
     /// Evaluates expressions and emits immediately, unless `defer_emit` is true (collect-target
     /// deferral: expressions are evaluated but the file write is deferred to `EmitDataset`).
     GenerateDataset {
         path: PathBuf,
         dataset: Arc<SyntheticDataset>,
         rows: usize,
-        prefills: Vec<InheritedField>,
+        inherited: Vec<InheritedField>,
         defer_emit: bool,
     },
     /// Staging node: generates scalar (non-list) fields only. No expression evaluation, no emit.
@@ -44,7 +48,7 @@ pub enum ExecutionStep {
         path: PathBuf,
         dataset: Arc<SyntheticDataset>,
         rows: usize,
-        prefills: Vec<InheritedField>,
+        inherited: Vec<InheritedField>,
     },
     /// Generate a segmented parent and fan row segments out to lower cover members.
     /// Evaluates parent expressions and emits immediately, unless `defer_emit` is true
@@ -64,19 +68,18 @@ pub enum ExecutionStep {
         segments: Vec<Segment>,
         members: Vec<LowerCoverMember>,
     },
-    /// Generate the witness batch for one list-link field.
+    /// Generate the witness batch for one (list-link field, segment) pair.
     ///
-    /// Each row of the resulting batch is one **atom**: a single (staging-slot, linked-row) pair.
+    /// Covers staging slots `slot_start..slot_start+slot_count` of the staging batch.
+    /// `segment_constraints` filters the eligible linked rows to those matching this
+    /// segment's field constraints before sampling.
+    ///
     /// The batch is stored in `computed[witness_key]` and contains:
-    ///   - `_slot_idx: UInt32` — which staging slot this atom belongs to
-    ///   - `_linked_idx: UInt32` — which linked-dataset row this atom was assigned to
-    ///   - one column per `inner_fields` field, resolved as follows:
-    ///       - linked-dataset refs: the pushed-down linked-row solution for `_linked_idx`
-    ///       - outer-scoped refs: the staging row value for `_slot_idx`
-    ///       - plain fields: generated fresh per atom
-    ///
-    /// `linked_path` is the path of the pre-solved linked-dataset batch (one row per eligible
-    /// linked row). Atoms sharing the same `_linked_idx` carry identical linked-dataset values.
+    ///   - `_linked_idx: UInt32` — which linked-batch row this witness row represents
+    ///   - `_staging_refs: List<UInt32>` — all staging slot indices that drew this linked row
+    ///   - linked-scoped refs: value taken from the linked batch
+    ///   - plain fields: generated once per unique linked row
+    ///   - outer-scoped refs: not stored; resolved from the staging batch at assembly time
     GenerateWitness {
         witness_key: PathBuf,
         staging_path: PathBuf,
@@ -85,18 +88,24 @@ pub enum ExecutionStep {
         include: Include,
         cardinality: CountSpec,
         linked_path: PathBuf,
+        /// Index of the first staging slot covered by this witness (absolute index in staging batch).
+        slot_start: usize,
+        /// Number of staging slots covered by this witness.
+        slot_count: usize,
+        /// Field constraints for this segment — used to filter eligible linked rows.
+        segment_constraints: HashMap<String, FieldConstraints>,
     },
     /// Assemble list-link columns into the staging batch and emit.
     ///
-    /// Reads the scalar staging batch and each witness batch from `computed`, builds one
-    /// `ListArray` per spec, appends them to the staging batch, evaluates expressions,
-    /// filters hidden columns, and writes output.
+    /// Reads the scalar staging batch and each witness batch from `computed`, unions the
+    /// per-segment witnesses for each field, builds one `ListArray` per spec, appends them
+    /// to the staging batch, evaluates expressions, filters hidden columns, and writes output.
     AssembleFromWitness {
         staging_path: PathBuf,
         dataset: Arc<SyntheticDataset>,
-        /// `(list_field_name, witness_key, project_col)` — `project_col` is `Some(col_name)`
-        /// when `content.project` is set, causing scalar-list assembly for that field.
-        witness_specs: Vec<(String, PathBuf, Option<String>)>,
+        /// `(list_field_name, witness_keys, project_col)` — one witness key per segment.
+        /// `project_col` is `Some(col_name)` when `content.project` is set.
+        witness_specs: Vec<(String, Vec<PathBuf>, Option<String>)>,
     },
     /// Accumulate values from a source batch into a linked dataset's field in `computed`.
     ///
@@ -211,9 +220,9 @@ fn expand_variant_dataset(
     }
 }
 
-/// Validate Case 2 v1 restriction: a pool dataset targeted by a nested-include collect binding
-/// must not be jointly segmented with another (non-witness-source) lower cover member. When it is, the correct
-/// approach is a top-level junction dataset (Case 1).
+/// Validate Case 2 v1 restriction: a linked dataset targeted by a nested-include collect
+/// binding must not be jointly segmented with another (non-witness-source) lower cover
+/// member. When it is, the correct approach is a top-level junction dataset (Case 1).
 fn check_collect_segmentation_restrictions(
     datasets: &HashMap<PathBuf, SyntheticDataset>,
     lower_cover_groups: &HashMap<PathBuf, Vec<LowerCoverMember>>,
@@ -241,83 +250,96 @@ fn check_collect_segmentation_restrictions(
     Ok(())
 }
 
-/// Return the maximum number of items a `CountSpec` can produce, or `None` if unbounded.
-fn max_cardinality_bound(spec: &CountSpec) -> Option<usize> {
-    match spec {
-        CountSpec::Fixed(n)            => Some(*n),
-        CountSpec::Uniform { max, .. } => Some(*max),
-        CountSpec::Normal  { .. }      => None,
-    }
-}
 
-/// Planning-time feasibility check for `reinforcement: 0` (without-replacement sampling).
+/// Planning-time feasibility check for list-link cardinality against the eligible
+/// linked-dataset size.
 ///
-/// Without-replacement requires that the number of items drawn per outer row (`M_n`) never
-/// exceeds the number of eligible pool slots (`n_eligible`). Because counts are stochastic,
-/// we check the maximum possible `M_n`:
+/// Two classes of failure are detected:
 ///
-/// - For nested-include fields: `max_cardinality_bound(cardinality) ≤ n_eligible_slots`.
-/// - For junction links: `junction_rows ≤ n_eligible_pool_rows`.
+/// 1. **Empty linked dataset** (all reinforcement modes): `n_eligible == 0` means no rows
+///    can ever be drawn; sampling would produce empty lists silently or panic.
+/// 2. **Without-replacement infeasibility** (`reinforcement: 0` only): drawing N items
+///    without replacement from a linked dataset with fewer than N eligible rows is impossible.
 ///
-/// `Normal` cardinality has no finite upper bound, so without-replacement is disallowed for
-/// it unless the pool is unbounded (impossible in practice). We reject it as a planning error.
-fn check_reinforcement_zero_feasibility(
+/// The **eligible linked-dataset size** (`n_eligible`) is the ratio-filtered row count
+/// computed at plan time: `(ratio * linked_rows).round().max(1).min(linked_rows)`.
+/// Segment-constraint-filtered sizes are not available at plan time.
+///
+/// For `Uniform { max }` with `reinforcement: 0`: if `max > n_eligible` but `min ≤ n_eligible`,
+/// no error is raised here — the runtime `execute_witness` caps the sampled count to
+/// `n_eligible` before calling `sample_linked_without_replacement`.
+fn check_cardinality_feasibility(
     datasets: &HashMap<PathBuf, SyntheticDataset>,
     row_counts: &HashMap<PathBuf, usize>,
 ) -> Result<()> {
     for (path, dataset) in datasets {
-        // Nested-include fields with reinforcement: 0.
+        // Nested-include (list-link) fields.
         for field in &dataset.data {
             let Some(content) = &field.content else { continue };
             let Some(from_ref) = &content.from else { continue };
             let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else { continue };
-            if link.reinforcement != Some(0.0) { continue; }
             let Some(linked_path) = resolve_include(path, &link.file) else { continue };
-            let n_eligible = {
-                let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
-                match link.ratio {
-                    Some(r) => ((r * linked_rows as f64).round() as usize).max(1).min(linked_rows),
-                    None    => linked_rows,
+            let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
+            let n_eligible = eligible_linked_rows(linked_rows, link.ratio);
+            // Phase 1: empty linked dataset (all reinforcement modes).
+            if n_eligible == 0 {
+                anyhow::bail!(
+                    "dataset '{}' field '{}': linked dataset '{}' has 0 eligible rows \
+                     (after applying ratio); cannot draw any items",
+                    dataset.name, field.name, link.reference
+                );
+            }
+            // Phase 2: without-replacement infeasibility.
+            if link.reinforcement == Some(0.0) {
+                let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
+                match &cardinality {
+                    CountSpec::Normal { .. } => anyhow::bail!(
+                        "dataset '{}' field '{}': `reinforcement: 0` (without-replacement) \
+                         is not compatible with `Normal` cardinality — the count is unbounded",
+                        dataset.name, field.name
+                    ),
+                    CountSpec::Fixed(n) if *n > n_eligible => anyhow::bail!(
+                        "dataset '{}' field '{}': `reinforcement: 0` requires cardinality ≤ \
+                         eligible linked-dataset size ({n_eligible}), but cardinality is {n}",
+                        dataset.name, field.name
+                    ),
+                    CountSpec::Uniform { min, .. } if *min > n_eligible => anyhow::bail!(
+                        "dataset '{}' field '{}': `reinforcement: 0` requires min cardinality ≤ \
+                         eligible linked-dataset size ({n_eligible}), but min is {min}",
+                        dataset.name, field.name
+                    ),
+                    _ => {}
                 }
-            };
-            let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
-            match max_cardinality_bound(&cardinality) {
-                None => anyhow::bail!(
-                    "dataset '{}' field '{}': `reinforcement: 0` (without-replacement) \
-                     is not compatible with `Normal` cardinality — the count is unbounded",
-                    dataset.name, field.name
-                ),
-                Some(max_m) if max_m > n_eligible => anyhow::bail!(
-                    "dataset '{}' field '{}': `reinforcement: 0` requires cardinality ≤ \
-                     eligible pool size ({n_eligible}), but max cardinality is {max_m}",
-                    dataset.name, field.name
-                ),
-                _ => {}
             }
         }
 
-        // Junction links with reinforcement: 0.
+        // Junction links.
         let list_link_refs: HashSet<&str> = dataset.data.iter()
             .filter_map(|f| f.content.as_ref()?.from.as_deref())
             .collect();
         for link in &dataset.links {
             if list_link_refs.contains(link.reference.as_str()) { continue; }
-            if link.reinforcement != Some(0.0) { continue; }
             let Some(linked_path) = resolve_include(path, &link.file) else { continue };
-            let n_eligible = {
-                let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
-                match link.ratio {
-                    Some(r) => ((r * linked_rows as f64).round() as usize).max(1).min(linked_rows),
-                    None    => linked_rows,
-                }
-            };
-            let junction_rows = *row_counts.get(path).unwrap_or(&0);
-            if junction_rows > n_eligible {
+            let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
+            let n_eligible = eligible_linked_rows(linked_rows, link.ratio);
+            // Phase 1: empty linked dataset (all reinforcement modes).
+            if n_eligible == 0 {
                 anyhow::bail!(
-                    "dataset '{}': `reinforcement: 0` on link '{}' requires junction rows \
-                     ({junction_rows}) ≤ eligible pool rows ({n_eligible})",
+                    "dataset '{}': link '{}' targets a linked dataset with 0 eligible rows \
+                     (after applying ratio); cannot sample any junction rows",
                     dataset.name, link.reference
                 );
+            }
+            // Phase 2: without-replacement infeasibility.
+            if link.reinforcement == Some(0.0) {
+                let junction_rows = *row_counts.get(path).unwrap_or(&0);
+                if junction_rows > n_eligible {
+                    anyhow::bail!(
+                        "dataset '{}': `reinforcement: 0` on link '{}' requires junction rows \
+                         ({junction_rows}) ≤ eligible linked-dataset rows ({n_eligible})",
+                        dataset.name, link.reference
+                    );
+                }
             }
         }
     }
@@ -344,8 +366,8 @@ fn scan_collect_targets(datasets: &HashMap<PathBuf, SyntheticDataset>) -> HashSe
                 if content.from.is_some() {
                     for cf in &content.item.fields {
                         for binding in cf.collect_bindings() {
-                            if let Some(pool_path) = resolve_collect_bind_target(path, dataset, binding) {
-                                targets.insert(pool_path);
+                            if let Some(linked_path) = resolve_collect_bind_target(path, dataset, binding) {
+                                targets.insert(linked_path);
                             }
                         }
                     }
@@ -356,7 +378,7 @@ fn scan_collect_targets(datasets: &HashMap<PathBuf, SyntheticDataset>) -> HashSe
     targets
 }
 
-/// Resolve the pool dataset path for a single collect binding.
+/// Resolve the linked dataset path for a single collect binding.
 fn resolve_collect_bind_target(
     dataset_path: &Path,
     dataset: &SyntheticDataset,
@@ -399,7 +421,7 @@ pub fn build_plan(
         .collect();
     let collect_targets = scan_collect_targets(datasets);
     check_collect_segmentation_restrictions(datasets, &lower_cover_groups)?;
-    check_reinforcement_zero_feasibility(datasets, &row_counts)?;
+    check_cardinality_feasibility(datasets, &row_counts)?;
 
     let mut topo = Topo::new(&dag.graph);
     let mut steps: Vec<ExecutionStep> = Vec::new();
@@ -453,8 +475,9 @@ pub fn build_plan(
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
                     let (s_vpath, s_c) = (vpath.clone(), c.clone());
+                    let segs_for_witness = segments.clone();
                     let (s_segs, s_mbrs) = (segments.clone(), members_with_output.clone());
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets,
+                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &segs_for_witness,
                         || ExecutionStep::GenerateStagingLowerCoverGroup {
                             parent_path: s_vpath, parent: s_c,
                             segments: s_segs, members: s_mbrs,
@@ -469,14 +492,19 @@ pub fn build_plan(
                     let vpath = virtual_path.clone();
                     let c = Arc::new(concrete.clone());
                     let (s_vpath, s_c) = (vpath.clone(), c.clone());
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets,
+                    let single_seg = vec![Segment {
+                        members: vec![],
+                        rows: variant_rows,
+                        field_constraints: HashMap::new(),
+                    }];
+                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &single_seg,
                         || ExecutionStep::GenerateStagingNode {
                             path: s_vpath, dataset: s_c,
-                            rows: variant_rows, prefills: vec![],
+                            rows: variant_rows, inherited: vec![],
                         },
                         |_| ExecutionStep::GenerateDataset {
                             path: vpath, dataset: c,
-                            rows: variant_rows, prefills: vec![], defer_emit: false,
+                            rows: variant_rows, inherited: vec![], defer_emit: false,
                         },
                     );
                 }
@@ -495,8 +523,9 @@ pub fn build_plan(
             let mbrs = members.clone();
             let is_collect_target = collect_targets.contains(path);
             let (s_p, s_d) = (p.clone(), d.clone());
+            let segs_for_witness = segments.clone();
             let (s_segs, s_mbrs) = (segments.clone(), mbrs.clone());
-            push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets,
+            push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &segs_for_witness,
                 || ExecutionStep::GenerateStagingLowerCoverGroup {
                     parent_path: s_p, parent: s_d,
                     segments: s_segs, members: s_mbrs,
@@ -517,17 +546,22 @@ pub fn build_plan(
         track_shared(dataset, &mut shared_outputs, &mut seen_shared);
         let p = path.clone();
         let d = Arc::new(dataset.clone());
-        let prefills = compute_prefills(path, datasets, &lower_cover_set);
+        let inherited = compute_lower_cover_inherited(path, datasets, &lower_cover_set);
         let rows = row_counts[path];
         let is_collect_target = collect_targets.contains(path);
         let (s_p, s_d) = (p.clone(), d.clone());
-        let s_prefills = prefills.clone();
-        push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets,
+        let s_inherited = inherited.clone();
+        let single_seg = vec![Segment {
+            members: vec![],
+            rows,
+            field_constraints: HashMap::new(),
+        }];
+        push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &single_seg,
             || ExecutionStep::GenerateStagingNode {
-                path: s_p, dataset: s_d, rows, prefills: s_prefills,
+                path: s_p, dataset: s_d, rows, inherited: s_inherited,
             },
             |defer| ExecutionStep::GenerateDataset {
-                path: p, dataset: d, rows, prefills, defer_emit: defer,
+                path: p, dataset: d, rows, inherited, defer_emit: defer,
             },
         );
         emit_top_level_collect_steps(dataset, path, datasets, &mut steps);
@@ -537,31 +571,67 @@ pub fn build_plan(
         steps.push(ExecutionStep::WriteSharedOutput { output_file, format });
     }
 
+    // Verify that every GenerateWitness step is preceded by its staging counterpart.
+    // The topo-sort guarantees this by construction; this assertion makes the invariant
+    // machine-checkable in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        let mut seen_staging: HashSet<&PathBuf> = HashSet::new();
+        for step in &steps {
+            match step {
+                ExecutionStep::GenerateStagingNode { path, .. } => {
+                    seen_staging.insert(path);
+                }
+                ExecutionStep::GenerateStagingLowerCoverGroup { parent_path, .. } => {
+                    seen_staging.insert(parent_path);
+                }
+                ExecutionStep::GenerateWitness { staging_path, .. } => {
+                    debug_assert!(
+                        seen_staging.contains(staging_path),
+                        "GenerateWitness for {staging_path:?} appears before its staging step — \
+                         topo-sort invariant violated"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     Ok(ExecutionPlan { steps })
 }
 
-fn witness_key(staging_path: &Path, field_name: &str) -> PathBuf {
-    internal_path(staging_path, &format!("{field_name}___witness"))
+fn witness_key_seg(staging_path: &Path, field_name: &str, seg_idx: usize) -> PathBuf {
+    internal_path(staging_path, &format!("{field_name}___witness_{seg_idx}"))
 }
 
 /// Push a step plus any follow-on witness steps if `dataset` has list-link fields.
 ///
-/// When the dataset has list-link fields, `make_staging()` is called and the resulting
-/// staging step is pushed, followed by all witness/assemble steps. When the dataset has no
-/// list-link fields, `make_normal(defer_emit)` is called instead (for collect-target
-/// deferral, `defer_emit` is passed through; for normal datasets it is `false`).
+/// The two closures exist because the correct step variant differs between staging and
+/// non-staging cases: a dataset with list-link fields must be staged first (scalars only,
+/// no emit) so that `GenerateWitness` can reference the staging batch; a dataset without
+/// list-link fields is generated and emitted in one step. The caller provides both forms
+/// because it controls the field values in each variant.
+///
+/// When `dataset` has list-link fields: `make_staging()` is pushed, followed by
+/// per-segment `GenerateWitness` + `AssembleFromWitness` steps.
+/// When it has no list-link fields: `make_normal(defer_emit)` is pushed instead.
+///
+/// `segments` is used to emit one `GenerateWitness` per (field, segment) pair. For
+/// standalone datasets (no lower cover group) pass a single synthetic segment covering
+/// all rows.
 fn push_with_list_link_steps(
     steps: &mut Vec<ExecutionStep>,
     dataset: &SyntheticDataset,
     path: &Path,
     defer_emit: bool,
     all_datasets: &HashMap<PathBuf, SyntheticDataset>,
+    segments: &[Segment],
     make_staging: impl FnOnce() -> ExecutionStep,
     make_normal: impl FnOnce(bool) -> ExecutionStep,
 ) {
     if dataset.data.iter().any(|f| f.is_list_link()) {
         steps.push(make_staging());
-        emit_witness_steps(dataset, path, all_datasets, steps);
+        emit_witness_steps(dataset, path, all_datasets, segments, steps);
     } else {
         steps.push(make_normal(defer_emit));
     }
@@ -571,53 +641,66 @@ fn emit_witness_steps(
     dataset: &SyntheticDataset,
     path: &Path,
     all_datasets: &HashMap<PathBuf, SyntheticDataset>,
+    segments: &[Segment],
     steps: &mut Vec<ExecutionStep>,
 ) {
-    let mut witness_specs: Vec<(String, PathBuf, Option<String>)> = Vec::new();
+    let mut witness_specs: Vec<(String, Vec<PathBuf>, Option<String>)> = Vec::new();
     for field in &dataset.data {
         let Some(content) = &field.content else { continue };
         let Some(ref from_ref) = content.from else { continue };
         let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else { continue };
         let Some(linked_path) = resolve_include(path, &link.file) else { continue };
-        let witness_key = witness_key(path, &field.name);
         let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
-        steps.push(ExecutionStep::GenerateWitness {
-            witness_key: witness_key.clone(),
-            staging_path: path.to_path_buf(),
-            list_field_name: field.name.clone(),
-            inner_fields: content.item.fields.clone(),
-            include: link.clone(),
-            cardinality,
-            linked_path: linked_path.clone(),
-        });
-        let project_col = content.project.as_ref()
-            .and_then(|p| split_ref(p))
-            .map(|(_, f)| f.to_string());
-        witness_specs.push((field.name.clone(), witness_key.clone(), project_col));
 
-        // Collect bindings in content fields: insert AccumulateToLinked + EmitDataset
-        // between GenerateWitness and AssembleFromWitness so linked-node values
-        // accumulate upward before the outer dataset is assembled (Case 2).
-        // Pass 1: emit all AccumulateToLinked steps; Pass 2: emit EmitDataset once after all.
-        let mut has_collect = false;
-        for cf in &content.item.fields {
-            for binding in cf.collect_bindings() {
-                let Some(bind) = binding.bind.as_deref() else { continue };
-                let Some((_, linked_field)) = split_ref(bind) else { continue };
-                let lf_name = linked_field.to_string();
-                let def = linked_field_default(&linked_path, &lf_name, all_datasets);
-                steps.push(ExecutionStep::AccumulateToLinked {
-                    source_path:  witness_key.clone(),
-                    source_field: cf.name.clone(),
-                    linked_path:  linked_path.clone(),
-                    linked_field: lf_name,
-                    group_by:     "_linked_idx".to_string(),
-                    reducer:      binding.reducer.clone().unwrap_or(Reducer::Collect),
-                    default_val:  def,
-                });
-                has_collect = true;
+        let mut field_witness_keys: Vec<PathBuf> = Vec::new();
+        let mut slot_start = 0usize;
+
+        for (seg_idx, seg) in segments.iter().enumerate() {
+            if seg.rows == 0 {
+                // slot_start unchanged — empty segments contribute no staging rows.
+                continue;
             }
+            let wkey = witness_key_seg(path, &field.name, seg_idx);
+            steps.push(ExecutionStep::GenerateWitness {
+                witness_key: wkey.clone(),
+                staging_path: path.to_path_buf(),
+                list_field_name: field.name.clone(),
+                inner_fields: content.item.fields.clone(),
+                include: link.clone(),
+                cardinality: cardinality.clone(),
+                linked_path: linked_path.clone(),
+                slot_start,
+                slot_count: seg.rows,
+                segment_constraints: seg.field_constraints.clone(),
+            });
+            field_witness_keys.push(wkey.clone());
+
+            // Collect bindings: one AccumulateToLinked per segment per binding.
+            // Cumulative: each call merges new items with the existing list values
+            // written by previous segments' AccumulateToLinked calls.
+            for cf in &content.item.fields {
+                for binding in cf.collect_bindings() {
+                    let Some(bind) = binding.bind.as_deref() else { continue };
+                    let Some((_, linked_field)) = split_ref(bind) else { continue };
+                    let lf_name = linked_field.to_string();
+                    let def = linked_field_default(&linked_path, &lf_name, all_datasets);
+                    steps.push(ExecutionStep::AccumulateToLinked {
+                        source_path:  wkey.clone(),
+                        source_field: cf.name.clone(),
+                        linked_path:  linked_path.clone(),
+                        linked_field: lf_name,
+                        group_by:     "_linked_idx".to_string(),
+                        reducer:      binding.reducer.clone().unwrap_or(Reducer::Collect),
+                        default_val:  def,
+                    });
+                }
+            }
+
+            slot_start += seg.rows;
         }
+
+        // After all segments: emit EmitDataset once if any content field has collect bindings.
+        let has_collect = content.item.fields.iter().any(|cf| !cf.collect_bindings().is_empty());
         if has_collect {
             if let Some(linked_ds) = all_datasets.get(&linked_path) {
                 steps.push(ExecutionStep::EmitDataset {
@@ -625,6 +708,13 @@ fn emit_witness_steps(
                     dataset: Arc::new(linked_ds.clone()),
                 });
             }
+        }
+
+        let project_col = content.project.as_ref()
+            .and_then(|p| split_ref(p))
+            .map(|(_, f)| f.to_string());
+        if !field_witness_keys.is_empty() {
+            witness_specs.push((field.name.clone(), field_witness_keys, project_col));
         }
     }
     if !witness_specs.is_empty() {
@@ -700,19 +790,20 @@ fn track_shared(
     }
 }
 
-/// Compute the inherited fields for `path` by scanning every child dataset that includes
-/// `path` (without a distribution) and has ref fields pointing back to it.
+/// Compute the fields that `path` inherits from its lower cover children.
 ///
-/// Because topo order visits children before parents, the child's batch is
-/// already in `computed` by the time the parent runs — so the parent can pull
-/// from it. Lower cover members are excluded: their ref columns are projected from
-/// the parent batch inside `execute_lower_cover_group` instead.
-fn compute_prefills(
+/// Scans every child dataset that includes `path` (without a ratio, i.e. a direct
+/// constraint child) and collects ref fields that point back to a column in `path`.
+/// Because topo order visits children before parents, the child's batch is already in
+/// `computed` by the time the parent runs — the parent pulls those columns directly
+/// instead of re-generating them. Lower cover members are excluded: their ref columns
+/// are projected from the parent batch inside `execute_lower_cover_group` instead.
+fn compute_lower_cover_inherited(
     path: &Path,
     datasets: &HashMap<PathBuf, SyntheticDataset>,
     lower_cover_set: &HashSet<PathBuf>,
 ) -> Vec<InheritedField> {
-    let mut prefills = Vec::new();
+    let mut inherited = Vec::new();
     for (child_path, child_ds) in datasets {
         if lower_cover_set.contains(child_path) {
             continue;
@@ -728,7 +819,7 @@ fn compute_prefills(
                 if ref_part != include.reference {
                     continue;
                 }
-                prefills.push(InheritedField {
+                inherited.push(InheritedField {
                     from_path: child_path.clone(),
                     from_column: field.name.clone(),
                     into_column: target_col.to_string(),
@@ -736,7 +827,7 @@ fn compute_prefills(
             }
         }
     }
-    prefills
+    inherited
 }
 
 fn build_lower_cover_groups(

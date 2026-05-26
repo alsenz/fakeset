@@ -1,3 +1,6 @@
+//! Expression dependency analysis. `pull_down_expression_deps` injects hidden ref fields
+//! into child datasets so expression identifiers declared only in a parent are available
+//! when the child batch is generated.
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,7 +30,7 @@ pub(crate) fn extract_identifiers(expression: &str) -> Vec<&str> {
 /// For each dataset with expression fields, auto-add hidden ref fields for any
 /// variables referenced in expressions that are not declared in the dataset but
 /// exist in an included dataset. These hidden fields are populated via the normal
-/// prefill mechanism and stripped from output by the executor.
+/// inherited-field mechanism and stripped from output by the executor.
 pub fn pull_down_expression_deps(
     datasets: &HashMap<PathBuf, SyntheticDataset>,
 ) -> Result<HashMap<PathBuf, SyntheticDataset>> {

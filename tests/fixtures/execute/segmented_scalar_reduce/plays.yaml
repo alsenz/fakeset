@@ -1,0 +1,22 @@
+name: plays
+format: jsonl
+output_file: plays
+rows: 10
+links:
+  - file: game.yaml
+    ref: game
+    cardinality: 2
+data:
+  - name: tag
+    type: string
+  - name: played_games
+    type: list
+    content:
+      from: game
+      fields:
+        - name: score
+          type: number
+          value: 5
+          refs:
+            - bind: game.total
+              reducer: sum

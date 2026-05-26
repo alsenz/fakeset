@@ -1,0 +1,8 @@
+name: game
+format: jsonl
+output_file: game
+rows: 3
+data:
+  - name: total
+    type: number
+    default: 0

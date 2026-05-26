@@ -1,0 +1,19 @@
+name: source
+format: jsonl
+output_file: source
+rows: 10
+links:
+  - file: linked.yaml
+    ref: linked_item
+    cardinality: 2
+data:
+  - name: tag
+    type: string
+  - name: items
+    type: list
+    content:
+      from: linked_item
+      fields:
+        - name: label
+          refs:
+            - linked_item.label

@@ -126,11 +126,11 @@ fn distribution_drives_parent_segment_row_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// Prefill wiring
+// Inherited field wiring
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ref_field_wired_as_prefill_on_includee() {
+fn ref_field_wired_as_inherited_on_includee() {
     // ref_wiring: derived includes source with no explicit ratio (defaults to 1.0).
     // Since Stage 5, all children are registered as lower cover members unconditionally, so
     // source gets a GenerateLowerCoverGroup step with derived as a lower cover member.
@@ -151,7 +151,7 @@ fn ref_field_wired_as_prefill_on_includee() {
 }
 
 #[test]
-fn hidden_ref_field_wired_as_prefill() {
+fn hidden_ref_field_wired_as_inherited() {
     // expression_pulldown: derived has expression "age * 2" referencing source.age,
     // pulled down as a hidden ref field. Since Stage 5, derived is registered as a
     // lower cover member of source unconditionally, so source gets GenerateLowerCoverGroup.
@@ -183,7 +183,7 @@ fn list_link_dataset_decomposes_into_witness_and_assemble() {
     //                 GenerateStagingNode(events),
     //                 GenerateWitness(attendees),
     //                 AssembleFromWitness(events)
-    let steps = plan_for("tests/fixtures/execute/link_content");
+    let steps = plan_for("tests/fixtures/execute/list_link");
 
     // people: no list-link fields → must have a normal (non-staging) generation step
     let people_not_staging = steps.iter().any(|s| match s {
@@ -231,7 +231,7 @@ fn bernoulli_list_link_parent_produces_staging_lower_cover_group() {
     //   GenerateStagingLowerCoverGroup(events)
     //   GenerateWitness(picks)
     //   AssembleFromWitness(events)
-    let steps = plan_for("tests/fixtures/execute/bernoulli_link_content");
+    let steps = plan_for("tests/fixtures/execute/bernoulli_list_link");
 
     assert!(
         find_step!(steps, ExecutionStep::GenerateStagingLowerCoverGroup { parent, .. } if parent.name == "events").is_some(),
@@ -258,18 +258,18 @@ fn bernoulli_list_link_parent_produces_staging_lower_cover_group() {
 }
 
 #[test]
-fn non_ref_dataset_has_no_prefills() {
+fn non_ref_dataset_has_no_inherited_fields() {
     // flat/person has no includes and no includers with ref fields.
     let steps = plan_for("tests/fixtures/execute/flat");
-    let prefills = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, prefills, .. } if dataset.name == "person" => {
-            Some(prefills)
+    let inherited = steps.iter().find_map(|s| match s {
+        ExecutionStep::GenerateDataset { dataset, inherited, .. } if dataset.name == "person" => {
+            Some(inherited)
         }
         _ => None,
     });
     assert!(
-        prefills.map_or(false, |p| p.is_empty()),
-        "person has no ref relationships and should have empty prefills"
+        inherited.map_or(false, |p| p.is_empty()),
+        "person has no ref relationships and should have no inherited fields"
     );
 }
 
@@ -458,11 +458,35 @@ fn case2_collect_with_jointly_segmented_pool_errors() {
 #[test]
 fn reinforcement_zero_exceeding_pool_errors() {
     // reinforcement_zero_infeasible: outer links pool (3 rows) with reinforcement:0 and
-    // cardinality:5. max_cardinality (5) > eligible pool size (3) → planning error.
+    // cardinality:5. Fixed(5) > eligible linked-dataset size (3) → planning error.
     let err = plan_err_for("tests/fixtures/plan/reinforcement_zero_infeasible");
     let msg = err.to_string();
     assert!(
         msg.contains("reinforcement") && (msg.contains("eligible") || msg.contains("cardinality")),
-        "error should mention reinforcement and eligible pool size; got: {msg}"
+        "error should mention reinforcement and eligible linked-dataset size; got: {msg}"
+    );
+}
+
+#[test]
+fn card_fixed_pool_too_small_errors() {
+    // card_fixed_pool_too_small: outer links linked (2 rows) with reinforcement:0 and
+    // cardinality:5. Fixed(5) > eligible linked-dataset size (2) → planning error.
+    let err = plan_err_for("tests/fixtures/validation/card_fixed_pool_too_small");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reinforcement") && msg.contains("eligible"),
+        "error should mention reinforcement and eligible; got: {msg}"
+    );
+}
+
+#[test]
+fn card_uniform_min_too_large_errors() {
+    // card_uniform_min_too_large: outer links linked (3 rows) with reinforcement:0 and
+    // cardinality:{min:5, max:10}. min=5 > eligible linked-dataset size (3) → planning error.
+    let err = plan_err_for("tests/fixtures/validation/card_uniform_min_too_large");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reinforcement") && msg.contains("min"),
+        "error should mention reinforcement and min cardinality; got: {msg}"
     );
 }

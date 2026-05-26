@@ -1,0 +1,11 @@
+name: child_b
+format: jsonl
+output_file: child_b
+include:
+  file: plays.yaml
+  ref: plays
+  ratio: 0.6
+data:
+  - name: tag
+    ref: plays.tag
+    value: "B"

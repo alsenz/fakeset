@@ -11,5 +11,5 @@ data:
       from: src
       fields:
         - name: label
-          type: string    # error: type must not be set on a pool-scoped ref
+          type: string    # error: type must not be set on a linked-scoped ref
           ref: src.label

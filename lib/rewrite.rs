@@ -1,3 +1,6 @@
+//! Ref resolution and locale application. `resolve_refs` pushes field types and merged
+//! constraints down the lattice toward child/ref targets; `apply_global_locales` stamps
+//! locale onto locale-aware fields across all datasets.
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

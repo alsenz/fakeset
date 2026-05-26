@@ -1,3 +1,6 @@
+//! Lower cover segmentation via Bernoulli factoring. `plan_segments` enumerates all
+//! 2^N membership subsets for a lower cover group, prunes contradictory subsets, then
+//! applies Iterative Proportional Fitting to restore declared marginal ratios.
 use anyhow::{bail, Result};
 use fake::Fake;
 use std::collections::HashMap;
@@ -27,7 +30,7 @@ pub struct LowerCoverMember {
     /// True for witness-source members (arose from a `content: {from: <ref>}` list-link field).
     /// Witness-source members do not generate standalone batches — they only contribute field
     /// constraints to the parent's segment generation, and their rows must be placed
-    /// first in the parent batch so `GenerateWitness`'s pool_size index is correct.
+    /// first in the parent batch so `GenerateWitness`'s `n_eligible` boundary is correct.
     pub is_witness_source: bool,
 }
 
@@ -99,7 +102,7 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember], max_lower
         .collect();
 
     // --- Opt A: Pairwise conflict pruning ---
-    // Zero any mask that contains a pair of siblings with mutually incompatible
+    // Zero any mask that contains a pair of lower cover members with mutually incompatible
     // constraints. This collapses exponentially many infeasible masks for
     // categorical/one-of groups without touching a single HashMap merge.
     let conflict_masks = precompute_conflicts(members);
@@ -146,14 +149,14 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember], max_lower
         accumulated_weight += weights[mask];
         feasible.insert(mask, constraints);
     }
-    // Force-include every singleton mask (one sibling bit set) that survived
+    // Force-include every singleton mask (one member bit set) that survived
     // conflict pruning, regardless of the budget threshold.
     //
     // Budget pruning uses raw Bernoulli weights, which catastrophically
-    // underestimate post-IPF contribution for mutually-exclusive siblings:
-    // a 4% sibling alongside a 95% peer has raw weight ≈ 0.2% (conditioned on
+    // underestimate post-IPF contribution for mutually-exclusive lower cover members:
+    // a 4% member alongside a 95% peer has raw weight ≈ 0.2% (conditioned on
     // "not in the 95% segment"), but its actual post-IPF marginal is 4%.
-    // Joint masks (2+ siblings) can still be budget-pruned — they have many
+    // Joint masks (2+ members) can still be budget-pruned — they have many
     // alternatives and Bernoulli rounding will drop near-zero ones anyway.
     for i in 0..n {
         let mask = 1usize << i;

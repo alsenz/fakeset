@@ -1,0 +1,23 @@
+name: outer
+format: jsonl
+output_file: outer
+rows: 5
+links:
+  - file: linked.yaml
+    ref: linked
+    cardinality:
+      min: 1
+      max: 10
+    reinforcement: 0
+data:
+  - name: label
+    type: string
+    generator: word
+  - name: items
+    type: list
+    content:
+      from: linked
+      fields:
+        - name: id
+          refs:
+            - linked.id

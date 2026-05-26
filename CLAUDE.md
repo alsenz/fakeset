@@ -9,7 +9,7 @@ A declarative, DAG-structured synthetic dataset generator. Users write YAML sche
 ```bash
 cargo build                  # debug
 cargo build --release        # release binary → target/release/fakeset
-cargo test                   # all unit + integration tests (~174 tests)
+cargo test                   # all unit + integration tests (~179 tests)
 cargo check                  # fast type-check without linking
 ```
 
@@ -84,6 +84,7 @@ load YAML files
   → pull_down_expression_deps  (push hidden ref fields DOWN the lattice: inject expression deps declared only in an included parent)
   → validate           (structural checks, ref validity, constraint consistency)
   → expand_field_variants      (variant fields → concrete global variants)
+  → expand_include_fields      (materialise `include.fields` wildcard copies as explicit ref fields)
   → resolve_refs       (push field types and merged constraints DOWN the lattice to child/ref targets)
   → apply_global_locales       (stamp locale onto locale-aware fields)
   → build_plan         (resolve row counts, lower cover groups, inherited-field wiring, collect targets → ExecutionPlan)
@@ -106,12 +107,12 @@ load YAML files
 | Module | Responsibility |
 |--------|---------------|
 | `lib.rs` | Public API: `load_all_datasets`, YAML discovery |
-| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, the list-link visitor, and lattice-traversal helpers |
+| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, `eligible_linked_rows`, the list-link visitor, and lattice-traversal helpers |
 | `graph.rs` | `build_dag` — petgraph DAG construction and topo-sort |
 | `validate.rs` | Schema validation: structural rules, ref checks, expression ordering |
 | `expand_variants.rs` | Expand `type: variant` fields into concrete global `variants:` entries |
 | `expressions.rs` | `pull_down_expression_deps`, identifier extraction for validation |
-| `rewrite.rs` | `resolve_refs` (ref chain resolution, constraint merging), `apply_global_locales`, `apply_locale_to_schema` |
+| `rewrite.rs` | `resolve_refs` (ref chain resolution, constraint merging), `expand_include_fields` (wildcard field copying), `apply_global_locales`, `apply_locale_to_schema` |
 | `constraints.rs` | `FieldConstraints`, `Satisfiable`, `Merge`, `validate_field_constraints` |
 | `segment.rs` | `plan_segments` — Bernoulli weights, conflict pruning, IPF, rounding. `LowerCoverMember` and `Segment` types. |
 | `plan.rs` | `build_plan` — row counts, lower cover groups, inherited-field wiring, collect targets → `ExecutionPlan` / `ExecutionStep` |
@@ -140,6 +141,7 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 - **No `sql_safe_name`** — DataFusion column names are double-quoted in SQL strings (`"field_name"`), so arbitrary field names are safe without sanitisation.
 - **`_row_idx` sentinel** — a `UInt32` 0..n column prepended to batches for positional JOIN keying inside `grow_parent_from_children`; stripped from all outputs.
 - **`_slot_idx` sentinel** — a `UInt32` staging-node slot index present in all witness and child batches — which source slot each atom row belongs to. Used by `AssembleFromWitness` to fold witness rows into per-slot lists. Also used in top-level cardinality batches to record which parent-row slot each child row belongs to. Retained in `computed` for grandchild access; stripped from emitted output by `filter_hidden_columns`.
+- **`_staging_refs` sentinel** — a `List<UInt32>` column in each witness batch. Entry i lists all staging-slot indices that drew witness row i (the many-to-one pairing from source slots to linked rows). Built in `execute_witness`; consumed and dropped by `AssembleFromWitness` during list folding.
 - **`_linked_idx` sentinel** — a `UInt32` column in witness batches recording which linked-dataset row was drawn (index into the eligible linked batch). Persisted for `AccumulateToLinked` collect bindings.
 - **Linked rows preceding staging rows** — when a dataset has witness-source lower cover members, the linked-dataset rows occupy the leading positions in the combined batch so `GenerateWitness`'s `n_eligible_slots` boundary correctly identifies eligible linked-dataset slots.
 
@@ -157,7 +159,7 @@ Full design specs and implementation plans live in `specs/`:
 | `specs/done/MULT-2a.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-2.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-3.md` | **Complete** — implemented and merged |
-| `specs/REFRAME-1.md` | In-progress lattice reframing spec |
+| `specs/REFRAME-1.md` | **Complete** — all stages implemented and merged |
 
 ## Planned next steps
 
@@ -171,7 +173,4 @@ Full design specs and implementation plans live in `specs/`:
 - **REPO** — allow definitions to be imported and included from remote GitHub repositories
 - **IMPORT** — allow imports from pre-existing files and database connections
 - **CNV-1** — field and excluded (field) wildcards on includes to default-define fields from includes as refs
-- **CMP-1** — comparison with synth library
-- **CMP-2** — comparison with Synthetic Data Vault (SDV) (python library)
-- **EX-1** — an insurance dataset example
 - **DQ** — data quality: final execution stage post-processing the generated output to introduce realistic data quality issues (null fields, typos, inconsistent ID keys, formatting errors, etc.). Row duplication (data-entry clones) is expressed separately via a top-level `quality: {inflation: 0.05}` stanza, not via include machinery — this keeps the include model semantically clean.

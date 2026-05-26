@@ -31,7 +31,7 @@ struct Cli {
     #[arg(long)]
     print_rewritten: bool,
 
-    /// Print the execution plan (row counts, sibling segments, prefill wiring), then exit
+    /// Print the execution plan (row counts, lower cover segments, inherited field wiring), then exit
     #[arg(long)]
     print_plan: bool,
 
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "Loaded {} dataset(s) into DAG ({} include edge(s))",
+        "Loaded {} dataset(s) into DAG ({} edge(s))",
         dag.graph.node_count(),
         dag.graph.edge_count(),
     );
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
 fn print_plan(plan: &ExecutionPlan) {
     for (i, step) in plan.steps.iter().enumerate() {
         match step {
-            ExecutionStep::GenerateStagingNode { dataset, rows, prefills, .. } => {
+            ExecutionStep::GenerateStagingNode { dataset, rows, inherited, .. } => {
                 println!(
                     "[{}] staging node: {} ({} rows, {})",
                     i + 1, dataset.name, rows, dataset.format
@@ -114,14 +114,14 @@ fn print_plan(plan: &ExecutionPlan) {
                 for field in &dataset.data {
                     print_field(field, 4);
                 }
-                for p in prefills {
+                for p in inherited {
                     let src = p.from_path.file_stem()
                         .and_then(|s: &std::ffi::OsStr| s.to_str())
                         .unwrap_or("?");
                     println!("    inherits: {}.{} → {}", src, p.from_column, p.into_column);
                 }
             }
-            ExecutionStep::GenerateDataset { dataset, rows, prefills, .. } => {
+            ExecutionStep::GenerateDataset { dataset, rows, inherited, .. } => {
                 println!(
                     "[{}] generate: {} ({} rows, {})",
                     i + 1, dataset.name, rows, dataset.format
@@ -129,7 +129,7 @@ fn print_plan(plan: &ExecutionPlan) {
                 for field in &dataset.data {
                     print_field(field, 4);
                 }
-                for p in prefills {
+                for p in inherited {
                     let src = p.from_path.file_stem()
                         .and_then(|s: &std::ffi::OsStr| s.to_str())
                         .unwrap_or("?");
@@ -221,7 +221,7 @@ fn print_plan(plan: &ExecutionPlan) {
             ExecutionStep::AssembleFromWitness { staging_path, dataset, witness_specs } => {
                 let staging = staging_path.file_stem()
                     .and_then(|s: &std::ffi::OsStr| s.to_str()).unwrap_or("?");
-                let fields: Vec<&str> = witness_specs.iter().map(|(n, _, _): &(String, PathBuf, Option<String>)| n.as_str()).collect();
+                let fields: Vec<&str> = witness_specs.iter().map(|(n, _, _): &(String, Vec<PathBuf>, Option<String>)| n.as_str()).collect();
                 println!(
                     "[{}] assemble from witness: {} ← [{}] ({})",
                     i + 1, staging, fields.join(", "), dataset.format

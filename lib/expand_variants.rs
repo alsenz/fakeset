@@ -1,3 +1,5 @@
+//! Variant expansion. `expand_field_variants` resolves `type: variant` fields into
+//! concrete global `variants:` entries so the planner and executor see a uniform schema.
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;

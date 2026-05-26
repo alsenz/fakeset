@@ -1,3 +1,7 @@
+//! Field constraint types (`FieldConstraints`, `Satisfiable`, `Merge`) and
+//! `validate_field_constraints` — used by the segment pruner and validator to detect
+//! contradictory constraint sets (e.g. two lower cover members pinning the same field
+//! to different constants).
 use anyhow::{bail, Result};
 use crate::models::{Field, Generator, Range};
 use serde_yaml::Value as YamlValue;
@@ -13,7 +17,7 @@ pub trait Merge: Sized {
 }
 
 /// All generation constraints that live on a field, extracted for merging and
-/// satisfiability checks during sibling segmentation.
+/// satisfiability checks during lower cover segmentation.
 #[derive(Debug, Clone, Default)]
 pub struct FieldConstraints {
     pub generator: Option<Generator>,

@@ -1,0 +1,15 @@
+name: employees
+format: jsonl
+output_file: employees
+rows: 30
+links:
+  - file: departments.yaml
+    ref: dept
+data:
+  - name: emp_id
+    type: string
+    generator: uuid
+  - name: dept_id
+    ref: dept.dept_id
+  - name: dept_name
+    ref: dept.dept_name

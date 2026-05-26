@@ -7,9 +7,9 @@ Loosely inspired by [synth](https://github.com/getsynth/synth).
 
 You describe your datasets as YAML files.  Each file declares a name, an output
 format, a schema (the shape of the rows), and optionally an *include* —
-another dataset file that this one depends on.  `fakeset` resolves the includes
-into a directed acyclic graph (DAG), validates it for cycles, and then executes
-the plan in dependency order using [Apache DataFusion](https://datafusion.apache.org).
+the broader dataset this one is a **constrained subset** of.  `fakeset` resolves
+these constraint relationships into a directed acyclic graph (DAG), validates it
+for cycles, and then executes the plan in topological order using [Apache DataFusion](https://datafusion.apache.org).
 
 ### Glossary
 
@@ -17,6 +17,7 @@ the plan in dependency order using [Apache DataFusion](https://datafusion.apache
 |---|---|
 | **parent** (parent-by-inclusion) | A dataset that is *included by* another — the less-constrained, broader population. |
 | **child** (child-by-inclusion) | A dataset that *includes* another — the more-constrained, narrower population. |
+| **atom** | The most-constrained node in a component — generated from scratch with no inherited values. Every lower-cover leaf and every witness node is an atom. Atoms are always preceding. |
 | **lower cover** | The set of datasets that directly include a given parent. |
 | **lower cover group** | A parent together with its lower cover; planned as a unit via Bernoulli factoring. |
 | **linked dataset** | The target of a `links:` stanza — the dataset whose rows are drawn as list items. |

@@ -1,3 +1,6 @@
+//! Data model: all YAML-deserialisable types (`SyntheticDataset`, `Field`, `Include`,
+//! `Schema`, `CountSpec`, `Reducer`, …) plus lattice-traversal helpers (`for_each_content_include`,
+//! `resolve_include`) and the `links:`-visitor used by planner and executor.
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +25,18 @@ pub fn expected_cardinality(spec: &CountSpec) -> f64 {
         CountSpec::Fixed(n)             => *n as f64,
         CountSpec::Uniform { min, max } => (*min + *max) as f64 / 2.0,
         CountSpec::Normal  { mean, .. } => *mean,
+    }
+}
+
+/// Compute the number of eligible linked-dataset rows after applying the declared `ratio`.
+///
+/// This is the single canonical formula used at plan time (`check_cardinality_feasibility`)
+/// and execution time (`execute_witness`, `inject_linked_idx`). When no ratio is declared,
+/// all rows are eligible. When `linked_rows == 0`, returns 0 regardless of ratio.
+pub fn eligible_linked_rows(linked_rows: usize, ratio: Option<f64>) -> usize {
+    match ratio {
+        Some(r) => ((r * linked_rows as f64).round() as usize).max(1).min(linked_rows),
+        None    => linked_rows,
     }
 }
 
@@ -354,7 +369,7 @@ pub enum RefEntry {
 pub struct RefBinding {
     /// The ref target (`"include_ref.field_name"`). Absent on bind-only entries.
     pub target: Option<String>,
-    /// The collect target (`"pool_ref.field_name"`). Used with `reducer: collect`.
+    /// The collect target (`"linked_ref.field_name"`). Used with `reducer: collect`.
     pub bind: Option<String>,
     pub reducer: Option<Reducer>,
 }
@@ -363,7 +378,8 @@ pub struct RefBinding {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reducer {
-    TakeFirst,
+    #[serde(alias = "take_first")]
+    TakeOne,
     Sum,
     Max,
     Min,
@@ -421,7 +437,7 @@ pub struct Field {
     /// powers of 10 (e.g. -2 rounds to the nearest 100). Applied after generation.
     /// Ignored on non-number fields.
     pub precision: Option<i32>,
-    /// Default value used when this field is not prefilled by any child.
+    /// Default value used when this field has no inherited value from any child.
     /// Must be type-compatible with `field_type`. List fields use `default: []`
     /// as the empty-collect fallback required by `reducer: collect` bindings.
     pub default: Option<serde_yaml::Value>,
@@ -540,13 +556,13 @@ pub struct Include {
     pub file: String,
     #[serde(rename = "ref")]
     pub reference: String,
-    /// Marginal row-membership probability (0.0–1.0). When set on two or more siblings that
-    /// share a common parent, the executor uses Bernoulli segmentation + IPF to correctly
-    /// model the overlap.
+    /// Marginal row-membership probability (0.0–1.0). When set on two or more lower cover
+    /// members of a common parent, the executor uses Bernoulli segmentation + IPF to
+    /// correctly model the overlap.
     #[serde(alias = "distribution")]
     pub ratio: Option<f64>,
     /// How many times each child row is replicated into the parent batch (top-level include),
-    /// or how many items to draw per outer row (links entry used as a pool partner).
+    /// or how many items to draw per outer row (list-link entry).
     pub cardinality: Option<CountSpec>,
     /// Sampling intensity: 0 = without-replacement, 1 = uniform, >1 = clumping.
     /// Model field only; execution deferred to MULT-2.

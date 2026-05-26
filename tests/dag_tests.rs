@@ -15,7 +15,7 @@ fn test_list_content_include_orders_provider_before_consumer() {
     // events.yaml has a nested include field whose content includes people.yaml.
     // The DAG must add a data-dependency edge that makes people a predecessor of events,
     // so the topo sort visits people before events.
-    let paths = vec![PathBuf::from("tests/fixtures/execute/link_content")];
+    let paths = vec![PathBuf::from("tests/fixtures/execute/list_link")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let dag = build_dag(&datasets).expect("should build dag");
 

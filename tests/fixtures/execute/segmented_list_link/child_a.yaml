@@ -1,0 +1,11 @@
+name: child_a
+format: jsonl
+output_file: child_a
+include:
+  file: source.yaml
+  ref: src
+  ratio: 0.4
+data:
+  - name: tag
+    ref: src.tag
+    value: "A"

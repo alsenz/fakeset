@@ -1,3 +1,5 @@
+//! Schema validation: structural rules, ref validity, constraint consistency, and
+//! cardinality feasibility checks. Called after loading YAML and before plan building.
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -7,7 +9,7 @@ use crate::expressions::extract_identifiers;
 use crate::models::{resolve_include, split_ref, CountSpec, Field, FieldType, FieldVariant, Include, RefBinding, Reducer, Schema, SyntheticDataset};
 
 /// Validate all loaded datasets, returning any non-fatal warnings.
-/// Hard errors (e.g. `rows` set alongside `distribution`) are returned as `Err`.
+/// Hard errors (e.g. `rows` set alongside `ratio`) are returned as `Err`.
 pub fn validate(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
     for (path, dataset) in datasets {
@@ -75,11 +77,11 @@ fn validate_dataset(
             );
         }
         if !group_refs.contains(&link.reference) {
-            // Junction link: cardinality is not meaningful (one pool row sampled per junction row).
+            // Junction link: cardinality is not meaningful (one linked-dataset row sampled per junction row).
             if link.cardinality.is_some() {
                 bail!(
                     "dataset '{}': junction link '{}' must not set `cardinality` — \
-                     junction links sample exactly one pool row per junction row",
+                     junction links sample exactly one linked-dataset row per junction row",
                     dataset.name, link.reference
                 );
             }
@@ -155,7 +157,7 @@ fn validate_dataset(
                 if let Some(link) = dataset.links.iter().find(|l| &l.reference == from_ref) {
                     let content_path = format!("{field_path}[]");
                     validate_project(content, link, &content_path, path, dataset, all)?;
-                    validate_link_content(&content_path, link, &content.item.fields, path, dataset, all, warnings)?;
+                    validate_list_link_content(&content_path, link, &content.item.fields, path, dataset, all, warnings)?;
                 }
             }
         }
@@ -371,7 +373,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
 /// - **Outer-scoped** (`ref: field`): no dot (or dot not matching the link ref); the field
 ///   must exist in the enclosing `dataset`. An explicit `type:` must be set (auto-inference
 ///   from the outer field is not yet supported).
-fn validate_link_content(
+fn validate_list_link_content(
     path: &str,
     link: &Include,
     data: &Schema,
@@ -391,15 +393,15 @@ fn validate_link_content(
         }
 
         if let Some(ref_str) = field.simple_ref() {
-            // Determine scope: pool-scoped (dot matches the link ref) or outer-scoped.
-            let pool_scoped = split_ref(ref_str)
+            // Determine scope: linked-scoped (dot matches the link ref) or outer-scoped.
+            let linked_scoped = split_ref(ref_str)
                 .and_then(|(ref_part, _)| if link.reference == ref_part { Some(link) } else { None });
 
-            if let Some(inc) = pool_scoped {
-                // Pool-scoped ref — type must not be set (inherited from link target).
+            if let Some(inc) = linked_scoped {
+                // Linked-scoped ref — type must not be set (inherited from link target).
                 if field.field_type.is_some() {
                     bail!(
-                        "field '{fpath}': `type` cannot be set alongside a pool-scoped `ref` \
+                        "field '{fpath}': `type` cannot be set alongside a linked-scoped `ref` \
                          — the type is inherited from the referenced field"
                     );
                 }
@@ -611,7 +613,7 @@ fn validate_single_collect_bind(
             )
         })?;
 
-    // Type compatibility: each reducer requires a specific pool field type.
+    // Type compatibility: each reducer requires a specific linked field type.
     let reducer = binding.reducer.as_ref().unwrap_or(&Reducer::Collect);
     match reducer {
         Reducer::Collect => {
@@ -636,8 +638,8 @@ fn validate_single_collect_bind(
                 );
             }
         }
-        Reducer::Max | Reducer::Min | Reducer::TakeFirst => {
-            // No type restriction — max/min/take_first work on any orderable type.
+        Reducer::Max | Reducer::Min | Reducer::TakeOne => {
+            // No type restriction — max/min/take_one work on any orderable type.
         }
     }
 

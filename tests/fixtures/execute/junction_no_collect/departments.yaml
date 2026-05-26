@@ -1,0 +1,11 @@
+name: departments
+format: jsonl
+output_file: departments
+rows: 10
+data:
+  - name: dept_id
+    type: string
+    generator: uuid
+  - name: dept_name
+    type: string
+    generator: word

@@ -1,3 +1,5 @@
+//! Arrow schema conversion. `schema_to_arrow` and `field_to_arrow` map fakeset field
+//! types to Arrow `DataType`s; `parquet_datatype_to_arrow` handles Parquet overrides.
 use arrow::datatypes::{DataType, Field as ArrowField, TimeUnit};
 use std::sync::Arc;
 

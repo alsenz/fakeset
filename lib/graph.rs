@@ -1,3 +1,6 @@
+//! DAG construction and topological sort. `build_dag` encodes the concept semi-lattice
+//! as a petgraph `DiGraph` and topo-sorts it so atoms (most-constrained nodes) are
+//! always visited before their parents.
 use anyhow::{anyhow, Result};
 use petgraph::algo::toposort;
 use petgraph::graph::DiGraph;
@@ -16,14 +19,19 @@ pub struct DatasetGraph {
 ///
 /// Two kinds of edge are added:
 ///
-/// **Constraint edges** (from top-level `includes:`): child → parent. A child is a
+/// **Constraint edges** (from top-level `include:`): child → parent. A child is a
 /// more-constrained subset of its parent and must execute first (preceding). The child
 /// is the edge source so topo visits it before the parent.
 ///
-/// **Data-dependency edges** (from `content: {includes: [...]}` inside list fields):
-/// pool dataset → enclosing dataset. The pool dataset supplies row data for the rich
-/// list and must be fully computed before the enclosing dataset runs. The pool dataset
-/// is the edge source so topo visits it first.
+/// **Data-dependency edges** (from `links:` inside list-link fields):
+/// linked dataset → enclosing dataset. The linked dataset supplies row data for witness
+/// generation and must be fully computed before the enclosing dataset runs. The linked
+/// dataset is the edge source so topo visits it first.
+///
+/// **Outer-ref ordering (staging → witness)** is *not* expressed as a DAG edge; it is
+/// satisfied by construction in `build_plan`, which always emits a `GenerateStagingNode`
+/// or `GenerateStagingLowerCoverGroup` step before the paired `GenerateWitness` steps in
+/// the linear step list. A future DAG-aware scheduler should make this dependency explicit.
 pub fn build_dag(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<DatasetGraph> {
     let mut graph: DiGraph<PathBuf, ()> = DiGraph::new();
     let mut node_indices = HashMap::new();

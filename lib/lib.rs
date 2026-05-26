@@ -1,3 +1,9 @@
+//! fakeset — declarative synthetic dataset generator.
+//!
+//! Users write YAML schemas describing a concept semi-lattice of datasets; fakeset
+//! generates referentially consistent Parquet/CSV/JSON/JSONL output by executing a
+//! topologically-sorted plan in which atoms (most-constrained nodes) are generated first
+//! and parent values are accumulated upward.
 pub mod constraints;
 pub mod executor;
 pub mod expand_variants;

@@ -1,0 +1,11 @@
+name: linked
+format: jsonl
+output_file: linked
+rows: 10
+data:
+  - name: label
+    type: string
+    generator: word
+  - name: kind
+    type: string
+    generator: word

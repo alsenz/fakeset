@@ -1,0 +1,8 @@
+name: linked
+format: jsonl
+output_file: linked
+rows: 4
+data:
+  - name: id
+    type: string
+    generator: uuid

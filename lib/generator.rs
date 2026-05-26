@@ -1,3 +1,6 @@
+//! Per-field fake data generation. `generate_column` dispatches to fake-rs generators
+//! based on field type and generator settings; `sample_count` draws a cardinality value
+//! from a `CountSpec` for list-link witness generation.
 use anyhow::{anyhow, bail, Result};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, ListArray, StringArray,

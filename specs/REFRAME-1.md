@@ -448,9 +448,9 @@ Execution traverses the DAG in topological order.
 ### Phase 1 — Generate atoms (leaf-first)
 
 For each atom node in topological order:
-- **Segment atoms**: generate rows using field generators and local constraints. No prefill
-  from above — field definitions were pushed down during planning. Staging atoms (source
-  component) additionally carry `_slot_idx` to index source rows for the witness node.
+- **Segment atoms**: generate rows using field generators and local constraints. No inherited
+  field values from above — field definitions were pushed down during planning. Staging atoms
+  (source component) additionally carry `_slot_idx` to index source rows for the witness node.
 - **Witness nodes**: for each unique linked row drawn (across all source slots), generate
   one witness row carrying the linked dataset's fields and a `_staging_refs` list of all
   source-slot indices that drew this linked row. Seed and outer-ref edges guarantee both
@@ -466,8 +466,8 @@ their assembly nodes emit — all before the outer witness node's seed edge is s
 ### Phase 2 — Accumulate upward (child-first, parent-last)
 
 For each non-atom node in topological order:
-- **Prefill accumulation**: LEFT JOIN on `_row_idx` from each child batch. Fields present
-  in a child are inherited; remaining fields are generated fresh.
+- **Inherited-field accumulation**: LEFT JOIN on `_row_idx` from each child batch. Fields
+  present in a child are inherited; remaining fields are generated fresh.
 - **List assembly**: for assembly nodes, witness rows are grouped by `_staging_refs` entry
   to reconstruct per-source-slot pairings, then folded into list columns.
 - **Expression evaluation**: after all inherited fields are present. Evaluation order follows YAML field declaration order, as established during planning's push-down phase.
@@ -482,7 +482,7 @@ both phases before any downstream component starts.
 | Term | Definition |
 |------|------------|
 | **⊥ (bottom)** | Greatest lower bound of all elements: the empty concept. Unsatisfiable Bernoulli segments reduce to ⊥ and are pruned. |
-| **Atom** | An element covering ⊥ directly: a least element strictly greater than ⊥. Atoms generate rows from scratch with no prefill. |
+| **Atom** | An element covering ⊥ directly: a least element strictly greater than ⊥. Atoms generate rows from scratch with no inherited field values. |
 | **Assembly node** | Virtual node (Step 3) above the staging node. Groups witness rows by `_staging_refs` entry to reconstruct per-source-slot pairings, folds into list columns, evaluates expressions, and emits the source dataset's output. |
 | **Cardinality edge** | Execution edge from a witness node to an assembly node. Ensures the witness batch is complete before list assembly. |
 | **Collect edge** | Execution edge from a witness node to the linked dataset's emit step. Ensures collect/reduce accumulation fires before the linked dataset writes output. |
@@ -617,630 +617,54 @@ Seven stages, each independently mergeable. Early stages are documentation and
 mechanical renames; later stages make structural changes to the planner and executor.
 The constraint throughout: no old vocabulary is left in any file after each stage merges.
 
-| Stage | Title | Files primarily affected | Risk |
-|-------|-------|--------------------------|------|
-| 1 | Documentation | `CLAUDE.md`, `specs/` | None |
-| 2 | Naming pass | All `.rs`, `src/main.rs`, test strings | Low |
-| 3 | Staging node as explicit step | `plan.rs`, `executor.rs`, `src/main.rs` | Low |
-| 4 | `_staging_refs` witness schema | `executor.rs`, `plan.rs`, test fixtures | High |
-| 5 | Per-segment witness correctness | `plan.rs`, `executor.rs`, new fixtures | High |
-| 6 | Cardinality validation | `plan.rs`, new test fixtures | Medium |
-| 7 | Outer-ref edge + final cleanup | `graph.rs`, `plan.rs`, fixture dirs, all | Low |
+| Stage | Title | Files primarily affected | Risk | Status |
+|-------|-------|--------------------------|------|--------|
+| 1 | Documentation | `CLAUDE.md`, `specs/` | None | ✓ Complete |
+| 2 | Naming pass | All `.rs`, `src/main.rs`, test strings | Low | ✓ Complete |
+| 3 | Staging node as explicit step | `plan.rs`, `executor.rs`, `src/main.rs` | Low | ✓ Complete |
+| 4 | `_staging_refs` witness schema | `executor.rs`, `plan.rs`, test fixtures | High | ✓ Complete |
+| 5 | Per-segment witness correctness | `plan.rs`, `executor.rs`, new fixtures | High | Next |
+| 6 | Cardinality validation | `plan.rs`, new test fixtures | Medium | |
+| 7 | Outer-ref edge + final cleanup | `graph.rs`, `plan.rs`, fixture dirs, all | Low | |
 
 ---
 
-### Stage 1 — Documentation
+### Stage 1 — Documentation ✓ Complete
 
-No code changes. Establishes the vocabulary reference that all later stages must match.
-Once merged, no old vocabulary should remain in `CLAUDE.md` or `README.md`.
+No code changes. Updated `CLAUDE.md` with the full semi-lattice glossary (atom, lower cover,
+lower cover group, staging node, witness node, assembly node, inherited field, etc.), rewrote
+the "Core architectural framing" section, renamed "Sibling segmentation" to "Lower cover
+segmentation (Bernoulli factoring)", and updated the execution pipeline step list and module
+map. `README.md` received matching glossary additions and YAML example updates.
 
----
-
-#### Stage 1A — `CLAUDE.md`
-
-**Glossary** — replace the entire table with:
-
-| Term | Meaning |
-|------|---------|
-| **concept semi-lattice** | The partial order over all datasets where `A ≤ B` means "A is a more-constrained subset of B's population". Every pair of datasets with a common ancestor has a meet (greatest lower bound). |
-| **element / node** | One member of the semi-lattice. "Node" is preferred when emphasising graph structure; "element" for order-theoretic properties. |
-| **⊥ (bottom)** | The empty concept — the unsatisfiable constraint set. Bernoulli segments that prune to zero rows represent ⊥ and are dropped. |
-| **atom** | An element that covers ⊥ directly — the most-constrained node in a component. Atoms are generated first. |
-| **lower cover** | The set of elements that directly include a given parent element (formerly "siblings"). |
-| **lower cover group** | A parent together with its lower cover; planned as a unit via Bernoulli factoring (formerly "sibling group"). |
-| **segment** | One subset of a parent element's rows that belongs to a particular combination of lower cover members. |
-| **staging node** | A virtual node that holds the scalar non-list fields of a source dataset while its witness and assembly nodes are being built. No output file. |
-| **witness node** | An atom carrying the linked dataset's schema. One witness row per unique linked-row draw. A hidden `_staging_refs: List<UInt32>` column maps each witness row back to the staging source slots that drew it. |
-| **assembly node** | A virtual node above the staging node that folds witness rows into list columns, evaluates expressions, and emits the final output. |
-| **source slot** | One row of a staging batch, identified by `_slot_idx`. |
-| **linked dataset** | The target of a `links:` stanza (formerly "pool dataset"). |
-| **seed edge** | The execution edge from linked dataset atoms to the witness node — the draw that populates witness rows from the linked dataset. |
-| **inherited field** | A column pre-populated from an already-computed child batch into the parent's batch, wiring up ref fields so they are never regenerated (formerly "prefill"). |
-| **preceding** (preceding-by-execution) | Generated first. Atoms are always preceding. |
-| **subsequent** (subsequent-by-execution) | Generated after. Parents and assembly nodes are always subsequent. |
-
-**"Core architectural tenet" section** — rename to "Core architectural framing" and replace body:
-
-> fakeset is built around a **concept semi-lattice**: a partial order where `A ≤ B` means
-> "dataset A is a more-constrained subset of B's population". An `include:` stanza expresses
-> constraint specialisation — not data dependency. A child is a narrower, more-constrained cut
-> of its parent's population. A `links:` stanza introduces a *linked dataset* — a target from
-> which list items are drawn per outer row, governed by the witness/assembly pipeline.
->
-> This framing is specified in full in `specs/REFRAME-1.md`. In brief: every dataset is a node
-> in the semi-lattice; every pair of nodes with a shared ancestor has a **meet** (greatest lower
-> bound); the most-constrained nodes — those covering ⊥ directly — are **atoms**, generated first.
->
-> The algorithm has two symmetric phases:
->
-> 1. **Push down** — field definitions, type constraints, and ref bindings propagate *down* the
->    lattice toward atoms. For linked datasets, the staging node pre-generates scalar fields
->    before the witness (atom) is generated.
->
-> 2. **Accumulate up** — generated atom values propagate *up* the lattice toward parents and
->    linked nodes. For include relationships this is `grow_parent_from_children` (DataFusion
->    LEFT JOIN on `_row_idx`). For collect bindings this is `AccumulateToLinked` — the symmetric
->    operation that accumulates atom-level values back into linked-dataset fields.
->
-> When a parent field matches a child's field (by ref-wiring or same name), the child's column
-> is *inherited* directly; fields with no child source are generated fresh. This logic lives in
-> `executor.rs::grow_parent_from_children`.
->
-> *Theoretical note:* all generator invocations could conceptually happen in parallel — the
-> algorithm's serialisation is purely a scheduling constraint imposed by the inherited-field
-> lattice. The interesting work is resolving which pre-solved values propagate to which nodes
-> and in what order.
-
-**"Sibling segmentation" section** — rename heading to "Lower cover segmentation (Bernoulli factoring)":
-- "siblings" → "lower cover members"
-- "sibling group" → "lower cover group"
-- "`--max-siblings`" → "`--max-lower-cover`"
-- "`plan_segments` controls the explosion with three steps" — body unchanged (already accurate)
-
-**Execution pipeline step list** — update `build_plan` bullet list:
-
-```
-`build_plan` produces a flat list of `ExecutionStep` variants:
-
-- `GenerateDataset` — dataset with no list links; generates, evaluates, and emits in one step.
-- `GenerateStagingNode` — dataset with list links; generates scalar batch only, stores in
-  `computed`, no expression evaluation, no emit.
-- `GenerateLowerCoverGroup` — parent + lower cover planned together via Bernoulli factoring;
-  parent emits directly from this step when it has no list links.
-- `GenerateStagingLowerCoverGroup` — staging counterpart of `GenerateLowerCoverGroup`; parent
-  has list links, so emit is deferred to `AssembleFromWitness`.
-- `GenerateWitness` — generates the witness batch (one row per source-slot × linked-row draw).
-- `AssembleFromWitness` — folds witness batches into `ListArray` columns, evaluates expressions,
-  emits the final output.
-- `AccumulateToLinked` — accumulates atom-level values into linked-dataset fields (collect
-  bindings); followed by `EmitDataset` for the updated linked dataset.
-- `WriteSharedOutput` — union + shuffle all accumulated batches for a shared output file,
-  write once.
-```
-
-**Module map** — update descriptions for `segment.rs`, `plan.rs`, and `executor.rs`:
-
-| `segment.rs` | `plan_segments` — Bernoulli weights, conflict pruning, IPF, rounding. `LowerCoverMember` and `Segment` types. |
-| `plan.rs` | `build_plan` — row counts, lower cover groups, inherited-field wiring, collect targets → `ExecutionPlan` / `ExecutionStep` |
-| `executor.rs` | `execute` — interprets the plan; staging node generation, witness generation, assembly, `grow_parent_from_children`, `AccumulateToLinked`. All DataFusion and Arrow batch operations. |
-
-**Key conventions** — update sentinels:
-- `_slot_idx`: "a `UInt32` staging-node slot index present in all witness and child batches — which source slot each atom row belongs to. Used by `AssembleFromWitness` to fold witness rows into per-slot lists. Also used in top-level cardinality batches for which parent-row slot each child row belongs to. Retained in `computed` for grandchild access; stripped from emitted output by `filter_hidden_columns`."
-- `_pool_idx` entry → `_linked_idx`: "a `UInt32` column in witness batches recording which linked-dataset row was drawn (index into the eligible linked batch). Persisted for `AccumulateToLinked` collect bindings."
-- Remove the "Pool rows come first" entry; replace with: "**Linked rows preceding staging rows** — when a dataset has witness-source lower cover members, the linked-dataset rows occupy the leading positions in the combined batch so `GenerateWitness`'s `n_eligible_slots` boundary correctly identifies eligible linked-dataset slots."
-
-**Planned next steps** — update:
-- `execute_inner_flat` → `execute_witness` (already captured in the step; just remove the now-incorrect function name)
+*Full plan: [`specs/done/REFRAME-1-stage-1.md`](done/REFRAME-1-stage-1.md)*
 
 ---
 
-#### Stage 1B — `README.md`
+### Stage 2 — Naming pass ✓ Complete
 
-**Glossary** — add/update rows:
+Pure renames across all modules, CLI, tests, and fixture YAML files. No algorithmic changes.
+Every symbol, constant, CLI flag, doc comment, and printed string now uses the new vocabulary:
+`LowerCoverMember` (was `Sibling`), `is_witness_source` (was `is_pool`), `GenerateWitness` /
+`AssembleFromWitness` / `AccumulateToLinked` (was `GenerateInnerFlat` / `AssembleNestedInclude` /
+`CollectToPool`), `InheritedField` (was `PrefillSource`), `--max-lower-cover` (was
+`--max-siblings`), `content.from` (was `content.group`). 23 fixture YAML files had `group:`
+renamed to `from:`.
 
-| Term | Definition |
-|---|---|
-| **parent** (parent-by-inclusion) | A dataset that is *included by* another — the less-constrained, broader population. |
-| **child** (child-by-inclusion) | A dataset that *includes* another — the more-constrained, narrower population. |
-| **lower cover** | The set of datasets that directly include a given parent. Formerly called "siblings". |
-| **lower cover group** | A parent together with its lower cover; planned as a unit via Bernoulli factoring. |
-| **linked dataset** | The target of a `links:` stanza — the dataset whose rows are drawn as list items. |
-| **staging node** | Internal node holding scalar non-list fields while list items are being assembled. |
-| **witness node** | Atom node carrying the linked dataset's schema; one row per unique linked-row draw. |
-| **preceding** (preceding-by-execution) | Generated first. Atoms are always preceding. |
-| **subsequent** (subsequent-by-execution) | Generated later. Parents and assembly nodes are always subsequent. |
-
-Remove the old sentence "The rule is: **parents are subsequent, children are preceding.**" and replace with "The rule is: **the most-constrained nodes (atoms) are generated first; parents and assembly nodes are assembled from them.**"
-
-**YAML schema section** — the `events` field example currently shows the pre-MULT-1
-`content: {include: {file: ..., ref: ..., ratio: ..., cardinality: ...}}` syntax. Replace it
-and the surrounding `content.include` sibling-segmentation YAML block with the current format:
-
-```yaml
-links:
-  - file: events.yaml
-    ref: event
-    cardinality: {min: 0, max: 3}   # items drawn per outer row
-
-data:
-  - name: events          # list-link field — items are structs drawn from the linked dataset
-    type: list
-    content:
-      from: event         # draw items from the "event" linked dataset
-      fields:
-        - name: event_id
-          refs: event.id  # sourced from the linked dataset
-        - name: label
-          type: string    # generated fresh per witness row
-```
-
-Also update the `ratio:` example that appears under "sibling segmentation":
-
-```yaml
-include:
-  file: customers.yaml
-  ratio: 0.05   # marginal row-membership probability (Bernoulli)
-```
-This is correct for top-level includes and needs no change; remove the `content: {include: ...}` block below it that no longer reflects the model.
-
-**"Sibling segmentation" section** — rename heading to "Lower cover segmentation (Bernoulli factoring)":
-- "siblings" → "lower cover members" / "lower cover"
-- "sibling segmentation" → "Bernoulli factoring"
-- Remove the sentence starting "A `content.include` pool sibling places qualifying rows…" (this concept no longer maps to the current model; the witness/assembly pipeline handles it)
+*Full plan: [`specs/done/REFRAME-1-stage-2.md`](done/REFRAME-1-stage-2.md)*
 
 ---
 
-### Stage 2 — Naming pass
-
-Pure renames: no algorithmic or structural changes. Every symbol, constant, CLI flag,
-doc comment, and printed string uses the new vocabulary after this stage.
-Verify with `cargo check` + `cargo test` at the end — no behavioural change expected.
-
----
-
-#### Stage 2 — `lib/segment.rs`
-
-| Old | New |
-|-----|-----|
-| `pub struct Sibling` | `pub struct LowerCoverMember` |
-| `pub is_pool: bool` | `pub is_witness_source: bool` |
-| `pub const DEFAULT_MAX_SIBLINGS: usize` | `pub const DEFAULT_MAX_LOWER_COVER: usize` |
-| `Segment.siblings: Vec<PathBuf>` | `Segment.members: Vec<PathBuf>` |
-| `fn sibling_field_constraints` | `fn lower_cover_field_constraints` |
-| `fn plan_segments(..., siblings: &[Sibling], max_siblings: usize)` | `plan_segments(..., members: &[LowerCoverMember], max_lower_cover: usize)` |
-| `fn precompute_conflicts(siblings: &[Sibling])` | `fn precompute_conflicts(members: &[LowerCoverMember])` |
-| local `sib` / `sibs` / `n_siblings` | `member` / `members` / `n_members` |
-
-Internal test helper: `is_pool: false` → `is_witness_source: false`;
-`plan_segments(..., DEFAULT_MAX_SIBLINGS)` → `plan_segments(..., DEFAULT_MAX_LOWER_COVER)`.
-
-All doc comments: "sibling group" → "parent + lower cover", "siblings" → "lower cover members".
-
----
-
-#### Stage 2 — `lib/models.rs`
-
-| Old | New |
-|-----|-----|
-| `ListContent.group: Option<String>` | `ListContent.from: Option<String>` with `#[serde(alias = "group")]` |
-| `fn is_link_content(&self) -> bool` | `fn is_list_link(&self) -> bool` |
-| `fn for_each_link_content<'a>(...)` | `fn for_each_list_link<'a>(...)` |
-
-Inside `for_each_list_link`: `content.group` → `content.from`.
-
-Doc comment on `ListContent`: "nested include" → "list-link field"; "pool dataset" →
-"linked dataset"; "pool-scoped ref" → "linked-dataset ref".
-
-Doc comment on `SyntheticDataset.links`: "Pool/partner datasets" → "Linked datasets";
-"pool-scoped values" → "linked-dataset values"; "nested-include pipeline" →
-"witness/assembly pipeline".
-
----
-
-#### Stage 2 — `lib/plan.rs`
-
-**`ExecutionStep` variant renames:**
-
-| Old variant | New variant | Field renames |
-|-------------|-------------|---------------|
-| `GenerateInnerFlat { flat_key, outer_path, ..., pool_slots_path }` | `GenerateWitness { witness_key, staging_path, ..., linked_path }` | `flat_key` → `witness_key`; `outer_path` → `staging_path`; `pool_slots_path` → `linked_path` |
-| `AssembleNestedInclude { outer_path, dataset, flat_specs }` | `AssembleFromWitness { staging_path, dataset, witness_specs }` | `outer_path` → `staging_path`; `flat_specs` → `witness_specs` |
-| `CollectToPool { pool_path, pool_field, group_by: "_pool_idx", ... }` | `AccumulateToLinked { linked_path, linked_field, group_by: "_linked_idx", ... }` | `pool_path` → `linked_path`; `pool_field` → `linked_field`; hardcoded string `"_pool_idx"` → `"_linked_idx"` |
-| `GenerateSiblingGroup { ..., siblings, skip_parent_emit }` | `GenerateLowerCoverGroup { ..., members, skip_parent_emit }` | `siblings` → `members`; `skip_parent_emit` unchanged until Stage 3 |
-
-**`PrefillSource` struct** → `InheritedField` (fields `from_path`, `from_column`, `into_column` unchanged).
-
-**Function renames:**
-
-| Old | New |
-|-----|-----|
-| `fn build_sibling_groups` | `fn build_lower_cover_groups` |
-| `fn collect_pool_siblings` | `fn collect_linked_lower_cover_members` |
-| `fn pool_sibling_path` | `fn linked_lower_cover_path` |
-| `fn inner_flat_key` | `fn witness_key` |
-| `fn emit_nested_include_steps` | `fn emit_witness_steps` |
-| `fn push_with_nested_include` | `fn push_with_list_link_steps` |
-| `fn check_case2_collect_restrictions` | `fn check_collect_segmentation_restrictions` |
-
-**Inside `emit_witness_steps`** (was `emit_nested_include_steps`):
-- `content.group` → `content.from` (accessing `ListContent.from` after the models rename)
-- `is_link_content()` → `is_list_link()` (call site in `push_with_list_link_steps`)
-- local `flat_key` → `witness_key`; `pool_slots_path` → `linked_path`
-- comment "CollectToPool" → "AccumulateToLinked"
-
-**Local variables** throughout: `pool_path` → `linked_path`; `pool_sibling` → `linked_member`;
-`is_pool` → `is_witness_source`; `sibs` / `sib` / `n_siblings` → `members` / `member` / `n_members`.
-
-Doc comment on `GenerateWitness` (was `GenerateInnerFlat`): remove "inner flat", "pool slot",
-"pool-scoped refs" — replace with witness/staging/linked vocabulary.
-
-**Imports**: `PrefillSource` → `InheritedField`; `Sibling` → `LowerCoverMember`;
-`DEFAULT_MAX_SIBLINGS` → `DEFAULT_MAX_LOWER_COVER`.
-
----
-
-#### Stage 2 — `lib/executor.rs`
-
-**Function renames:**
-
-| Old | New |
-|-----|-----|
-| `fn execute_inner_flat` | `fn execute_witness` |
-| `fn execute_assemble_nested_include` | `fn execute_assemble_from_witness` |
-| `fn execute_collect_to_pool` | `fn execute_accumulate_to_linked` |
-| `fn inject_pool_idx` | `fn inject_linked_idx` |
-| `fn strip_pool_idx` | `fn strip_linked_idx` |
-
-**Column name** `"_pool_idx"` → `"_linked_idx"` everywhere: in `prepend_column` calls, SQL
-strings (if any), doc comments, and the `strip_sentinel` calls.
-
-**Match arm** `ExecutionStep::GenerateSiblingGroup` → `ExecutionStep::GenerateLowerCoverGroup`;
-destructure `siblings` → `members`. Dispatch to `execute_sibling_group` (function rename:
-`execute_sibling_group` → `execute_lower_cover_group`; parameter `siblings: &[Sibling]` →
-`members: &[LowerCoverMember]`).
-
-**Match arm** `ExecutionStep::CollectToPool` → `ExecutionStep::AccumulateToLinked`; destructure
-`pool_path` → `linked_path`, `pool_field` → `linked_field`. Dispatch to `execute_accumulate_to_linked`.
-
-**Inside `execute_witness`** (was `execute_inner_flat`):
-- local `pool_slots` → `linked_batch`
-- doc comments: "pool slot", "pool-scoped ref", "pool sampling" → linked-dataset vocabulary
-
-**Imports**: `PrefillSource` → `InheritedField`; `Sibling` → `LowerCoverMember`.
-
----
-
-#### Stage 2 — `lib/graph.rs`, `lib/validate.rs`, `lib/rewrite.rs`, `lib/expressions.rs`
-
-**`graph.rs`**: No symbol renames currently needed (grep shows no old-vocab symbols). Update
-any doc comments that use "pool dataset", "pool sibling", "nested-include", or "rich list"
-vocabulary.
-
-**`validate.rs`**: String literals to update:
-- `"count cannot be set on a nested-include list field"` → `"count cannot be set on a list-link field"`
-- `"nested include content at …"` → `"list-link content at …"`
-- `"expression is not supported inside nested include content"` → `"expression is not supported inside list-link content"`
-- `"pool dataset not loaded"` → `"linked dataset not loaded"`
-- Comment `// Case 2 — fields inside nested-include content blocks` → `// Case 2 — fields inside list-link content blocks`
-
-**`rewrite.rs`**: Symbol and string updates:
-- `fn resolve_nested_include_content_field` → `fn resolve_list_link_content_field`
-- Error strings: `"nested include field '{}': ..."` → `"list-link content field '{}': ..."`
-- Comment `// Resolve pool-scoped refs inside nested include content` → new vocabulary
-
-**`expressions.rs`**: No symbol renames expected (grep shows no old-vocab identifiers). Update
-any comments that use "nested include" or "pool" vocabulary.
-
----
-
-#### Stage 2 — `src/main.rs`
-
-**CLI flag**: `--max-siblings` → `--max-lower-cover`.
-Help string: `"Maximum number of lower cover elements per group. Enumeration cost is 2^N; raising this costs RAM quadratically. Default: 16."`
-
-**Import**: `segment::DEFAULT_MAX_SIBLINGS` → `segment::DEFAULT_MAX_LOWER_COVER`.
-
-**`print_plan` string replacements** (exact strings from current source):
-
-| Old string | New string |
-|------------|------------|
-| `"inner flat:"` (in the `GenerateInnerFlat` arm label) | `"witness:"` |
-| `"assemble nested include:"` | `"assemble from witness:"` |
-| `"collect to pool:"` | `"accumulate to linked:"` |
-| `"sibling group:"` | `"lower cover group:"` |
-| `"siblings:"` (the sub-list label) | `"lower cover:"` |
-| `"(parent-only)"` (segment label) | `"(remainder)"` |
-| `"[nested include content]"` | `"[list-link content]"` |
-| `"prefill:"` | `"inherits:"` |
-
-Match arm renames: `GenerateSiblingGroup` → `GenerateLowerCoverGroup`;
-`GenerateInnerFlat` → `GenerateWitness`; `AssembleNestedInclude` → `AssembleFromWitness`;
-`CollectToPool` → `AccumulateToLinked`. Field destructuring: `flat_key` → `witness_key`,
-`flat_specs` → `witness_specs`, `pool_path` → `linked_path`, `pool_field` → `linked_field`,
-`siblings` → `members`.
-
----
-
-#### Stage 2 — `tests/executor_tests.rs`
-
-**Test function renames** (no logic changes, only `fn` names and comments):
-
-| Old | New |
-|-----|-----|
-| `test_inner_flat_slot_idx` | `test_witness_slot_idx` |
-| `test_bernoulli_nested_include_parent_assembles_correctly` | `test_bernoulli_list_link_parent_assembles_correctly` |
-| `test_plain_fields_in_nested_include_content` | `test_plain_fields_in_list_link_content` |
-| `test_nested_include_refs` | `test_list_link_refs` |
-| `test_nested_include_collect_to_pool` | `test_list_link_collect_to_linked` |
-| `test_variant_sibling_total_rows` | `test_variant_lower_cover_total_rows` |
-
-**Assertion string / field access renames**:
-- `"_pool_idx must not appear in wards output"` → `"_linked_idx must not appear in wards output"`
-- `"_pool_idx must not appear in directorships output"` → `"_linked_idx must not appear in directorships output"`
-- `ward.get("_pool_idx")` → `ward.get("_linked_idx")`
-- `row.get("_pool_idx")` → `row.get("_linked_idx")`
-
-**Section header comments**: update "sibling", "pool", "nested include", "inner flat" to new
-vocabulary (e.g. `// _slot_idx and _pool_idx sentinel tests` → `// _slot_idx and _linked_idx sentinel tests`).
-
-**Inline comments** (illustrative; update any others found during the pass):
-- `"Each ward has an on_call_doctors list drawn from doctors via _pool_idx"` →
-  `"drawn from doctors via witness batch"`
-- `"pool val should be in [1, 10]"` → no change needed (this refers to a YAML field value, not a sentinel)
-
----
-
-#### Stage 2 — fixture YAML files (`group:` → `from:`)
-
-23 files require a single-field rename. In each file: `group: <ref>` → `from: <ref>`.
-Once all fixtures are migrated, remove the `#[serde(alias = "group")]` from `ListContent.from`.
-
-Files (relative to repo root):
-
-```
-tests/fixtures/execute/include_fields_list_link/events.yaml
-tests/fixtures/execute/bernoulli_link_content/events.yaml
-tests/fixtures/execute/hidden_collect_binding/outer.yaml
-tests/fixtures/execute/link_content_plain/records.yaml
-tests/fixtures/execute/no_replacement/outer.yaml
-tests/fixtures/execute/project_list/events.yaml
-tests/fixtures/execute/wards_doctors/wards.yaml
-tests/fixtures/execute/link_content/events.yaml
-tests/fixtures/execute/count_normal/outer.yaml
-tests/fixtures/validation/link_content_expression_in_content/main.yaml
-tests/fixtures/validation/link_content_include_scoped_with_type/main.yaml
-tests/fixtures/validation/project_ref_mismatch/outer.yaml
-tests/fixtures/validation/link_content_outer_scoped_missing_field/main.yaml
-tests/fixtures/validation/project_field_missing/outer.yaml
-tests/fixtures/validation/link_content_outer_scoped_no_type/main.yaml
-tests/fixtures/validation/count_on_nested_include_list/main.yaml
-tests/fixtures/validation/collect_bind_not_list/outer.yaml
-tests/fixtures/plan/nested_collect/outer.yaml
-tests/fixtures/plan/case2_collect_joint_segment/outer.yaml
-tests/fixtures/validation/project_with_fields/outer.yaml
-tests/fixtures/validation/link_content_include_scoped_missing_field/main.yaml
-tests/fixtures/plan/reinforcement_zero_infeasible/outer.yaml
-tests/fixtures/validation/collect_bind_no_default/outer.yaml
-```
-
-After migrating all 23 files, remove the serde alias from `ListContent.from` (one-line edit
-to `models.rs`).
-
-**Deliverable**: `cargo check` passes; all 173+ tests pass; every human-readable symbol and
-string uses new vocabulary. No behavior change.
-
----
-
-### Stage 3 — Staging node as explicit execution step
-
-Currently `skip_emit: bool` on `GenerateDataset` serves two distinct roles, and the step type
-name gives no hint which role applies:
-
-1. **Staging** (`has_list_link = true`): scalar batch stored in `computed`; no expression
-   evaluation; no emit. Assembly deferred to `AssembleFromWitness`.
-2. **Collect-target deferral** (`is_collect_target = true`, no list links): expressions
-   evaluated; emit deferred to the `EmitDataset` step that follows `AccumulateToLinked`.
-
-`GenerateLowerCoverGroup` has `skip_parent_emit: bool` for the same role-1 purpose.
-
-Stage 3 separates these roles by introducing two new step variants and a shared executor
-helper, so the step type is always self-documenting.
-
----
-
-#### Stage 3 — `lib/plan.rs`
-
-**New `ExecutionStep` variants**:
-
-```rust
-/// Staging node: generates scalar (non-list) fields only. No expression evaluation,
-/// no emit. `AssembleFromWitness` adds list columns and emits.
-GenerateStagingNode {
-    path: PathBuf,
-    dataset: Arc<SyntheticDataset>,
-    rows: usize,
-    prefills: Vec<InheritedField>,
-},
-
-/// Staging counterpart of `GenerateLowerCoverGroup`.
-/// Parent has list-link fields; emit is deferred to `AssembleFromWitness`.
-GenerateStagingLowerCoverGroup {
-    parent_path: PathBuf,
-    parent: Arc<SyntheticDataset>,
-    segments: Vec<Segment>,
-    members: Vec<LowerCoverMember>,
-},
-```
-
-**Remove flags from existing variants**:
-- `GenerateDataset`: remove `skip_emit: bool` field. The `defer_emit: bool` rename (for
-  collect-target deferral) is the only remaining skip flag — rename the field to `defer_emit`
-  to make the remaining purpose explicit.
-- `GenerateLowerCoverGroup`: remove `skip_parent_emit: bool`. The step type now carries this
-  information.
-
-**`push_with_list_link_steps`** (was `push_with_nested_include`) — change signature to accept
-two closures, one per case:
-
-```rust
-fn push_with_list_link_steps(
-    steps: &mut Vec<ExecutionStep>,
-    dataset: &SyntheticDataset,
-    path: &Path,
-    defer_emit: bool,             // collect-target deferral; only applies when !has_list_link
-    all_datasets: &HashMap<PathBuf, SyntheticDataset>,
-    make_staging: impl FnOnce() -> ExecutionStep,
-    make_normal: impl FnOnce(bool) -> ExecutionStep,  // arg = defer_emit
-) {
-    if dataset.data.iter().any(|f| f.is_list_link()) {
-        steps.push(make_staging());
-        emit_witness_steps(dataset, path, all_datasets, steps);
-    } else {
-        steps.push(make_normal(defer_emit));
-    }
-}
-```
-
-**Call sites** (there are two, one for datasets and one for lower cover groups):
-
-```rust
-// Standalone dataset:
-push_with_list_link_steps(
-    &mut steps, dataset, path, is_collect_target, datasets,
-    || ExecutionStep::GenerateStagingNode { path: p.clone(), dataset: d.clone(), rows, prefills: prefills.clone() },
-    |defer| ExecutionStep::GenerateDataset { path: p, dataset: d, rows, prefills, defer_emit: defer },
-);
-
-// Lower cover group:
-push_with_list_link_steps(
-    &mut steps, dataset, path, /*defer_emit=*/false, datasets,
-    || ExecutionStep::GenerateStagingLowerCoverGroup { parent_path: p.clone(), parent: d.clone(), segments: segs.clone(), members: members.clone() },
-    |_| ExecutionStep::GenerateLowerCoverGroup { parent_path: p, parent: d, segments: segs, members },
-);
-```
-
-(A lower cover group parent is never a standalone collect target; `defer_emit=false` here.)
-
----
-
-#### Stage 3 — `lib/executor.rs`
-
-**Shared helpers** — introduce two functions that both paths call:
-
-```rust
-/// Core logic for GenerateDataset (defer_emit=false or true) and GenerateStagingNode (is_staging=true).
-async fn execute_dataset_core(
-    is_staging: bool,
-    defer_emit: bool,
-    path: &Path,
-    dataset: &SyntheticDataset,
-    rows: usize,
-    prefills: &[InheritedField],
-    computed: &mut HashMap<PathBuf, RecordBatch>,
-    shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
-) -> Result<()> {
-    let prefill_map = resolve_prefills(prefills, computed);
-    let batch = generate_prefilled_batch(&dataset.data, rows, &prefill_map)?;
-    if is_staging {
-        // Scalar batch only. AssembleFromWitness adds list columns and emits.
-        computed.insert(path.to_path_buf(), batch);
-    } else {
-        let batch = evaluate_expressions(batch, dataset).await?;
-        let batch = inject_linked_idx(&batch, path, dataset, computed)?;
-        let output = filter_hidden_columns(strip_linked_idx(batch.clone()), &dataset.data).await?;
-        computed.insert(path.to_path_buf(), batch);
-        if !defer_emit {
-            emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
-        }
-    }
-    Ok(())
-}
-```
-
-```rust
-/// Core logic for GenerateLowerCoverGroup and GenerateStagingLowerCoverGroup.
-async fn execute_lower_cover_group_core(
-    is_staging: bool,
-    path: &Path,
-    dataset: &SyntheticDataset,
-    segments: &[Segment],
-    members: &[LowerCoverMember],
-    computed: &mut HashMap<PathBuf, RecordBatch>,
-    parent_computed: &mut HashSet<PathBuf>,
-    shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
-) -> Result<()>
-```
-
-(The function body is the existing `execute_sibling_group` body, renamed and parameterised by
-`is_staging` instead of `skip_parent_emit`.)
-
-**Match dispatch** — the four arms in `execute`:
-
-```rust
-ExecutionStep::GenerateStagingNode { path, dataset, rows, prefills } => {
-    execute_dataset_core(true, false, path, dataset.as_ref(), *rows, prefills,
-                         &mut computed, &mut shared).await?;
-}
-ExecutionStep::GenerateDataset { path, dataset, rows, prefills, defer_emit } => {
-    execute_dataset_core(false, *defer_emit, path, dataset.as_ref(), *rows, prefills,
-                         &mut computed, &mut shared).await?;
-}
-ExecutionStep::GenerateStagingLowerCoverGroup { parent_path, parent, segments, members } => {
-    execute_lower_cover_group_core(true, parent_path, parent.as_ref(), segments, members,
-                                   &mut computed, &mut parent_computed, &mut shared).await?;
-}
-ExecutionStep::GenerateLowerCoverGroup { parent_path, parent, segments, members } => {
-    execute_lower_cover_group_core(false, parent_path, parent.as_ref(), segments, members,
-                                   &mut computed, &mut parent_computed, &mut shared).await?;
-}
-```
-
-Delete `execute_sibling_group`; the body moves into `execute_lower_cover_group_core`.
-
----
-
-#### Stage 3 — `src/main.rs`
-
-Add `print_plan` arms for the two new variants:
-
-```
-"[{i}] staging node: {name} ({rows} rows)"
-"[{i}] staging lower cover group: {name} (...)"
-```
-
-(Exact format matches the existing `GenerateDataset` and `GenerateLowerCoverGroup` arms
-respectively, prefixed with "staging ".)
-
-Remove `skip_emit` and `skip_parent_emit` from destructuring in existing arms (fields no
-longer exist). `src/main.rs` uses `..` wildcards in all match arms, so no structural change
-is needed there — only adding the two new arms.
-
----
-
-#### Stage 3 — `tests/plan_tests.rs`
-
-Three tests pattern-match on `skip_emit` / `skip_parent_emit` and must be updated:
-
-| Test | Change needed |
-|------|---------------|
-| `list_link_dataset_decomposes_into_witness_and_assemble` | `GenerateDataset { skip_emit: false, .. }` → `GenerateDataset { .. }`; `GenerateLowerCoverGroup { skip_parent_emit: false, .. }` → `GenerateLowerCoverGroup { .. }`; `GenerateDataset { skip_emit: true, .. }` → `GenerateStagingNode { .. }` |
-| `bernoulli_list_link_parent_has_skip_parent_emit` | `GenerateLowerCoverGroup { skip_parent_emit: true, .. }` → `GenerateStagingLowerCoverGroup { .. }`; rename function to `bernoulli_list_link_parent_produces_staging_lower_cover_group` |
-| `list_link_collect_produces_correct_step_sequence` | `GenerateDataset { skip_emit: true, .. }` → `GenerateStagingNode { .. }`; `GenerateLowerCoverGroup { skip_parent_emit: true, .. }` → `GenerateStagingLowerCoverGroup { .. }`; update assertion messages accordingly |
-
----
-
-#### Stage 3 — Verification
-
-```bash
-cargo check    # must pass cleanly
-cargo test     # all tests pass; plan output now shows "staging node:" labels
-```
-
-Spot-check `--print-plan` output for a dataset with list links to confirm the plan printer
-shows `staging node:` / `witness:` / `assemble from witness:` in sequence.
-
-**Deliverable**: `cargo check` and `cargo test` both pass. Plan output explicitly labels
-staging nodes and staging lower cover groups. `skip_emit` / `skip_parent_emit` flags are gone.
+### Stage 3 — Staging node as explicit execution step ✓ Complete
+
+Introduced `GenerateStagingNode` and `GenerateStagingLowerCoverGroup` as explicit step variants,
+replacing the overloaded `skip_emit` / `skip_parent_emit` booleans on `GenerateDataset` and
+`GenerateLowerCoverGroup`. The staging role (generate scalar fields only; defer list assembly)
+and the collect-target deferral role (`defer_emit: bool`, emit after `AccumulateToLinked`) are
+now self-documenting from the step type alone. Shared helpers `execute_dataset_core` and
+`execute_lower_cover_group_core` serve both the staging and non-staging paths.
+
+*Full plan: [`specs/done/REFRAME-1-stage-3.md`](done/REFRAME-1-stage-3.md)*
 
 ---
 
@@ -1258,500 +682,79 @@ _linked_idx + inner content fields`) has been replaced.
 
 ---
 
-#### Stage 4 — Current vs target witness schema
+### Stage 5 — Per-segment witness correctness ✓ Complete
 
-**Current** (junction table, `total` rows = Σ cardinalities):
+One `GenerateWitness` step per (staging segment, list-link field). Each witness covers a
+contiguous slot range (`slot_start`/`slot_count`) and filters the linked batch to rows
+matching that segment's field constraints. Staging batches concatenated in segment order
+(no shuffle) to preserve slot indices. `AssembleFromWitness` unions all per-segment
+witness batches before unnesting. Cumulative `Collect` reducer in `AccumulateToLinked`:
+subsequent calls carry forward existing list items rather than replacing them.
 
-```
-_slot_idx:  UInt32            — which staging slot made this draw
-_linked_idx: UInt32           — which linked batch row was drawn
-<content fields>              — one value per draw (linked-scoped, outer-scoped, or plain)
-```
+*Implemented in `lib/plan.rs` (`emit_witness_steps`, `push_with_list_link_steps`,
+`GenerateWitness`, `AssembleFromWitness`), `lib/executor.rs` (`execute_witness`,
+`execute_lower_cover_group_core`, `execute_assemble_from_witness`,
+`execute_accumulate_to_linked`). New fixture:
+`tests/fixtures/execute/segmented_list_link/`. New test:
+`test_segmented_list_link_assembles_correctly`. All tests pass.*
 
-**Target** (one row per unique linked-row draw, ≤ `linked_batch.len()` rows):
+*Full plan: [`specs/done/REFRAME-1-stage-5.md`](done/REFRAME-1-stage-5.md)*
+---
 
-```
-_linked_idx: UInt32           — which linked batch row this witness row represents (hidden)
-_staging_refs: List<UInt32>   — all staging slot indices that drew this linked row (hidden)
-<linked-scoped content fields>  — value taken from linked batch (same for every draw)
-<plain content fields>          — generated once per unique linked row
-```
+### Stage 5.5 — Cumulative scalar reducers for multi-segment staging nodes ✓ Complete
 
-Outer-scoped content fields (those whose `simple_ref()` resolves in the staging batch rather
-than the linked batch) are **not stored in the witness**. They are looked up from the staging
-batch at assembly time using the per-slot index recovered by unnesting `_staging_refs`.
+Scalar `AccumulateToLinked` reducers (Sum, Max, Min, TakeOne) are now cumulative across
+Bernoulli segments. Subsequent calls combine element-wise (add/max/min for mapped rows;
+existing value unchanged for unmapped rows) rather than overwriting with the default.
+`TakeOne` (renamed from `TakeFirst`, backward-compatible via serde alias) keeps the first
+segment's captured value unchanged on subsequent calls.
+
+*Implemented in `lib/executor.rs` (`execute_accumulate_to_linked`,
+`accumulate_scalar_cumulative`), `lib/models.rs` (`Reducer::TakeOne`), `lib/validate.rs`.
+New fixture: `tests/fixtures/execute/segmented_scalar_reduce/`. New test:
+`test_segmented_scalar_sum_accumulates_correctly`. All tests pass.*
+
+*Full plan: [`specs/done/REFRAME-1-stage-5.5.md`](done/REFRAME-1-stage-5.5.md)*
 
 ---
 
-#### Stage 4 — `lib/executor.rs` — `execute_witness`
+### Stage 6 — Cardinality validation against eligible linked-dataset size ✓ Complete
 
-**Phase 1 — sampling** (unchanged logic, new variable names for clarity):
+`check_reinforcement_zero_feasibility` renamed to `check_cardinality_feasibility` and
+extended to cover two failure classes: (1) empty linked dataset (all reinforcement modes —
+bail before any sampling); (2) without-replacement infeasibility — Fixed(N) > n_eligible
+bails, Uniform{min} > n_eligible bails (new check), Uniform{max} > n_eligible is handled
+by a silent runtime cap in `execute_witness` rather than a plan-time error.
+`max_cardinality_bound` helper removed.
 
-```rust
-// All existing sampling code (n_eligible_slots, counts, slot_assignments, staging_idxs)
-// remains exactly as-is. The output is still two flat arrays:
-//   staging_idxs[k]: which staging slot made draw k  (same as before)
-//   slot_assignments[k]: which linked row was drawn   (same as before)
-let total = counts.iter().sum::<usize>();
-```
+*Implemented in `lib/plan.rs` (`check_cardinality_feasibility`), `lib/executor.rs`
+(Uniform max-cap in `execute_witness`). New fixtures:
+`tests/fixtures/validation/card_fixed_pool_too_small/`,
+`tests/fixtures/validation/card_uniform_min_too_large/`,
+`tests/fixtures/execute/no_replacement_max_cap/`. New tests:
+`card_fixed_pool_too_small_errors`, `card_uniform_min_too_large_errors` (plan_tests.rs),
+`test_no_replacement_max_cap` (executor_tests.rs). All tests pass.*
 
-**Phase 2 — deduplication: group by linked row**:
-
-```rust
-// Build linked_idx → Vec<slot_idx> using a BTreeMap so order is deterministic.
-let mut draw_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-for k in 0..total {
-    draw_map
-        .entry(slot_assignments[k])
-        .or_default()
-        .push(staging_idxs[k]);
-}
-// draw_map keys are unique linked indices (sorted); values are the staging slots that drew each.
-let unique_linked_idxs: Vec<u32> = draw_map.keys().copied().collect();
-let n_witness = unique_linked_idxs.len();
-
-// Build _staging_refs ListArray.
-let mut refs_offsets: Vec<i32> = vec![0];
-let mut refs_values: Vec<u32> = Vec::new();
-for &linked_idx in &unique_linked_idxs {
-    let slots = &draw_map[&linked_idx];
-    refs_values.extend_from_slice(slots);
-    refs_offsets.push(refs_values.len() as i32);
-}
-let staging_refs_array = ListArray::new(
-    Arc::new(ArrowField::new("item", DataType::UInt32, false)),
-    OffsetBuffer::new(ScalarBuffer::from(refs_offsets)),
-    Arc::new(UInt32Array::from(refs_values)),
-    None,
-);
-let unique_linked_arr = UInt32Array::from(unique_linked_idxs.clone());
-```
-
-**Phase 3 — build witness columns** (iterate over `unique_linked_idxs`, one value per unique linked row):
-
-For each `field` in `inner_fields`:
-
-```rust
-let col: ArrayRef = if let Some(ref_str) = field.simple_ref() {
-    let is_linked_scoped = split_ref(ref_str)
-        .map(|(rp, _)| include.reference == rp)
-        .unwrap_or(false);
-    if is_linked_scoped {
-        // Linked-scoped: take the linked batch value for each unique linked row.
-        let (_, target_col) = split_ref(ref_str).unwrap();
-        let idx = linked_batch.schema().index_of(target_col)?;
-        take(linked_batch.column(idx).as_ref(), &unique_linked_arr, None)?
-    } else {
-        // Outer-scoped: not stored in witness; skip this field.
-        continue;
-    }
-} else {
-    // Plain: generate one fresh value per unique linked row.
-    generate_column(field, n_witness, &[])?
-};
-arrow_fields.push(field_to_arrow(field));
-columns.push(col);
-```
-
-**Phase 4 — assemble witness batch**:
-
-```rust
-let data_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(arrow_fields)), columns)?;
-// Prepend _staging_refs (hidden list column), then _linked_idx (hidden scalar).
-let with_refs = prepend_column(&data_batch, "_staging_refs",
-    Arc::new(staging_refs_array) as ArrayRef)?;
-let witness_batch = prepend_column(&with_refs, "_linked_idx",
-    Arc::new(UInt32Array::from(unique_linked_idxs)) as ArrayRef)?;
-computed.insert(witness_key.clone(), witness_batch);
-```
-
-The witness batch no longer carries `_slot_idx`. The `_slot_idx` values are encoded inside
-each witness row's `_staging_refs` list.
+*Full plan: [`specs/done/REFRAME-1-stage-6.md`](done/REFRAME-1-stage-6.md)*
 
 ---
 
-#### Stage 4 — `lib/executor.rs` — `execute_assemble_from_witness`
-
-The assembly now **unnests `_staging_refs`** to reconstruct the anonymous junction table,
-then proceeds with the existing slot-grouped list-fold logic.
-
-**New helper — `unnest_staging_refs`**:
-
-```rust
-/// Unnest the `_staging_refs` ListArray in `witness` to produce a flat junction table:
-/// one row per (staging-slot, linked-row) pair. Returns the junction table and the
-/// `slot_idx_arr` / `witness_row_arr` index arrays used to build it.
-///
-/// Columns in the returned batch:
-///   _slot_idx: UInt32    — derived from _staging_refs entry values
-///   <inner content fields from witness, replicated per _staging_refs entry>
-///
-/// Outer-scoped fields (absent from witness) are NOT in this batch; callers supply them
-/// by looking up staging_batch[slot_idx] after receiving `slot_idx_arr`.
-fn unnest_staging_refs(
-    witness: &RecordBatch,
-) -> Result<(RecordBatch, UInt32Array, UInt32Array)>
-```
-
-Implementation of `unnest_staging_refs`:
-
-```rust
-let refs_col_idx = witness.schema().index_of("_staging_refs")?;
-let staging_refs = witness.column(refs_col_idx)
-    .as_any().downcast_ref::<ListArray>()
-    .ok_or_else(|| anyhow!("_staging_refs is not a ListArray"))?;
-
-let total: usize = (0..witness.num_rows())
-    .map(|r| staging_refs.value(r).len())
-    .sum();
-
-let mut slot_idxs: Vec<u32> = Vec::with_capacity(total);
-let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
-for wr in 0..witness.num_rows() {
-    let refs_slice = staging_refs.value(wr);
-    let refs_arr = refs_slice.as_any().downcast_ref::<UInt32Array>().unwrap();
-    for &slot in refs_arr.values() {
-        slot_idxs.push(slot);
-        witness_row_idxs.push(wr as u32);
-    }
-}
-let slot_arr = UInt32Array::from(slot_idxs);
-let witness_row_arr = UInt32Array::from(witness_row_idxs);
-
-// Sort pairs by slot_idx so rows are slot-grouped (required by offset-based fold).
-let sort_order = arrow::compute::sort_to_indices(
-    &(Arc::new(slot_arr.clone()) as ArrayRef), None, None)?;
-let slot_arr_sorted: UInt32Array = take(&slot_arr, &sort_order, None)?
-    .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
-let witness_row_arr_sorted: UInt32Array = take(&witness_row_arr, &sort_order, None)?
-    .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
-
-// Strip _linked_idx and _staging_refs; replicate remaining witness columns.
-let stripped = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
-let mut fields = vec![ArrowField::new("_slot_idx", DataType::UInt32, false)];
-let mut cols: Vec<ArrayRef> = vec![Arc::new(slot_arr_sorted.clone())];
-for col_idx in 0..stripped.num_columns() {
-    fields.push(stripped.schema().field(col_idx).as_ref().clone());
-    cols.push(take(stripped.column(col_idx).as_ref(), &witness_row_arr_sorted, None)?);
-}
-let junction = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?;
-Ok((junction, slot_arr_sorted, witness_row_arr_sorted))
-```
-
-**Updated body of `execute_assemble_from_witness`**:
-
-For each `(field_name, witness_key, project_col)` in `witness_specs`:
-
-```rust
-let witness = computed[witness_key].clone();
-let staging = computed[staging_path].clone();
-let staging_n = staging.num_rows();
-
-let (mut junction, slot_arr_sorted, witness_row_arr_sorted) =
-    unnest_staging_refs(&witness)?;
-
-// Identify outer-scoped fields: present in dataset's content definition but absent from
-// the witness batch (after sentinel stripping). Look them up from the staging batch.
-let content_field_defs = dataset.data.iter()
-    .find(|f| &f.name == field_name)
-    .and_then(|f| f.content.as_deref())
-    .map(|c| c.item.fields.as_slice())
-    .unwrap_or(&[]);
-let link_ref = dataset.data.iter()
-    .find(|f| &f.name == field_name)
-    .and_then(|f| f.content.as_deref()?.from.as_deref())
-    .and_then(|from_ref| dataset.links.iter().find(|l| l.reference == from_ref))
-    .map(|l| l.reference.as_str())
-    .unwrap_or("");
-
-let stripped_witness_cols: HashSet<&str> = {
-    let s = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
-    s.schema().fields().iter().map(|f| f.name().as_str()).collect()
-};
-for cf in content_field_defs {
-    if stripped_witness_cols.contains(cf.name.as_str()) { continue; }
-    // Field is outer-scoped: look up from staging batch by slot_idx.
-    if let Some(ref_str) = cf.simple_ref() {
-        let col_name = split_ref(ref_str).map(|(_, c)| c).unwrap_or(ref_str);
-        let stg_idx = staging.schema().index_of(col_name)
-            .map_err(|_| anyhow!("outer-scoped column '{col_name}' not found in staging batch"))?;
-        let col = take(staging.column(stg_idx).as_ref(), &slot_arr_sorted, None)?;
-        let arrow_field = ArrowField::new(cf.name.as_str(), col.data_type().clone(), true);
-        junction = add_column(junction, arrow_field, col)?;
-    }
-}
-
-// From here: existing slot-grouped fold logic, operating on `junction` instead of `inner`.
-// `_slot_idx` replaces the old `_slot_idx` sentinel; strip it to get pure content columns.
-let slot_idx_arr = junction.column(junction.schema().index_of("_slot_idx")?)
-    .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
-
-let mut counts = vec![0usize; staging_n];
-for &idx in slot_idx_arr.values() {
-    counts[idx as usize] += 1;
-}
-
-let inner = strip_sentinel(junction, "_slot_idx");  // content columns only
-let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
-// ... existing project_col / struct-fold logic unchanged from here ...
-```
-
-The `strip_linked_idx(strip_slot_idx(...))` calls are removed; `_slot_idx` is the only
-sentinel left in `junction` (already sorted), and there is no `_linked_idx` in the
-junction table.
-
----
-
-#### Stage 4 — `lib/executor.rs` — `execute_accumulate_to_linked`
-
-The source batch is now a witness batch (has `_staging_refs` and `_linked_idx` as scalar
-columns). It must be expanded to the junction table before aggregating, so that the
-reducer sees **one row per draw** (not one row per unique linked row).
-
-Add a pre-step at the top of the function body:
-
-```rust
-// If the source batch is a Stage-4 witness (has _staging_refs), expand it to the
-// anonymous junction table before aggregating. The junction table has one row per
-// (staging-slot, linked-row) pair, with _linked_idx replicated per draw — exactly
-// the shape the existing aggregation logic expects.
-let source_batch = if source_batch.schema().index_of("_staging_refs").is_ok() {
-    let (junction, _, witness_row_arr_sorted) = unnest_staging_refs(&source_batch)?;
-    // _linked_idx is in source_batch but not in junction; add it back (replicated).
-    let linked_idx_src_idx = source_batch.schema().index_of("_linked_idx")?;
-    let linked_idx_replicated =
-        take(source_batch.column(linked_idx_src_idx).as_ref(), &witness_row_arr_sorted, None)?;
-    add_column(junction, ArrowField::new("_linked_idx", DataType::UInt32, false),
-               linked_idx_replicated)?
-} else {
-    source_batch
-};
-// The rest of the function is unchanged: group by "_linked_idx", aggregate source_field.
-```
-
-Wait — `witness_row_arr_sorted` from `unnest_staging_refs` is sorted by `slot_idx`. For the
-`AccumulateToLinked` aggregate there is no requirement that rows be sorted (DataFusion handles
-grouping); we only need the rows expanded. Use `unnest_staging_refs` for the expansion, then
-add `_linked_idx` back via `take` with the (unsorted) `witness_row_arr`.
-
-Revised (sort-free version for `AccumulateToLinked`):
-
-```rust
-let source_batch = if source_batch.schema().index_of("_staging_refs").is_ok() {
-    // Expand witness to junction table: one row per (slot, linked-row) draw.
-    let refs_col_idx = source_batch.schema().index_of("_staging_refs")?;
-    let staging_refs = source_batch.column(refs_col_idx)
-        .as_any().downcast_ref::<ListArray>().unwrap();
-    let total: usize = (0..source_batch.num_rows())
-        .map(|r| staging_refs.value(r).len()).sum();
-    let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
-    for wr in 0..source_batch.num_rows() {
-        let refs_slice = staging_refs.value(wr);
-        let n = refs_slice.as_any().downcast_ref::<UInt32Array>().unwrap().len();
-        for _ in 0..n { witness_row_idxs.push(wr as u32); }
-    }
-    let witness_row_arr = UInt32Array::from(witness_row_idxs);
-    // Build junction by replicating each witness row per its _staging_refs count.
-    // Include _linked_idx (scalar in witness → replicated in junction).
-    let stripped = strip_sentinel(source_batch.clone(), "_staging_refs");
-    let mut fields = stripped.schema().fields().iter()
-        .map(|f| f.as_ref().clone()).collect::<Vec<_>>();
-    let mut cols = stripped.columns().iter()
-        .map(|c| take(c.as_ref(), &witness_row_arr, None))
-        .collect::<Result<Vec<_>>>()?;
-    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?
-} else {
-    source_batch
-};
-// Existing aggregation: ctx.register_batch("src", source_batch)? ...
-// group_by = "_linked_idx" — unchanged.
-```
-
-The `_staging_refs` column is stripped before replication; `_linked_idx` is kept and
-replicated (it is a scalar in the witness, one per unique linked row, so after replication
-each junction row correctly identifies its linked batch position).
-
----
-
-#### Stage 4 — `lib/executor.rs` — helper changes
-
-**`strip_sentinel`** (new general-purpose helper, supersedes `strip_slot_idx` and
-`strip_linked_idx`):
-
-```rust
-fn strip_sentinel(batch: RecordBatch, name: &str) -> RecordBatch {
-    let Ok(idx) = batch.schema().index_of(name) else { return batch };
-    let mut fields: Vec<Arc<ArrowField>> = batch.schema().fields().to_vec();
-    let mut columns = batch.columns().to_vec();
-    fields.remove(idx);
-    columns.remove(idx);
-    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
-        .expect("strip_sentinel: schema/column mismatch")
-}
-```
-
-Replace the existing `strip_slot_idx` and `strip_linked_idx` functions with calls to
-`strip_sentinel`. Update all callers.
-
----
-
-#### Stage 4 — `lib/plan.rs`
-
-No changes to `ExecutionStep` variants. The `AccumulateToLinked.group_by` field remains
-`"_linked_idx"` — the pre-expansion step in `execute_accumulate_to_linked` ensures
-`_linked_idx` is present in the expanded junction table.
-
-No changes to `GenerateWitness`. The `inner_fields` vec still carries all content field
-definitions (including outer-scoped); `execute_witness` now skips outer-scoped fields
-when building the witness batch, so the executor implicitly handles the categorisation
-without requiring a plan-level change.
-
----
-
-#### Stage 4 — `src/main.rs`
-
-No changes needed. No new `ExecutionStep` variants.
-
----
-
-#### Stage 4 — Tests
-
-**Tests that remain valid without changes** (behaviour preserved):
-
-| Test | Why unchanged |
-|------|---------------|
-| `test_list_link_refs` | Outer-scoped `event_title` correctly resolved per slot in assembly |
-| `test_witness_slot_idx` | Same fixture; observable output identical |
-| `test_plain_fields_in_list_link_content` | Plain fields exist in output; tests don't assert per-slot uniqueness |
-| `test_bernoulli_list_link_parent_assembles_correctly` | All-linked-scoped content; unnesting produces same junction |
-| `test_list_link_collect_to_linked` | Unnesting restores K junction rows per linked row; count preserved |
-| `test_hidden_collect_binding_excluded_but_collect_fires` | Same collect count via unnesting |
-
-**Existing test that needs comment update** (`test_witness_slot_idx`):
-The comment "assembled from inner flat batches keyed by `_slot_idx`" should become
-"assembled from witness batches via `_staging_refs` unnesting; outer-scoped refs resolved
-from staging per slot". No assertion changes.
-
-**New test — `test_staging_refs_deduplicates_linked_rows`**:
-
-Design: use a 1-row linked dataset and `reinforcement: 0` (without-replacement) with
-`cardinality: 1`. Three staging rows → each draws the only linked row → witness has exactly
-1 row with `_staging_refs = [0, 1, 2]`.
-
-Verify:
-1. Output has 3 list entries (one per staging row, each with the single linked row)
-2. The output list column exists and each entry has exactly 1 item
-3. The linked dataset's collect field (if present) has exactly 3 accumulated entries
-
-Fixture: `tests/fixtures/execute/staging_refs_dedup/` — a new fixture pair:
-- `linked.yaml`: 1 row, collect-target field
-- `source.yaml`: 3 rows, `links: [{file: linked.yaml, reinforcement: 0, cardinality: 1}]`,
-  list field `content: {from: linked}` with linked-scoped + collect binding
-
-This fixture also serves as the regression test if `_staging_refs` deduplication is ever
-broken.
-
----
-
-#### Stage 4 — Verification
-
-```bash
-cargo test   # all existing tests pass; new test passes
-```
-
-Spot-check: run a fixture with `--print-plan`, then run with output, and verify that:
-- Witness batch row count ≤ linked batch row count (deduplication happened)
-- Each output list has the correct number of items (matching cardinality × staging rows)
-- Linked-scoped content fields have the linked batch values
-- Outer-scoped fields (e.g. `event_title`) match the enclosing staging row's value
-
-**Known behavioural change**: plain (generator-based) content fields now carry one generated
-value per unique linked-row draw instead of one per draw. If two staging slots draw the same
-linked row, both their list entries share the same plain-field value for that linked row. This
-is correct under the witness-per-linked-row model and is not tested for per-slot uniqueness
-by any existing test.
-
-**Deliverable**: All tests pass; `_staging_refs` is the canonical witness-to-staging join
-column; `_linked_idx` is a scalar per witness row; outer-scoped content fields resolved at
-assembly; plain fields deduplicated by linked row.
-
----
-
-### Stage 5 — Per-segment witness correctness
-
-Currently `emit_witness_steps` emits one `GenerateWitness` per list-link field regardless
-of how many staging segments the source dataset has. The correct model (from REFRAME-1.md)
-is one paired witness per staging segment atom.
-
-**`plan.rs` — `emit_witness_steps`**
-- When the staging node participates in Bernoulli factoring (has lower-cover members in the
-  lower cover group), emit one `GenerateWitness` per staging segment for each list-link field,
-  passing the segment's `field_constraints` to the step so the witness can filter the linked
-  dataset's eligible rows per segment
-- `ExecutionStep::GenerateWitness`: add optional `segment_constraints: HashMap<String, FieldConstraints>`
-  field (empty for un-segmented staging nodes)
-
-**`executor.rs` — `execute_witness`**
-- Accept per-segment field constraints; filter the linked dataset's rows to the eligible
-  subset before sampling (rows whose fields satisfy the constraints)
-- This makes the witness draw from only the eligible slice of the linked dataset for each
-  staging segment
-
-**`executor.rs` — `execute_assemble_from_witness`**
-- `ExecutionStep::AssembleFromWitness.witness_specs`: each entry now carries a `Vec<witness_key>`
-  (one per staging segment) rather than a single key
-- Union witness batches before unnesting `_staging_refs` and assembling lists
-
-**New fixture**: `tests/fixtures/execute/segmented_list_link/` — source dataset with two
-include-based lower cover members (triggering Bernoulli factoring) and one list-link field;
-verifies that one witness batch per staging segment is generated.
-
-**Deliverable**: Correct per-segment witness generation; all tests pass.
-
----
-
-### Stage 6 — Cardinality validation against eligible pool size
-
-**`plan.rs` — new `check_cardinality_feasibility`**
-- Called after `build_lower_cover_groups` and `plan_row_counts`, before returning the plan
-- For each `GenerateWitness` step: compute `eligible_pool_size` — the count of linked-dataset
-  rows that survive the staging segment's field constraints
-- Rules:
-  - Fixed `cardinality: N`: `bail!` if `eligible_pool_size < N`
-  - Min-max `{min: a, max: b}`: `bail!` if `eligible_pool_size < a`; silently cap `b` to
-    `eligible_pool_size` if `b > eligible_pool_size`
-  - `Normal` cardinality: warn (cannot compute a finite upper bound without sampling)
-- Integrates with the existing `check_reinforcement_zero_feasibility` logic (the
-  without-replacement check is a special case of this; consolidate if clean to do so)
-
-**New test fixtures**: cardinality error on under-sized linked dataset; silent max-cap
-behaviour; normal cardinality warning.
-
-**Deliverable**: Planning errors for infeasible fixed cardinalities; silent cap for min-max
-upper bounds.
-
----
-
-### Stage 7 — Outer-ref edge, fixture renames, and final cleanup
-
-**Explicit outer-ref edge**
-- `ExecutionStep::GenerateWitness` already carries `staging_path`; verify that the plan
-  emitter always places `GenerateStagingNode` before the paired `GenerateWitness` steps in
-  the linear step list (currently guaranteed by construction; add an assertion)
-- Document in `graph.rs`: the outer-ref execution dependency is satisfied by step ordering
-  rather than a DAG edge today; note this as a target for a future DAG-aware scheduler
-
-**Fixture directory renames** (update `executor_tests.rs` fixture paths and step assertions):
-- `tests/fixtures/execute/rich_list/` → `tests/fixtures/execute/list_link/`
-- `tests/fixtures/execute/bernoulli_rich_list/` → `tests/fixtures/execute/bernoulli_list_link/`
-- `tests/fixtures/execute/rich_list_plain/` → `tests/fixtures/execute/list_link_flat/`
-
-**Final consistency pass** (all modules)
-- Add or update `//!` module-level doc comments for every `.rs` file using new vocabulary
-- Verify no old vocabulary survives in any string literal, comment, variable name, or doc comment
-- `CLAUDE.md` final update to reflect completed renames and structural changes
-
-**Deliverable**: Fully aligned codebase. No old vocabulary anywhere. `cargo test` green.
+### Stage 7 — Fixture renames, vocabulary cleanup, and final consistency pass ✓ Complete
+
+Pure naming/cleanup pass — no behaviour changes. Eliminated all surviving old vocabulary
+(`pool_scoped`, `sample_pool_*`, `link_content`, `pool row`, `pool field type`, etc.)
+from comments, variable names, function names, and fixture paths. Renamed three execute
+fixture directories (`link_content` → `list_link`, `bernoulli_link_content` →
+`bernoulli_list_link`, `link_content_plain` → `list_link_flat`) and five validation
+fixture directories. Added `//!` doc comments to all 13 `lib/*.rs` files. Added a
+`#[cfg(debug_assertions)]` assertion in `build_plan` verifying staging steps precede
+witness steps. Documented the staging → witness ordering dependency in `graph.rs`.
+
+*Implemented across all `lib/*.rs` modules, `tests/executor_tests.rs`,
+`tests/validate_tests.rs`, `tests/plan_tests.rs`, `tests/rewrite_tests.rs`,
+`tests/dag_tests.rs`, `CLAUDE.md`. All tests pass.*
+
+*Full plan: [`specs/done/REFRAME-1-stage-7.md`](done/REFRAME-1-stage-7.md)*
 
 ---
 
