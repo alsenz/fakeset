@@ -1,0 +1,204 @@
+---
+title: List Links & Witness Assembly
+description: How fakeset generates nested lists of structs drawn from a linked dataset using the staging/witness/assembly pipeline.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Two kinds of list field
+
+fakeset supports two kinds of `list` type field:
+
+**Scalar lists** — items are plain values generated from an item field spec:
+
+```yaml
+- name: tags
+  type: list
+  count: { min: 1, max: 5 }
+  content:
+    type: string
+    generator: word
+```
+
+**List-link fields** — items are structs drawn from a linked dataset:
+
+```yaml
+- name: pets
+  type: list
+  content:
+    from: cats       # names a link in the dataset's links: list
+    fields:
+      - name: cat_id
+        refs:
+          - cats.id  # sourced from the linked dataset
+      - name: label
+        type: string # generated fresh per witness row
+```
+
+The `from:` key is what makes it a list-link field. The named value must match a
+`ref:` in the dataset's `links:` list.
+
+## Declaring links
+
+The `links:` stanza declares which datasets can be drawn from:
+
+```yaml
+name: owners
+format: jsonl
+rows: 20
+links:
+  - file: cats.yaml
+    ref: cats
+    cardinality: 2     # draw 2 cats per owner
+data:
+  - name: owner_id
+    type: string
+    generator: uuid
+  - name: pets
+    type: list
+    content:
+      from: cats
+      fields:
+        - name: cat_id
+          refs: [ cats.id ]
+        - name: name
+          refs: [ cats.name ]
+```
+
+The `cardinality:` on the link controls how many items are drawn per outer row.
+It accepts the same `CountSpec` as `count:` — a fixed integer, a uniform range, or
+a normal distribution.
+
+## The staging/witness/assembly pipeline
+
+A list-link field requires three execution steps:
+
+### 1. Staging node
+
+The outer dataset (`owners`) is split. The **staging node** generates all
+*non-list* fields — `owner_id` in this case — and stores the result in `computed`
+without emitting. Each row is indexed by `_slot_idx`.
+
+### 2. Witness node
+
+The **witness node** is an atom: it covers ⊥ directly and has no lattice ordering
+relationship with any other dataset. For each staging slot, it draws `cardinality`
+rows from the eligible linked dataset (cats) and records:
+
+- `_staging_refs: List<UInt32>` — all staging slot indices that drew this particular
+  cat row. When multiple owners draw the same cat, a single witness row covers all
+  of them.
+- `_linked_idx: UInt32` — which cat row was drawn.
+- All fields from the `content.fields:` list that are sourced from the linked
+  dataset (linked-scoped refs).
+- Any fields in `content.fields:` with no `from:` sourcing (generated fresh, once
+  per unique linked row).
+
+### 3. Assembly node
+
+The **assembly node** reads the staging batch and all witness batches. For each
+staging slot, it:
+
+1. Looks up all witness rows whose `_staging_refs` include that slot.
+2. Resolves outer-scoped refs (fields in `content.fields:` that reference the
+   *outer* dataset — `ref: owner_id` rather than `ref: cats.id`).
+3. Folds the matched witness rows into a `ListArray`.
+4. Evaluates any `expression:` fields.
+5. Emits the final output.
+
+## Field scoping in list items
+
+Fields inside `content.fields:` live in a two-namespace environment:
+
+| Ref form | Resolution |
+|----------|-----------|
+| `refs: cats.field_name` | Linked-scoped: value taken from the linked batch; stored in the witness node |
+| `refs: outer_field_name` | Outer-scoped: value taken from the staging node at assembly time; not stored in the witness |
+| `type: string` (no refs) | Fresh: generated once per unique linked row in the witness node |
+
+Outer-scoped refs allow list items to carry values from the enclosing row — e.g.
+an owner's `owner_id` appearing inside each pet entry.
+
+## Per-segment witness replication
+
+When the outer dataset participates in [Bernoulli
+factoring](/concepts/bernoulli-factoring/), the staging node is segmented and each
+segment gets its own paired witness node. This is necessary for correctness: a
+senior owner drawing preferentially from indoor cats requires a different set of
+eligible linked rows than a non-senior owner. A single unified witness node cannot
+apply different per-segment constraints to linked-row selection.
+
+## Collect bindings
+
+A **collect binding** reverses the data flow: instead of drawing values *from* the
+linked dataset, it accumulates values from the generated rows *back into* linked-dataset
+fields.
+
+```yaml
+# cats.yaml — linked dataset
+- name: owner_ids
+  type: list
+  default: []
+```
+
+```yaml
+# owners.yaml — source dataset
+content:
+  from: cats
+  fields:
+    - name: cat_id
+      refs:
+        - target: cats.id
+        - bind: cats.owner_ids
+          reducer: collect
+```
+
+After witness generation, `AccumulateToLinked` fires: for each cat row, it
+collects all the `owner_id` values from the witness batch (via `_linked_idx`) and
+writes them to `cats.owner_ids`. The linked dataset is then emitted with the
+accumulated list populated.
+
+Supported reducers:
+
+| Reducer | Behaviour |
+|---------|-----------|
+| `collect` | Gathers all values as a list |
+| `sum` | Sums numeric values |
+| `max` | Takes the maximum value |
+| `min` | Takes the minimum value |
+| `take_one` | Takes the first value (also aliased `take_first`) |
+
+<Aside type="note">
+The `default:` field on a collect target provides the fallback value for linked rows
+that no outer row drew. For list collect targets use `default: []`.
+</Aside>
+
+## The `project:` shorthand
+
+When you want a scalar list of a single field from the linked dataset rather than
+a list of structs, use `project:`:
+
+```yaml
+- name: cat_ids
+  type: list
+  content:
+    from: cats
+    project: cats.id   # produces List<string> instead of List<{cat_id: string, ...}>
+```
+
+`project:` is mutually exclusive with explicit `fields:` in the `content`.
+
+## Ratio filtering
+
+The `ratio:` on a link entry limits which linked-dataset rows are eligible for
+sampling:
+
+```yaml
+links:
+  - file: cats.yaml
+    ref: cats
+    ratio: 0.5    # sample only from 50% of cat rows
+    cardinality: 2
+```
+
+`eligible_rows = round(ratio × total_linked_rows)`, clamped to `[1, total]`.

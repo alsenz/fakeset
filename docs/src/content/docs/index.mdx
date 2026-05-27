@@ -1,0 +1,99 @@
+---
+title: fakeset
+description: A declarative, DAG-structured synthetic dataset generator.
+tableOfContents: false
+hero:
+  title: fakeset
+  tagline: Generate referentially consistent synthetic datasets from YAML definitions.
+  image:
+    file: ../../assets/logo.svg
+    alt: fakeset logo
+  actions:
+    - text: Get started
+      link: /getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: YAML Reference
+      link: /reference/yaml-schema/
+      icon: open-book
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Why fakeset?
+
+Generating synthetic data that holds together across related datasets is hard.
+A naive approach — generate each dataset independently — produces IDs that don't
+match, ratios that drift, and constraints that contradict each other. fakeset
+solves this by treating the relationships between datasets as a **concept
+semi-lattice** and generating data in the one order that guarantees consistency:
+most-constrained first.
+
+<CardGrid>
+  <Card title="Declarative schemas" icon="document">
+    Describe datasets as YAML files. Declare types, generators, constraints, and
+    relationships — fakeset works out the rest.
+  </Card>
+  <Card title="Referential consistency" icon="approve-check">
+    Shared IDs, ratios, and field constraints are honoured across every output
+    file. No post-processing required.
+  </Card>
+  <Card title="Bernoulli segmentation" icon="puzzle">
+    Lower-cover siblings share their parent's rows via mathematically correct
+    Bernoulli factoring with IPF, not ad-hoc splitting.
+  </Card>
+  <Card title="List links" icon="list-format">
+    Generate nested lists of structs drawn from a linked dataset — ownership
+    records, event logs, product tags — with full outer-ref scoping.
+  </Card>
+</CardGrid>
+
+## Quick example
+
+Three files define an insurance dataset where fraudulent policies are a 5% subset
+of all policies:
+
+```yaml
+# policies.yaml
+name: policies
+format: parquet
+rows: 10000
+data:
+  - name: policy_id
+    type: string
+    generator: uuid
+  - name: premium
+    type: number
+    range: { min: 100, max: 5000 }
+  - name: status
+    type: string
+    value: "active"
+```
+
+```yaml
+# fraudulent_policies.yaml
+name: fraudulent_policies
+format: parquet
+include:
+  file: policies.yaml
+  ref: policies
+  ratio: 0.05
+data:
+  - name: policy_id
+    ref: policies.policy_id
+  - name: premium
+    type: number
+    range: { min: 100, max: 500 }   # fraud signal: low premiums
+  - name: status
+    ref: policies.status
+    value: "cancelled"
+```
+
+```bash
+fakeset policies.yaml fraudulent_policies.yaml
+```
+
+fakeset generates `fraudulent_policies` first (more constrained), then assembles
+`policies` to include the correctly proportioned fraudulent cohort — 500 rows with
+`status: cancelled` and the rest generated fresh.

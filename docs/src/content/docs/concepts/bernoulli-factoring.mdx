@@ -1,0 +1,133 @@
+---
+title: Bernoulli Factoring
+description: How fakeset correctly partitions a parent population across multiple lower-cover members using Bernoulli segmentation and IPF.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## The lower-cover problem
+
+When two or more datasets include the same parent, they form that parent's **lower cover**.
+Their rows must all come from the parent population, but how the rows are shared between
+them is not obvious.
+
+Consider three SME tiers that all include `organisations`:
+
+```yaml
+# small.yaml — includes organisations, ratio: 0.4
+# medium.yaml — includes organisations, ratio: 0.35
+# micro.yaml — includes organisations, ratio: 0.25
+```
+
+If the tiers are mutually exclusive (an organisation is exactly one size), their rows
+partition the parent cleanly: segment A is small-only, segment B is medium-only,
+segment C is micro-only.
+
+But if two lower-cover members could overlap — e.g. `active_customers` (ratio 0.7)
+and `premium_customers` (ratio 0.3) sharing the `customers` parent — then some
+customers are both active *and* premium. The sizes of the four possible segments
+(`active-only`, `premium-only`, `both`, `neither`) are not determined by the marginal
+ratios alone.
+
+fakeset handles both cases correctly via **Bernoulli factoring**.
+
+## The three-step algorithm
+
+`segment.rs::plan_segments` solves the joint distribution in three steps:
+
+### Step 1 — Product-Bernoulli prior
+
+For N lower-cover members, enumerate all 2^N possible membership subsets. Each
+subset is a **segment** — rows belonging to exactly that combination of lower-cover
+members.
+
+The prior weight of each segment is the product of marginal in/out probabilities:
+
+```
+weight(S) = ∏ᵢ { ratio[i]   if member i ∈ S
+                { 1−ratio[i] if member i ∉ S
+```
+
+This assumes all memberships are *independent* Bernoulli trials. For genuinely
+independent flags (e.g. `is_active` and `has_premium`) this prior is exact. For
+mutually exclusive categories, the prior assigns weight to impossible combinations
+which are then pruned in step 2.
+
+### Step 2 — Conflict pruning
+
+Zero out any segment whose field constraints are mutually contradictory.
+Two lower-cover members conflict when they each pin the same field to different
+constant values:
+
+```yaml
+# small.yaml: employee_count.value: "small"
+# medium.yaml: employee_count.value: "medium"
+```
+
+No organisation can be both small and medium, so the segment `{small, medium}` gets
+weight zero. Its weight is redistributed proportionally to surviving segments.
+
+### Step 3 — IPF (Iterative Proportional Fitting)
+
+After pruning, the surviving segment weights generally no longer have the correct
+marginals (each member's declared `ratio`). IPF rescales the weights iteratively
+until the marginals are exactly restored. This typically converges in a few passes.
+
+Integer row counts are derived by Bernoulli rounding: each segment's fractional
+weight is rounded to an integer, with the fractional remainder converted to a
+Bernoulli trial (one extra row with that probability).
+
+## A concrete example
+
+Three SME tiers: `small` (ratio 0.4), `medium` (ratio 0.35), `micro` (ratio 0.25).
+All three pin `size_category` to different constants — so any segment containing
+more than one tier is pruned.
+
+The surviving segments are exactly the three single-tier segments plus the
+`neither` remainder (ratio 0.0, since 0.4+0.35+0.25=1.0). With no remainder,
+only three segments survive — identical to the original lower-cover elements.
+This is the degenerate case where Bernoulli factoring reduces to a simple partition.
+
+For a non-degenerate case, consider `active_customers` (ratio 0.7) and
+`premium_customers` (ratio 0.3) with no conflicting field constraints:
+
+| Segment | Prior weight | After IPF |
+|---------|-------------|-----------|
+| active-only | 0.7 × 0.7 = 0.49 | 49 rows |
+| premium-only | 0.3 × 0.3 = 0.09 | 9 rows |
+| both | 0.7 × 0.3 = 0.21 | 21 rows |
+| neither | 0.3 × 0.7 = 0.21 | 21 rows |
+
+Marginals check: active-only + both = 49 + 21 = 70 ✓, premium-only + both = 9 + 21 = 30 ✓.
+
+## All lower-cover members participate
+
+Every lower-cover member participates in segmentation — even those with `ratio: 1.0`.
+A member with `ratio: 1.0` contributes its field constraints to conflict pruning even
+though it never appears in a "not in this member" segment.
+
+## Recursive factoring
+
+Bernoulli factoring is applied recursively bottom-up. If `employees` has a lower
+cover of `{remote, on-site}`, and both `employees` and `seniors` are in the lower
+cover of `people`, factoring proceeds:
+
+1. Expand `employees` lower cover first → creates `remote/emp`, `on-site/emp`
+   segment atoms.
+2. Expand `people` lower cover `{employees, seniors}` → segments that each
+   incorporate the already-expanded `employees` sub-atoms.
+
+## The segment cap
+
+The default cap is **16 lower-cover members** per group (2^16 = 65,536 segments).
+Override with `--max-lower-cover`:
+
+```bash
+fakeset definitions/ --max-lower-cover 20
+```
+
+<Aside type="caution">
+Raising `--max-lower-cover` costs RAM quadratically — 2^20 = 1M segments.
+Consider whether your lower-cover members genuinely need joint distribution
+modelling or whether they can be split into independent groups.
+</Aside>

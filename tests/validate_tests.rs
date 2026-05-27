@@ -426,6 +426,25 @@ fn test_junction_link_cardinality_errors() {
 }
 
 #[test]
+fn test_include_reinforcement_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/include_reinforcement")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("reinforcement on include: should error");
+    let msg = err.to_string();
+    assert!(msg.contains("reinforcement"), "error should mention 'reinforcement': {msg}");
+    assert!(msg.contains("links"), "error should mention 'links': {msg}");
+}
+
+#[test]
+fn test_link_reinforcement_invalid_value_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/link_reinforcement_invalid")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("reinforcement in (0,1) on a link should error");
+    let msg = err.to_string();
+    assert!(msg.contains("reinforcement"), "error should mention 'reinforcement': {msg}");
+}
+
+#[test]
 fn test_cardinality_min_zero_errors() {
     let paths = vec![PathBuf::from("tests/fixtures/validation/cardinality_min_zero")];
     let datasets = load_all_datasets(&paths).expect("should load");

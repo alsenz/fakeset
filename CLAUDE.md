@@ -20,6 +20,54 @@ cargo run -- examples/corporate-registry --output ./output/corporate-registry
 
 Output goes to `./output/` (gitignored).
 
+## Documentation site
+
+The docs live in `docs/` and are built with [Astro Starlight](https://starlight.astro.build).
+
+### Running and building
+
+```bash
+cd docs
+pnpm run dev        # dev server at http://localhost:4321 with hot reload
+pnpm run build      # production build → docs/dist/
+pnpm run preview    # preview the production build locally
+```
+
+`pnpm run build` automatically runs `scripts/gen-schema.mjs` first (the `prebuild` hook), which executes `cargo run --bin docgen` to regenerate `docs/src/data/schema.json`. The `docgen` binary (`src/docgen.rs`) serialises all YAML-deserializable types to a hand-crafted JSON description.
+
+### Page map
+
+| File | Content |
+|------|---------|
+| `docs/src/content/docs/index.mdx` | Introduction / home page |
+| `docs/src/content/docs/getting-started.mdx` | Installation, first schema, quick-start |
+| `docs/src/content/docs/concepts/semi-lattice.mdx` | Concept semi-lattice model |
+| `docs/src/content/docs/concepts/execution-pipeline.mdx` | 8-stage pipeline, ExecutionStep types, sentinel columns |
+| `docs/src/content/docs/concepts/bernoulli-factoring.mdx` | Lower cover segmentation algorithm |
+| `docs/src/content/docs/concepts/list-links.mdx` | Staging/witness/assembly pipeline, collect bindings |
+| `docs/src/content/docs/reference/yaml-schema.mdx` | Complete YAML field reference (static MDX) |
+| `docs/src/content/docs/reference/generators.mdx` | All generators grouped by category, locale matrix |
+| `docs/src/content/docs/reference/cli.mdx` | CLI flags and examples |
+
+The sidebar order and section labels are configured in `docs/astro.config.mjs`.
+
+### Keeping docs current
+
+When you add or change features, update the docs in the same PR:
+
+- **New YAML field on an existing type** → update `src/docgen.rs` (add the field to the relevant `FieldDoc` list) AND update the corresponding table in `docs/src/content/docs/reference/yaml-schema.mdx`.
+- **New top-level type** → add a `TypeDoc` entry in `src/docgen.rs` AND add a new `##` section with an example in `yaml-schema.mdx`.
+- **New generator or locale** → update `docs/src/content/docs/reference/generators.mdx`.
+- **New CLI flag** → update `docs/src/content/docs/reference/cli.mdx`.
+- **New architectural concept or execution step** → add or extend a page under `docs/src/content/docs/concepts/`. Add it to the sidebar in `astro.config.mjs` if it's a new page.
+- **Renamed terminology** → update the glossary in both this file and the relevant concepts page.
+
+### Assets and styling
+
+- Logo SVG: `docs/src/assets/logo.svg` (Hasse diagram in a cog shape; referenced by Starlight header and the intro hero).
+- Custom CSS: `docs/src/styles/custom.css` — table column no-wrap rules, accent colour palette, hero image flip.
+- **Starlight CSS variable quirk**: Starlight uses `:root` for dark-mode defaults and `:root[data-theme='light']` for light-mode overrides (opposite of the usual convention). To reliably override accent colours, use `html:root` for dark and `html:root[data-theme='light']` for light — this beats Starlight's specificity regardless of stylesheet bundle order.
+
 ## Glossary
 
 These terms have precise meanings in this codebase — use them consistently.

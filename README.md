@@ -140,6 +140,25 @@ Supported field types: `number`, `boolean`, `string`, `object`, `list`, `date`, 
 | [walkdir](https://crates.io/crates/walkdir) | Recursive YAML file discovery |
 | [tokio](https://crates.io/crates/tokio) | Async runtime (required by DataFusion) |
 
+## Documentation
+
+Full documentation lives in the `docs/` directory and is built with [Astro Starlight](https://starlight.astro.build).
+
+```bash
+cd docs
+pnpm install        # first time only
+pnpm run dev        # dev server at http://localhost:4321
+pnpm run build      # production build → docs/dist/
+```
+
+The YAML schema reference is generated from source via a `docgen` binary:
+
+```bash
+cd docs && pnpm run gen-schema   # regenerates docs/src/data/schema.json
+```
+
+This runs automatically as a prebuild step before `pnpm run build`.
+
 ## Building
 
 ```bash

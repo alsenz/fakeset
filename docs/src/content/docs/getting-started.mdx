@@ -1,0 +1,173 @@
+---
+title: Installation & Quick Start
+description: Build fakeset from source and generate your first dataset.
+---
+
+import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+## Prerequisites
+
+- [Rust](https://rustup.rs) 1.80 or later (edition 2024)
+- Cargo (included with Rust)
+
+## Installation
+
+<Steps>
+
+1. **Clone the repository**
+
+   ```bash
+   git clone https://github.com/tomplowy/fakeset
+   cd fakeset
+   ```
+
+2. **Build the release binary**
+
+   ```bash
+   cargo build --release
+   ```
+
+   The binary is placed at `target/release/fakeset`.
+
+3. **(Optional) add to your PATH**
+
+   ```bash
+   cp target/release/fakeset ~/.local/bin/fakeset
+   ```
+
+</Steps>
+
+## Your first schema
+
+Create two YAML files in a new directory:
+
+```yaml title="customers.yaml"
+name: customers
+format: parquet
+rows: 1000
+data:
+  - name: customer_id
+    type: string
+    generator: uuid
+  - name: full_name
+    type: string
+    generator: name
+  - name: email
+    type: string
+    generator: email
+  - name: country
+    type: string
+    generator: country_name
+```
+
+```yaml title="premium_customers.yaml"
+name: premium_customers
+format: parquet
+include:
+  file: customers.yaml
+  ref: customers
+  ratio: 0.1        # 10% of the customer population
+data:
+  - name: customer_id
+    ref: customers.customer_id     # inherit the same ID
+  - name: full_name
+    ref: customers.full_name       # inherit name
+  - name: email
+    ref: customers.email           # inherit email
+  - name: country
+    ref: customers.country         # inherit country
+  - name: tier
+    type: string
+    value: "platinum"
+```
+
+Now run fakeset:
+
+```bash
+fakeset customers.yaml premium_customers.yaml --output ./output
+```
+
+<Aside type="tip">
+You can also point fakeset at a directory and it will discover all `.yaml` / `.yml`
+files recursively:
+
+```bash
+fakeset ./definitions/ --output ./output
+```
+</Aside>
+
+## What just happened?
+
+fakeset reads the `include:` stanza on `premium_customers.yaml` and builds a DAG:
+`premium_customers → customers`. It then generates in topological order — most
+constrained first:
+
+1. **`premium_customers`** is generated first: 100 rows with `tier: "platinum"` and
+   freshly generated IDs, names, and emails.
+2. **`customers`** is assembled: the 100 premium rows are slotted in (their fields
+   inherited by position), and 900 new rows are generated to fill the remainder.
+
+The result: `customers.parquet` contains exactly 1 000 rows, 100 of which appear
+verbatim in `premium_customers.parquet` — `customer_id` matches, `full_name` matches,
+everything is consistent.
+
+## The corporate-registry example
+
+The repository ships a larger worked example under `examples/corporate-registry/`:
+
+```bash
+cargo run -- examples/corporate-registry --output ./output/corporate-registry
+```
+
+This produces five datasets:
+
+| File | Description |
+|------|-------------|
+| `organisations.parquet` | 100 organisations, each with a `directors` list field |
+| `smes.parquet` | SMEs — a 99% subset of organisations |
+| `small_enterprises.parquet` | Small enterprises: 10–49 employees |
+| `medium_enterprises.parquet` | Medium enterprises: 50–249 employees |
+| `micro_enterprises.parquet` | Micro enterprises: < 10 employees |
+
+The three size tiers form the **lower cover** of `smes`: together they partition the SME
+population via Bernoulli segmentation. See [Bernoulli Factoring](/concepts/bernoulli-factoring/)
+for how this works.
+
+## Output formats
+
+fakeset supports four output formats. Set per-dataset with `format:` in the YAML, or
+override all datasets at once with `--output-format`:
+
+<Tabs>
+  <TabItem label="Parquet">
+    ```yaml
+    format: parquet
+    ```
+    Apache Parquet columnar format. Best for analytics workloads and large datasets.
+  </TabItem>
+  <TabItem label="CSV">
+    ```yaml
+    format: csv
+    ```
+    Plain comma-separated values. Compatible with every tool.
+  </TabItem>
+  <TabItem label="JSON">
+    ```yaml
+    format: json
+    ```
+    A JSON array of objects. Convenient for small datasets and APIs.
+  </TabItem>
+  <TabItem label="JSONL">
+    ```yaml
+    format: jsonl
+    ```
+    Newline-delimited JSON. One object per line; good for streaming pipelines.
+  </TabItem>
+</Tabs>
+
+## Next steps
+
+- Read [The Semi-Lattice Model](/concepts/semi-lattice/) to understand how fakeset
+  reasons about constraint relationships between datasets.
+- See the [YAML Schema Reference](/reference/yaml-schema/) for every field and option.
+- Browse the [Generators & Locales](/reference/generators/) catalogue.

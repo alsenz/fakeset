@@ -1,0 +1,373 @@
+---
+title: YAML Schema Reference
+description: Complete reference for all fields in fakeset YAML dataset definitions.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="note" title="Generated reference">
+This page is generated from the Rust source models. Regenerate it with:
+```bash
+cd docs && npm run gen-schema
+```
+</Aside>
+
+## Dataset (top level)
+
+Every YAML file defines one `SyntheticDataset`.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | ✓ | Dataset name; used as the default output filename. |
+| `format` | [`Format`](#format) | ✓ | Output format: `parquet`, `csv`, `json`, or `jsonl`. |
+| `rows` | integer | — | Explicit row count. Mutually exclusive with `ratio` on `include`. |
+| `locale` | [`Locale`](#locale) | — | Default locale for locale-capable generators. Field-level `locale` takes precedence. |
+| `output_file` | string | — | Override the output filename (default: `name`). Multiple datasets sharing the same `output_file` are unioned and shuffled into one file. |
+| `include` | [`Include`](#include) | — | Declares this dataset as a constrained subset of another. |
+| `links` | [`Include[]`](#include) | — | Linked datasets for list-link sampling. Each entry names a dataset from which list items are drawn. |
+| `data` | [`Field[]`](#field) | — | Field definitions. Evaluated in declaration order for expressions. |
+| `variants` | [`VariantSchema[]`](#variantschema) | — | When non-empty, virtually splits the dataset into N concrete variants. Each variant inherits `data` fields and overrides/extends them. |
+
+### Example
+
+```yaml
+name: policies
+format: parquet
+rows: 10000
+locale: en
+output_file: policies
+data:
+  - name: policy_id
+    type: string
+    generator: uuid
+```
+
+---
+
+## Include
+
+Used in both `include:` (top-level constraint inclusion) and `links:` (list-link declarations).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | string | ✓ | Path to the included YAML file, relative to this file. |
+| `ref` | string | ✓ | Name used to reference fields from this include: `ref: <ref>.<field>`. |
+| `ratio` | float | — | Marginal row-membership probability (0.0–1.0). In `include:` this drives the child's row count from the parent: `parent_rows × ratio`. In `links:` this limits the fraction of linked-dataset rows eligible for sampling. |
+| `cardinality` | [`CountSpec`](#countspec) | — | **`links:` only.** How many items to draw per outer row. |
+| `reinforcement` | float | — | **`links:` only.** Sampling intensity: `0` = without-replacement (each linked row drawn at most once per outer row); `1` or absent = uniform with-replacement (default); `> 1` = Pólya-urn clumping (previously-drawn rows become progressively more likely). Values in the open interval `(0, 1)` are invalid. |
+| `fields` | string[] | — | Field names to automatically copy into this dataset as `ref: <ref>.<field>` entries. Use `["*"]` for all fields. |
+| `exclude` | string[] | — | Field names to suppress after `fields` expansion. Only valid when `fields` is non-empty. |
+
+<Aside type="tip">
+`ratio` and `rows` are mutually exclusive on the same dataset. Use `ratio` when
+the child's size should be derived from the parent; use `rows` for root datasets
+with a fixed count.
+</Aside>
+
+### Example
+
+```yaml
+include:
+  file: customers.yaml
+  ref: customers
+  ratio: 0.1
+  fields: ["*"]            # copy all customer fields as refs
+  exclude: [internal_notes]
+```
+
+---
+
+## Field
+
+Defines one column in a dataset's schema.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | ✓ | Column name in the output file. |
+| `type` | [`FieldType`](#fieldtype) | — | Column type. Required unless `ref` is set (type is then inherited from the ref target). |
+| `ref` / `refs` | [`RefsSpec`](#refsspec) | — | Cross-dataset field reference. `ref: <ref>.<field>` for a single ref; `refs:` for multiple including collect bindings. |
+| `generator` | [`Generator`](#generator) | — | Specific fake-rs generator to use. When absent, the type default is used. |
+| `locale` | [`Locale`](#locale) | — | Locale for this field's generator. Overrides the dataset-level locale. |
+| `range` | [`Range`](#range) | — | Inclusive numeric bounds for `number` fields. |
+| `value` | any | — | Emit this constant for every row. Incompatible with `generator`, `range`. |
+| `fields` | [`Field[]`](#field) | — | Nested fields for `object` type. |
+| `content` | [`ListContent`](#listcontent) | — | Element spec for `list` type. |
+| `variants` | [`FieldVariant[]`](#fieldvariant) | — | Alternatives for `type: variant` fields. |
+| `parquet` | [`ParquetConfig`](#parquetconfig) | — | Arrow/Parquet type override. Overrides the default Arrow type inferred from `type`. |
+| `expression` | string | — | SQL expression evaluated after all other fields are generated. Must reference only fields declared above this one. Mutually exclusive with `type`, `ref`, `generator`, `range`, `value`. |
+| `hidden` | boolean | — | Present in the internal batch but excluded from output. Set automatically for expression dependency pull-down. |
+| `count` | [`CountSpec`](#countspec) | — | Items per row for `list` fields. Ignored on other types. |
+| `precision` | integer | — | Decimal precision for `number` fields. Positive = decimal places; negative = rounds by powers of 10 (e.g. `-2` rounds to the nearest 100). |
+| `default` | any | — | Fallback value when no child provides an inherited value. List collect targets use `default: []`. |
+
+### Examples
+
+```yaml
+# Simple typed field
+- name: price
+  type: number
+  range: { min: 0.01, max: 999.99 }
+  precision: 2
+
+# Constant value
+- name: status
+  type: string
+  value: "active"
+
+# Ref field (inherits type from target)
+- name: customer_id
+  ref: customers.customer_id
+
+# Expression field
+- name: vat_amount
+  expression: "price * 0.2"
+
+# Object field
+- name: address
+  type: object
+  fields:
+    - name: street
+      type: string
+      generator: street_name
+    - name: city
+      type: string
+      generator: city_name
+
+# Variant field
+- name: tier
+  type: variant
+  variants:
+    - value: "gold"
+      ratio: 0.1
+    - value: "silver"
+      ratio: 0.3
+    - value: "bronze"
+```
+
+---
+
+## ListContent
+
+Specifies the element type for a `list` field.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `from` | string | — | When set, names the link ref (from `links:`) from which items are drawn. Activates the witness/assembly pipeline. |
+| `project` | string | — | Project a single field from the linked dataset, producing a scalar list. Value: `"<link_ref>.<field_name>"`. Mutually exclusive with explicit `fields` in the item spec. |
+| *(item fields)* | *(Field fields)* | — | All `Field` properties apply to the list item spec (`type`, `generator`, `fields`, etc.). When `from:` is set, `fields:` describes the struct fields of each list item. |
+
+### Example — scalar list
+
+```yaml
+- name: tags
+  type: list
+  count: { min: 1, max: 5 }
+  content:
+    type: string
+    generator: word
+```
+
+### Example — list-link field
+
+```yaml
+- name: directors
+  type: list
+  content:
+    from: individual
+    fields:
+      - name: name
+        refs: [ individual.full_name ]
+      - name: role
+        type: string
+        value: "director"
+      - name: employer
+        type: string
+        refs: [ company_name ]   # outer-scoped ref
+```
+
+---
+
+## FieldVariant
+
+One alternative within a `type: variant` field.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | [`FieldType`](#fieldtype) | Type for this variant. |
+| `generator` | [`Generator`](#generator) | Generator for this variant. |
+| `locale` | [`Locale`](#locale) | Locale for this variant. |
+| `range` | [`Range`](#range) | Numeric range for this variant. |
+| `value` | any | Constant value for this variant. |
+| `parquet` | [`ParquetConfig`](#parquetconfig) | Type override for this variant. Falls back to the parent field's `parquet`. |
+| `ratio` | float | Fraction of the parent field's population allocated to this choice. Unset choices share the remainder equally. |
+
+---
+
+## VariantSchema
+
+One concrete variant of a dataset (used in `variants:`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `data` | [`Field[]`](#field) | Fields that override or extend the dataset's base `data`. Same-named base fields are replaced; new names are appended. |
+| `locale` | [`Locale`](#locale) | Locale override for this variant's fields. |
+| `ratio` | float | Fraction of the parent dataset's rows allocated to this variant. Unset variants share the remainder equally. |
+
+---
+
+## RefsSpec
+
+Specifies one or more ref bindings on a field. Two forms are accepted:
+
+**Single ref** — shorthand for one type-sourcing ref:
+
+```yaml
+ref: customers.customer_id
+```
+
+**Multi ref** — list of ref entries, enabling collect bindings:
+
+```yaml
+refs:
+  - customers.customer_id        # simple entry
+  - target: cats.id              # rich entry: type-sourcing ref
+  - bind: cats.owner_ids         # rich entry: collect binding
+    reducer: collect
+```
+
+Each entry in a multi-ref list is either a plain string (simple ref) or an object
+with optional `target:`, `bind:`, and `reducer:` keys.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `target` | string | The ref target (`"<ref>.<field>"`). Absent on bind-only entries. |
+| `bind` | string | The collect target (`"<ref>.<field>"`). Used with `reducer:`. |
+| `reducer` | [`Reducer`](#reducer) | How values are assembled when the referenced include has different cardinality. |
+
+---
+
+## CountSpec
+
+Specifies a count — used for `count:` (list items per row) and `cardinality:` (linked-dataset draws per outer row).
+
+Three forms:
+
+```yaml
+count: 5                          # fixed
+count: { min: 2, max: 8 }        # uniform random integer in [min, max]
+count: { mean: 5.0, std_dev: 2.0 } # normal distribution, rounded and clamped ≥ 0
+```
+
+---
+
+## Range
+
+Inclusive numeric bounds for `number` type fields.
+
+```yaml
+range:
+  min: 0.0    # optional lower bound
+  max: 100.0  # optional upper bound
+```
+
+Either bound may be omitted; if both are absent, the generator produces an
+unbounded float64.
+
+---
+
+## ParquetConfig
+
+Override the Arrow/Parquet type for a field. Useful for coercing `number` fields to
+specific integer widths or ensuring consistent types across variant choices.
+
+```yaml
+parquet:
+  datatype: int32
+```
+
+---
+
+## FieldType
+
+| Value | Description |
+|-------|-------------|
+| `number` | 64-bit float. Use `parquet.datatype` to coerce to int or narrower float. |
+| `boolean` | Boolean. |
+| `string` | UTF-8 string. |
+| `object` | Nested struct. Requires `fields:` to define sub-columns. |
+| `list` | Array of items. Requires `content:` to define the element spec. |
+| `date` | Calendar date (Arrow `Date32`). |
+| `date_time` | Timestamp with microsecond precision (Arrow `TimestampMicrosecond`). |
+| `variant` | Multi-alternative field expanded into global dataset variants before execution. Requires `variants:` list. |
+
+---
+
+## Format
+
+| Value | Description |
+|-------|-------------|
+| `parquet` | Apache Parquet columnar format. |
+| `csv` | Comma-separated values. |
+| `json` | JSON array of objects. |
+| `jsonl` | Newline-delimited JSON (one object per line). |
+
+---
+
+## Reducer
+
+Controls how values are assembled when a ref spans a cardinality boundary (e.g. accumulating child values into a parent field, or collecting linked-dataset values into the outer dataset).
+
+| Value | Description |
+|-------|-------------|
+| `take_one` (alias `take_first`) | Take the first value. |
+| `sum` | Sum numeric values. |
+| `max` | Maximum value. |
+| `min` | Minimum value. |
+| `collect` | Gather all values as a list. |
+
+---
+
+## ParquetDatatype
+
+Valid values for `parquet.datatype:`:
+
+| Value | Arrow type |
+|-------|-----------|
+| `int8` | Int8 |
+| `int16` | Int16 |
+| `int32` | Int32 |
+| `int64` | Int64 |
+| `uint8` | UInt8 |
+| `uint16` | UInt16 |
+| `uint32` | UInt32 |
+| `uint64` | UInt64 |
+| `float32` | Float32 |
+| `float64` | Float64 |
+| `utf8` | Utf8 (string) |
+| `boolean` | Boolean |
+| `date32` | Date32 |
+| `timestamp_ms` | Timestamp (millisecond) |
+| `timestamp_us` | Timestamp (microsecond) |
+
+---
+
+## Locale
+
+BCP-47-style locale tags. Only valid on generators that support locale selection — see [Generators & Locales](/reference/generators/).
+
+| Value | Locale |
+|-------|--------|
+| `en` | English |
+| `fr_fr` | French (France) |
+| `de_de` | German (Germany) |
+| `it_it` | Italian (Italy) |
+| `nl_nl` | Dutch (Netherlands) |
+| `pt_br` | Portuguese (Brazil) |
+| `pt_pt` | Portuguese (Portugal) |
+| `cy_gb` | Welsh (UK) |
+| `zh_cn` | Chinese (Simplified) |
+| `zh_tw` | Chinese (Traditional) |
+| `ja_jp` | Japanese |
+| `ar_sa` | Arabic (Saudi Arabia) |
+| `tr_tr` | Turkish |
+| `fa_ir` | Persian (Iran) |

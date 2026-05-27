@@ -1,0 +1,180 @@
+---
+title: The Semi-Lattice Model
+description: How fakeset models dataset relationships as a concept semi-lattice and why this guarantees referential consistency.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## include is constraint specialisation
+
+The central design decision in fakeset is what `include:` *means*. It is not a
+data dependency ("copy rows from this file"). It is a **constraint specialisation**:
+
+> "I am a more-constrained subset of my parent's population."
+
+A `fraudulent_policies` dataset that includes `policies` at ratio 0.05 is not
+saying "take rows from policies". It is saying "fraudulent policies are a 5%
+sub-population of all policies, with these additional field constraints". The
+policies population *contains* the fraudulent cohort — not the other way around.
+
+This framing has a concrete consequence for generation order: the most-constrained
+datasets must be generated *first*, and their values propagate *upward* into the
+less-constrained parent populations. The parent is assembled from its children.
+
+## The partial order
+
+All datasets form a **concept semi-lattice**: a partial order where `A ≤ B` means
+"A includes B" — A is a more-constrained, narrower cut of B's population.
+
+```
+⊥ ──→ fraudulent_policies ──→ policies
+```
+
+`fraudulent_policies ≤ policies` because every fraudulent policy is also a policy.
+The order is constraint specialisation, not data dependency.
+
+Two datasets with no include relationship between them — say `policies` and
+`customers` — have no ordering in the lattice. Their meet (greatest lower bound) is
+**⊥**, the bottom element: the empty concept, the population satisfying all
+constraints simultaneously (which is empty when the constraints contradict).
+
+## Atoms: the most constrained nodes
+
+An **atom** is an element that covers ⊥ directly — the most-constrained node in
+a component. Atoms:
+
+- Have no elements below them other than ⊥
+- Are generated from scratch using field generators and local constraints
+- Are always generated before their parents
+
+After [Bernoulli factoring](/concepts/bernoulli-factoring/), segment nodes become
+the new atoms for each lower-cover group. Witness nodes (for list-link fields) are
+always atoms by construction.
+
+## Push down, accumulate up
+
+The algorithm has two symmetric phases:
+
+### Phase 1 — Push down
+
+Field definitions, type constraints, and ref bindings propagate *downward* toward
+atoms before generation begins. This is how a child inherits a field type from its
+parent: the parent declares `field_type: string`, and the planner pushes that type
+down to the child's ref field so the child knows what to generate.
+
+### Phase 2 — Accumulate up
+
+Generated atom values propagate *upward* toward parent nodes. For include
+relationships this means: once all atoms are generated, each parent is assembled
+from its children via a LEFT JOIN on `_row_idx`. Fields present in a child are
+**inherited** (their values copied into the parent's batch); remaining fields are
+generated fresh.
+
+Consistency is guaranteed by construction: any field shared between a parent and
+child dataset carries the *same value* in both outputs, because the parent batch is
+assembled *from* the child batch.
+
+## A worked example
+
+Four datasets: `animals`, `cats`, `dogs`, `owners`.
+
+```yaml
+# animals.yaml — root, 100 rows
+name: animals
+rows: 100
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: weight_kg
+    type: number
+    range: { min: 0.5, max: 80.0 }
+```
+
+```yaml
+# cats.yaml — 60% of animals
+name: cats
+include:
+  file: animals.yaml
+  ref: animals
+  ratio: 0.6
+data:
+  - name: id
+    ref: animals.id
+  - name: environment
+    type: variant
+    variants:
+      - value: indoor
+        ratio: 0.5
+      - value: outdoor
+        ratio: 0.5
+```
+
+```yaml
+# dogs.yaml — 40% of animals
+name: dogs
+include:
+  file: animals.yaml
+  ref: animals
+  ratio: 0.4
+data:
+  - name: id
+    ref: animals.id
+  - name: breed
+    type: string
+    generator: word
+```
+
+After [variant expansion](/concepts/execution-pipeline/), `cats` becomes
+`cats/indoor` (30 rows) and `cats/outdoor` (30 rows). The lattice is:
+
+```
+⊥ ──→ cats/indoor ──→ animals (100)
+⊥ ──→ cats/outdoor ──→ animals
+⊥ ──→ dogs ──→ animals
+⊥ ──→ owners (20)
+```
+
+`animals` and `owners` are incomparable — no include relationship between them,
+their meet is ⊥.
+
+Execution order (topological, atoms first):
+
+1. `cats/indoor` (30 rows) — generated from scratch
+2. `cats/outdoor` (30 rows) — generated from scratch
+3. `dogs` (40 rows) — generated from scratch
+4. `animals` (100 rows) — assembled from the three atom batches
+
+The `id` field in `animals` is inherited from the three child batches. `weight_kg`
+is generated fresh for the 100 assembled rows. Every `id` in `cats/indoor.parquet`
+appears verbatim in `animals.parquet`.
+
+<Aside type="note" title="The animals/cats/dogs case is degenerate">
+Because `cats` and `dogs` use mutually exclusive field constraints *and* their
+ratios sum to 1.0, no Bernoulli segment nodes are created — the lower-cover
+elements themselves are the atoms. The general case produces intermediate segment
+nodes; see [Bernoulli Factoring](/concepts/bernoulli-factoring/).
+</Aside>
+
+## Row counts
+
+Row counts follow the same partial order recursively. Every non-root element derives
+its row count from its parent:
+
+- Children: `parent_rows × ratio`
+- Witness nodes (list links): `source_rows × expected_cardinality`
+- Root elements: declared via `rows:`
+
+Counts are resolved bottom-up from the declared root values, before any generation
+begins.
+
+## The ⊥ bottom element
+
+⊥ (bottom) is the empty concept — the population satisfying every constraint
+simultaneously. Two datasets whose constraints contradict each other (e.g. two
+lower-cover members both pinning `status` to different constants) meet at ⊥.
+
+In practice, ⊥ appears as the zero-weight segments that [Bernoulli
+factoring](/concepts/bernoulli-factoring/) prunes away. A segment whose constraints
+are unsatisfiable gets weight zero and is dropped — its notional rows are
+redistributed to surviving segments.

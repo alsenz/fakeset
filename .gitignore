@@ -2,3 +2,7 @@
 .claude
 .idea
 /output
+/docs/node_modules
+/docs/dist
+/docs/.astro
+/docs/src/data/schema.json

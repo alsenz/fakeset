@@ -1,0 +1,10 @@
+name: outer
+format: csv
+rows: 5
+include:
+  file: linked.yaml
+  ref: linked
+  reinforcement: 0  # error: reinforcement is only valid on links:, not include:
+data:
+  - name: id
+    ref: linked.id

@@ -1,0 +1,101 @@
+---
+title: CLI Reference
+description: All command-line flags for the fakeset binary.
+---
+
+## Synopsis
+
+```
+fakeset [OPTIONS] <PATHS>...
+```
+
+`PATHS` is one or more files and/or directories containing YAML dataset
+definitions. Directories are searched recursively for `.yaml` and `.yml` files.
+
+## Options
+
+### `--output <DIR>` / `-o <DIR>`
+
+Directory to write generated output files into.
+
+**Default:** `output`
+
+```bash
+fakeset definitions/ --output ./generated-data
+```
+
+### `--output-format <FORMAT>`
+
+Override the output format for every dataset. Takes precedence over the
+per-dataset `format:` declaration in the YAML.
+
+**Values:** `parquet`, `csv`, `json`, `jsonl`
+
+```bash
+fakeset definitions/ --output-format csv
+```
+
+### `--max-lower-cover <N>`
+
+Maximum number of lower-cover members in one lower-cover group. Segment
+enumeration is 2^N, so raising this requires proportionally more RAM.
+
+**Default:** `16` (65,536 segments)
+
+```bash
+fakeset definitions/ --max-lower-cover 20
+```
+
+See [Bernoulli Factoring](/concepts/bernoulli-factoring/) for details.
+
+### `--print-dag`
+
+Print the DAG with field details **before** the rewrite pass, then exit.
+Useful for verifying include structure and field definitions before the
+type-resolution pass modifies them.
+
+```bash
+fakeset definitions/ --print-dag
+```
+
+### `--print-rewritten`
+
+Print the DAG with field details **after** the rewrite pass (resolved types
+and merged constraints), then exit. Useful for debugging ref resolution and
+constraint merging.
+
+```bash
+fakeset definitions/ --print-rewritten
+```
+
+### `--print-plan`
+
+Print the execution plan — row counts, lower-cover segments, and inherited
+field wiring — then exit. Useful for verifying Bernoulli segmentation and
+understanding what the executor will generate.
+
+```bash
+fakeset definitions/ --print-plan
+```
+
+## Examples
+
+```bash
+# Generate from a single file
+fakeset policies.yaml
+
+# Generate from a directory
+fakeset ./definitions/
+
+# Mix of files and directories
+fakeset ./definitions/ extra_dataset.yaml --output ./output
+
+# Override all output to CSV
+fakeset ./definitions/ --output-format csv --output ./csv-output
+
+# Inspect the execution plan
+fakeset ./definitions/ --print-plan
+
+# Larger lower-cover cap (uses more RAM)
+fakeset ./definitions/ --max-lower-cover 20
+```

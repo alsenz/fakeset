@@ -1,0 +1,236 @@
+---
+title: Generators & Locales
+description: All available generators, their compatible field types, locale support, and example output.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Using generators
+
+Set `generator:` on any field to select a specific fake-rs generator:
+
+```yaml
+- name: user_email
+  type: string
+  generator: email
+
+- name: join_date
+  type: date
+  generator: date
+
+- name: latitude
+  type: number
+  generator: latitude
+```
+
+When `generator` is absent, fakeset uses the type default:
+- `string` → random alphanumeric string
+- `number` → random float64 (bounded by `range:` if set)
+- `boolean` → random true/false
+- `date` → random date
+- `date_time` → random timestamp
+
+---
+
+## Name generators
+
+Locale-aware. Setting `locale:` on these fields will produce culturally appropriate names.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `first_name` | `string` | `Sofia`, `Luca`, `Emma` |
+| `last_name` | `string` | `Müller`, `Tanaka`, `Smith` |
+| `name` | `string` | `María García`, `John Smith` |
+| `name_with_title` | `string` | `Dr. James Wilson`, `Prof. Ana Souza` |
+
+---
+
+## Lorem generators
+
+Locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `word` | `string` | `lorem`, `ipsum` |
+| `sentence` | `string` | `Lorem ipsum dolor sit amet.` |
+| `paragraph` | `string` | Multi-sentence paragraph. |
+
+---
+
+## Company generators
+
+Locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `company_name` | `string` | `Acme Corp`, `Schmidt GmbH` |
+| `company_suffix` | `string` | `Ltd`, `GmbH`, `S.A.` |
+| `industry` | `string` | `Software`, `Finance` |
+| `profession` | `string` | `Engineer`, `Designer` |
+| `buzzword` | `string` | `synergise`, `leverage` |
+
+---
+
+## Internet generators
+
+Not locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `email` | `string` | `user@example.com` |
+| `username` | `string` | `john_doe42` |
+| `password` | `string` | `xK9#mP2!` (8–20 chars) |
+| `ipv4` | `string` | `192.168.1.1` |
+| `ipv6` | `string` | `2001:db8::1` |
+| `mac_address` | `string` | `00:1B:44:11:3A:B7` |
+| `user_agent` | `string` | `Mozilla/5.0 (Windows NT 10.0; Win64; x64)` |
+
+---
+
+## Address generators
+
+`city_name`, `country_name`, `street_name`, `zip_code`, `state_abbr` are locale-aware.
+`country_code` and `time_zone` are not.
+
+| Generator | Valid types | Locale | Example output |
+|-----------|-------------|--------|----------------|
+| `city_name` | `string` | ✓ | `Lyon`, `München`, `Osaka` |
+| `country_name` | `string` | ✓ | `France`, `Deutschland` |
+| `country_code` | `string` | — | `FR`, `DE`, `JP` |
+| `street_name` | `string` | ✓ | `Rue de Rivoli`, `Main Street` |
+| `zip_code` | `string` | ✓ | `75001`, `10115`, `SW1A 1AA` |
+| `state_abbr` | `string` | ✓ | `CA`, `TX`, `NY` |
+| `time_zone` | `string` | — | `America/New_York`, `Europe/Paris` |
+
+---
+
+## Phone generator
+
+Locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `phone_number` | `string` | `+1 (555) 867-5309`, `+33 1 23 45 67 89` |
+
+---
+
+## Finance generators
+
+Not locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `credit_card_number` | `string` | `4532015112830366` |
+| `bic` | `string` | `DEUTDEDB` |
+| `currency_code` | `string` | `USD`, `EUR`, `GBP` |
+| `currency_name` | `string` | `US Dollar`, `Euro` |
+| `currency_symbol` | `string` | `$`, `€`, `£` |
+
+---
+
+## Geographic generators
+
+Valid on both `number` and `string` types. Not locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `latitude` | `number`, `string` | `48.8566` |
+| `longitude` | `number`, `string` | `2.3522` |
+
+---
+
+## Numeric generators
+
+Valid on both `number` and `string` types. Not locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `positive_decimal` | `number`, `string` | `0.7312` |
+| `decimal` | `number`, `string` | `-0.4521` |
+
+---
+
+## Identity / code generators
+
+Not locale-aware.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `uuid` | `string` | `550e8400-e29b-41d4-a716-446655440000` |
+| `isin` | `string` | `US0378331005` |
+| `licence_plate` | `string` | `AB-123-CD` (locale-aware: `fr_fr`, `it_it`, `nl_nl`) |
+| `isbn` | `string` | `978-3-16-148410-0` |
+| `semver` | `string` | `1.4.2` |
+
+<Aside type="note" title="licence_plate locale support">
+`licence_plate` supports `fr_fr`, `it_it`, and `nl_nl` locales. All other locales
+fall back to the French format.
+</Aside>
+
+---
+
+## Temporal generators
+
+Valid on the matching temporal type or `string`.
+
+| Generator | Valid types | Example output |
+|-----------|-------------|----------------|
+| `date` | `date`, `string` | `2024-03-15` (string: ISO 8601) |
+| `date_time` | `date_time`, `string` | `2024-03-15T10:30:00Z` (string: RFC 3339) |
+
+---
+
+## Locale support matrix
+
+The following generators are locale-aware. Setting `locale:` on a field (or at the
+dataset level) will use locale-specific data where available; locales without
+customised data fall back to the English defaults.
+
+| Locale | Code | Supported generators |
+|--------|------|---------------------|
+| English | `en` | All locale-aware generators |
+| French | `fr_fr` | All locale-aware generators + `licence_plate` |
+| German | `de_de` | All locale-aware generators |
+| Italian | `it_it` | All locale-aware generators + `licence_plate` |
+| Dutch | `nl_nl` | All locale-aware generators + `licence_plate` |
+| Portuguese (Brazil) | `pt_br` | All locale-aware generators |
+| Portuguese (Portugal) | `pt_pt` | All locale-aware generators |
+| Welsh | `cy_gb` | All locale-aware generators |
+| Chinese (Simplified) | `zh_cn` | All locale-aware generators |
+| Chinese (Traditional) | `zh_tw` | All locale-aware generators |
+| Japanese | `ja_jp` | All locale-aware generators |
+| Arabic | `ar_sa` | All locale-aware generators |
+| Turkish | `tr_tr` | All locale-aware generators |
+| Persian | `fa_ir` | All locale-aware generators |
+
+Locale-aware generators: `first_name`, `last_name`, `name`, `name_with_title`,
+`word`, `sentence`, `paragraph`, `company_name`, `company_suffix`, `industry`,
+`profession`, `buzzword`, `city_name`, `country_name`, `street_name`, `zip_code`,
+`state_abbr`, `phone_number`, `licence_plate`.
+
+---
+
+## Setting locale
+
+At the dataset level (applies to all locale-capable fields):
+
+```yaml
+name: customers
+locale: fr_fr
+data:
+  - name: full_name
+    type: string
+    generator: name          # will use fr_fr names
+  - name: city
+    type: string
+    generator: city_name     # will use fr_fr city names
+```
+
+At the field level (overrides dataset locale):
+
+```yaml
+- name: name
+  type: string
+  generator: name
+  locale: ja_jp    # Japanese names even in a French-locale dataset
+```

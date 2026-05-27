@@ -1,0 +1,21 @@
+{
+  "name": "fakeset-docs",
+  "type": "module",
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro",
+    "gen-schema": "node scripts/gen-schema.mjs",
+    "prebuild": "node scripts/gen-schema.mjs"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.28.0",
+    "astro": "^4.16.0"
+  },
+  "engines": {
+    "node": ">=18.17.1"
+  }
+}

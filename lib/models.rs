@@ -564,8 +564,10 @@ pub struct Include {
     /// How many times each child row is replicated into the parent batch (top-level include),
     /// or how many items to draw per outer row (list-link entry).
     pub cardinality: Option<CountSpec>,
-    /// Sampling intensity: 0 = without-replacement, 1 = uniform, >1 = clumping.
-    /// Model field only; execution deferred to MULT-2.
+    /// Sampling intensity for list-link and junction-link draws. `links:` only.
+    /// `0` = without-replacement (Fisher-Yates); `1` or absent = uniform with-replacement;
+    /// `> 1` = Pólya-urn clumping (previously-drawn rows are preferred on subsequent draws).
+    /// Values in the range `(0, 1)` are invalid.
     pub reinforcement: Option<f64>,
     /// Field names to automatically copy from the included dataset into this dataset's `data`
     /// (driver `include`) or into the associated list field's `content.fields` (list links).

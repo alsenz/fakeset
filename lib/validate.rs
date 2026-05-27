@@ -86,6 +86,15 @@ fn validate_dataset(
                 );
             }
         }
+        if let Some(r) = link.reinforcement {
+            if r < 0.0 || (r > 0.0 && r < 1.0) {
+                bail!(
+                    "dataset '{}': link '{}': `reinforcement` must be 0 (without-replacement), \
+                     1 (uniform), or > 1 (clumping); got {r}",
+                    dataset.name, link.reference
+                );
+            }
+        }
     }
     // group ref must match a link.
     for from_ref in &group_refs {
@@ -127,6 +136,17 @@ fn validate_dataset(
         check_fields_exclude(link, "link")?;
         if !link.fields.is_empty() {
             validate_include_fields(path, dataset, link, all, warnings);
+        }
+    }
+
+    // Rule: reinforcement is links: only.
+    if let Some(inc) = &dataset.include {
+        if inc.reinforcement.is_some() {
+            bail!(
+                "dataset '{}': `include.reinforcement` is not valid — \
+                 `reinforcement` only applies to `links:` entries",
+                dataset.name
+            );
         }
     }
 

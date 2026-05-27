@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <defs>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!--
+    Lattice: ⊥ (centre) → 8 atoms (r=65) → 8 tops (r=110).
+    A thin circle at r=95 hints at the Rust cog without drawing it.
+    The 8 gold top nodes at r=110 protrude just beyond the ring,
+    evoking teeth when you already know to look for them.
+  -->
+
+  <!-- Hint circle — Cambridge blue, the ghost of the cog -->
+  <circle cx="200" cy="200" r="95" fill="none" stroke="#7AAFC6" stroke-width="5.25"/>
+
+  <!-- Hasse edges: ⊥ → atoms — start from edge of ⊥ circle (r=28) -->
+  <g stroke="#2DC4B4" stroke-width="3.7" stroke-linecap="round" opacity="0.70">
+    <line x1="228.0" y1="200.0" x2="265" y2="200"/>
+    <line x1="219.8" y1="219.8" x2="246" y2="246"/>
+    <line x1="200.0" y1="228.0" x2="200" y2="265"/>
+    <line x1="180.2" y1="219.8" x2="154" y2="246"/>
+    <line x1="172.0" y1="200.0" x2="135" y2="200"/>
+    <line x1="180.2" y1="180.2" x2="154" y2="154"/>
+    <line x1="200.0" y1="172.0" x2="200" y2="135"/>
+    <line x1="219.8" y1="180.2" x2="246" y2="154"/>
+  </g>
+
+  <!-- Hasse edges: atoms → tops — turquoise (lighter) -->
+  <g stroke="#2DC4B4" stroke-width="2.96" stroke-linecap="round" opacity="0.50">
+    <line x1="265" y1="200" x2="310" y2="200"/>
+    <line x1="265" y1="200" x2="278" y2="278"/>
+    <line x1="246" y1="246" x2="278" y2="278"/>
+    <line x1="246" y1="246" x2="200" y2="310"/>
+    <line x1="200" y1="265" x2="200" y2="310"/>
+    <line x1="200" y1="265" x2="122" y2="278"/>
+    <line x1="154" y1="246" x2="122" y2="278"/>
+    <line x1="154" y1="246" x2="90"  y2="200"/>
+    <line x1="135" y1="200" x2="90"  y2="200"/>
+    <line x1="135" y1="200" x2="122" y2="122"/>
+    <line x1="154" y1="154" x2="122" y2="122"/>
+    <line x1="154" y1="154" x2="200" y2="90"/>
+    <line x1="200" y1="135" x2="200" y2="90"/>
+    <line x1="200" y1="135" x2="278" y2="122"/>
+    <line x1="246" y1="154" x2="278" y2="122"/>
+    <line x1="246" y1="154" x2="310" y2="200"/>
+  </g>
+
+  <!-- Top nodes (r=110) — aquamarine -->
+  <g filter="url(#glow)">
+    <circle cx="310" cy="200" r="10" fill="#58D8C8"/>
+    <circle cx="278" cy="278" r="10" fill="#58D8C8"/>
+    <circle cx="200" cy="310" r="10" fill="#58D8C8"/>
+    <circle cx="122" cy="278" r="10" fill="#58D8C8"/>
+    <circle cx="90"  cy="200" r="10" fill="#58D8C8"/>
+    <circle cx="122" cy="122" r="10" fill="#58D8C8"/>
+    <circle cx="200" cy="90"  r="10" fill="#58D8C8"/>
+    <circle cx="278" cy="122" r="10" fill="#58D8C8"/>
+  </g>
+
+  <!-- Atom nodes (r=65) — blue-green -->
+  <g filter="url(#glow)">
+    <circle cx="265" cy="200" r="8.5" fill="#0D9E8E"/>
+    <circle cx="246" cy="246" r="8.5" fill="#0D9E8E"/>
+    <circle cx="200" cy="265" r="8.5" fill="#0D9E8E"/>
+    <circle cx="154" cy="246" r="8.5" fill="#0D9E8E"/>
+    <circle cx="135" cy="200" r="8.5" fill="#0D9E8E"/>
+    <circle cx="154" cy="154" r="8.5" fill="#0D9E8E"/>
+    <circle cx="200" cy="135" r="8.5" fill="#0D9E8E"/>
+    <circle cx="246" cy="154" r="8.5" fill="#0D9E8E"/>
+  </g>
+
+  <!-- ⊥ bottom node (centre) — cerulean blue, hollow ring -->
+  <circle cx="200" cy="200" r="28" fill="none" stroke="#1877BD" stroke-width="5.25" filter="url(#glow)"/>
+</svg>

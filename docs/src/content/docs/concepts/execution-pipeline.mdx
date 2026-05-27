@@ -1,0 +1,153 @@
+---
+title: Execution Pipeline
+description: The eight-stage pipeline fakeset runs on every invocation, from YAML loading to output files.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## The eight stages
+
+Every `fakeset` run executes this fixed sequence:
+
+```
+load YAML files
+  → build_dag
+  → pull_down_expression_deps
+  → validate
+  → expand_field_variants
+  → expand_include_fields
+  → resolve_refs
+  → apply_global_locales
+  → build_plan
+  → execute
+```
+
+### 1. Load YAML
+
+All `.yaml` / `.yml` files are discovered and deserialized into `SyntheticDataset`
+structs. File paths are canonicalized so they serve as stable keys throughout the
+pipeline.
+
+### 2. Build DAG
+
+A petgraph directed graph is constructed from the dataset map:
+
+- **Constraint edges** (from `include:`): child → parent. A child is more constrained
+  and must execute first, so the edge points from child to parent, making the child a
+  predecessor in topological order.
+- **Data-dependency edges** (from `links:`): linked dataset → consumer. The linked
+  dataset must be fully generated before its consumer can run.
+
+A topological sort is verified; a cycle causes an immediate error.
+
+### 3. Pull down expression deps
+
+If a dataset's `expression:` field references a field defined only in a parent dataset,
+that field needs to be visible in the child's batch. This pass injects those
+dependencies as hidden `hidden: true` fields into the child before the rewrite pass
+runs — so expressions can reference parent fields without users having to re-declare them.
+
+### 4. Validate
+
+Structural checks across the whole graph:
+
+- Field types are present or resolvable via refs
+- Ref targets exist and point to reachable datasets
+- Expression identifiers are declared in evaluation order
+- Constraint consistency (e.g. `value:` and `range:` are not both set)
+- `rows:` and `ratio:` are not set simultaneously on the same include
+
+Warnings (non-fatal) are printed to stderr; errors abort.
+
+### 5. Expand field variants
+
+`type: variant` fields are expanded. A dataset with a single `type: variant` field
+with N alternatives is replaced by N concrete variant datasets at the same
+semi-lattice position. Multiple variant fields produce a cross-product expansion.
+
+Variant datasets share the same `output_file:` and are written to the same output
+using a union + shuffle step (`WriteSharedOutput`).
+
+### 6. Expand include fields
+
+`include.fields: ["*"]` wildcards and named field lists are expanded into explicit
+`ref: <ref>.<field>` entries on the child dataset. This happens after variant
+expansion so that wildcard copies land on the right expanded dataset.
+
+### 7. Resolve refs
+
+The main rewrite pass propagates type information and merged constraints *down* the
+lattice toward atoms:
+
+- Ref fields without explicit types inherit the type from the target field
+- Field constraints (range, value, generator) are merged through ref chains
+- Contradictory constraints are flagged as validation errors
+
+After this pass, every field in every dataset has a resolved type and all ref chains
+are fully materialised.
+
+### 8. Apply global locales
+
+The `locale:` stanza at the dataset level is stamped onto every locale-capable field
+in that dataset that does not have its own explicit locale. Field-level locale always
+takes precedence.
+
+### 9. Build plan
+
+`build_plan` produces a flat list of `ExecutionStep` variants. This is where:
+
+- Row counts are resolved (ratios → integers)
+- Lower cover groups are identified and segmented via Bernoulli factoring
+- Inherited field wiring is determined (which parent fields come from which child batch)
+- Collect targets (for `reducer: collect` bindings) are recorded
+
+### 10. Execute
+
+The executor interprets `ExecutionStep`s in order using Apache Arrow record batches.
+DataFusion is used for JOIN operations and expression evaluation.
+
+## Execution step types
+
+| Step | Description |
+|------|-------------|
+| `GenerateDataset` | Generate a dataset with no list links. Evaluates expressions, emits immediately. |
+| `GenerateStagingNode` | Generate scalar (non-list) fields for a dataset that has list-link fields. No emit; deferred to `AssembleFromWitness`. |
+| `GenerateLowerCoverGroup` | Generate a segmented parent and fan row segments to its lower cover members. Parent emits if it has no list links. |
+| `GenerateStagingLowerCoverGroup` | Staging counterpart of the above for parents with list-link fields. |
+| `GenerateWitness` | Generate the witness batch — one row per unique linked-dataset row drawn, carrying `_staging_refs`. |
+| `AssembleFromWitness` | Fold witness batches into list columns, evaluate expressions, emit the final output. |
+| `AccumulateToLinked` | Accumulate atom-level values back into linked-dataset fields via collect/reduce bindings. |
+| `WriteSharedOutput` | Union and shuffle all accumulated batches for a shared output file and write once. |
+
+## Sentinel columns
+
+Several hidden columns carry positional bookkeeping across steps. All are stripped
+from emitted output.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `_row_idx` | `UInt32` | JOIN key for `grow_parent_from_children`; prepended and stripped within that function |
+| `_slot_idx` | `UInt32` | Staging-node slot index; maps each child row to its parent slot for list assembly and grandchild access |
+| `_staging_refs` | `List<UInt32>` | Per-witness-row list of all staging slot indices that drew that linked row; consumed and dropped by `AssembleFromWitness` |
+| `_linked_idx` | `UInt32` | Index into the eligible linked-dataset batch; retained for `AccumulateToLinked` collect bindings |
+
+## DataFusion usage
+
+DataFusion provides the query-engine layer for batch operations that would be
+awkward in plain Arrow:
+
+- **`grow_parent_from_children`** — LEFT JOIN on `_row_idx` to merge child field
+  values into the parent skeleton. Implemented via the programmatic DataFrame API
+  (type-safe, no string formatting).
+- **`evaluate_expressions`** — CTE chain in SQL evaluates expression fields in YAML
+  declaration order. A fresh `SessionContext` is created per call to avoid
+  registration lifecycle issues.
+- **`filter_hidden_columns`** — project out hidden fields before emitting.
+- **`union_and_shuffle`** — union accumulated variant batches and sort by a random
+  column for reproducibility-agnostic shuffles.
+
+<Aside type="note">
+Each DataFusion function creates its own `SessionContext::new()`. There is no shared
+context threaded through the executor. New work should use the programmatic DataFrame
+API rather than SQL strings where possible.
+</Aside>

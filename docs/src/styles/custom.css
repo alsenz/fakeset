@@ -1,0 +1,45 @@
+/* Prevent Field and Type columns from wrapping in reference tables */
+.sl-markdown-content table td:first-child,
+.sl-markdown-content table th:first-child,
+.sl-markdown-content table td:nth-child(2),
+.sl-markdown-content table th:nth-child(2) {
+  white-space: nowrap;
+}
+
+/*
+  Accent colour palette — cerulean / turquoise / aquamarine family.
+  Starlight uses :root for dark-mode defaults and [data-theme='light']
+  for light-mode overrides — the opposite of the usual convention.
+*/
+
+/* Dark mode — (0,1,1) beats Starlight's :root (0,1,0) */
+html:root {
+  --sl-color-accent-low: #0a2d2a;
+  --sl-color-accent: #2DC4B4;
+  --sl-color-accent-high: #58D8C8;
+  --sl-color-text-accent: #1EA89A;
+}
+
+/* Light mode — (0,2,1) beats Starlight's :root[data-theme='light'] (0,2,0) */
+html:root[data-theme='light'] {
+  --sl-color-accent-low: #c4eeea;
+  --sl-color-accent: #0B8C84;
+  --sl-color-accent-high: #077068;
+  --sl-color-text-accent: #0B8C84;
+}
+
+/*
+  Flip the hero image from the default right side to the left.
+  Starlight's scoped styles win on specificity so we need !important
+  for the two layout properties that position the image.
+*/
+@media (min-width: 50rem) {
+  .hero {
+    grid-template-columns: 3fr 8fr !important;
+  }
+
+  .hero > img {
+    order: -1 !important;
+    width: min(100%, 14rem) !important;
+  }
+}
