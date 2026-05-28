@@ -1,0 +1,7 @@
+name: linked
+format: csv
+rows: 10
+data:
+  - name: id
+    type: string
+    generator: uuid

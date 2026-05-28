@@ -94,6 +94,9 @@ pub enum ExecutionStep {
         slot_count: usize,
         /// Field constraints for this segment — used to filter eligible linked rows.
         segment_constraints: HashMap<String, FieldConstraints>,
+        /// Pre-computed shard size for `overlap: 0`: `n_eligible_pre_filter / n_total_staging_rows`.
+        /// `None` when `overlap` is absent or `≥ 1`.
+        shard_q: Option<usize>,
     },
     /// Assemble list-link columns into the staging batch and emit.
     ///
@@ -290,7 +293,7 @@ fn check_cardinality_feasibility(
                 );
             }
             // Phase 2: without-replacement infeasibility.
-            if link.reinforcement == Some(0.0) {
+            if link.reinforcement == Some(0.0) && link.overlap != Some(0.0) {
                 let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
                 match &cardinality {
                     CountSpec::Normal { .. } => anyhow::bail!(
@@ -309,6 +312,50 @@ fn check_cardinality_feasibility(
                         dataset.name, field.name
                     ),
                     _ => {}
+                }
+            }
+            // Phase 3: overlap:0 shard feasibility.
+            if link.overlap == Some(0.0) {
+                let n_staging_rows = *row_counts.get(path).unwrap_or(&0);
+                if n_staging_rows > 0 {
+                    let shard_q = n_eligible / n_staging_rows;
+                    if shard_q == 0 {
+                        anyhow::bail!(
+                            "dataset '{}' field '{}': `overlap: 0` requires at least as many \
+                             eligible linked-dataset rows ({n_eligible}) as staging rows \
+                             ({n_staging_rows}); increase the linked dataset size or raise `ratio`",
+                            dataset.name, field.name
+                        );
+                    }
+                    if link.reinforcement == Some(0.0) {
+                        let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
+                        match &cardinality {
+                            CountSpec::Normal { .. } => anyhow::bail!(
+                                "dataset '{}' field '{}': `reinforcement: 0` is not compatible \
+                                 with `Normal` cardinality — the count is unbounded",
+                                dataset.name, field.name
+                            ),
+                            CountSpec::Fixed(n) if *n > shard_q => anyhow::bail!(
+                                "dataset '{}' field '{}': `overlap: 0, reinforcement: 0` requires \
+                                 cardinality ≤ shard size ({shard_q}), but cardinality is {n}",
+                                dataset.name, field.name
+                            ),
+                            CountSpec::Uniform { min, .. } if *min > shard_q => anyhow::bail!(
+                                "dataset '{}' field '{}': `overlap: 0, reinforcement: 0` requires \
+                                 min cardinality ≤ shard size ({shard_q}), but min is {min}",
+                                dataset.name, field.name
+                            ),
+                            _ => {}
+                        }
+                    }
+                    if link.reinforcement.map_or(false, |r| r > 1.0) && shard_q < 3 {
+                        eprintln!(
+                            "warning: dataset '{}' field '{}': `overlap: 0` partition size is \
+                             {shard_q} row(s) — Pólya clumping from `reinforcement` may have \
+                             little effect on such a small partition",
+                            dataset.name, field.name
+                        );
+                    }
                 }
             }
         }
@@ -331,12 +378,24 @@ fn check_cardinality_feasibility(
                 );
             }
             // Phase 2: without-replacement infeasibility.
-            if link.reinforcement == Some(0.0) {
+            if link.reinforcement == Some(0.0) && link.overlap != Some(0.0) {
                 let junction_rows = *row_counts.get(path).unwrap_or(&0);
                 if junction_rows > n_eligible {
                     anyhow::bail!(
                         "dataset '{}': `reinforcement: 0` on link '{}' requires junction rows \
                          ({junction_rows}) ≤ eligible linked-dataset rows ({n_eligible})",
+                        dataset.name, link.reference
+                    );
+                }
+            }
+            // Phase 3: overlap:0 shard feasibility for junction links.
+            if link.overlap == Some(0.0) {
+                let junction_rows = *row_counts.get(path).unwrap_or(&0);
+                if junction_rows > 0 && n_eligible < junction_rows {
+                    anyhow::bail!(
+                        "dataset '{}': `overlap: 0` on link '{}' requires at least as many \
+                         eligible linked-dataset rows ({n_eligible}) as junction rows \
+                         ({junction_rows})",
                         dataset.name, link.reference
                     );
                 }
@@ -477,7 +536,7 @@ pub fn build_plan(
                     let (s_vpath, s_c) = (vpath.clone(), c.clone());
                     let segs_for_witness = segments.clone();
                     let (s_segs, s_mbrs) = (segments.clone(), members_with_output.clone());
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &segs_for_witness,
+                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &row_counts, &segs_for_witness,
                         || ExecutionStep::GenerateStagingLowerCoverGroup {
                             parent_path: s_vpath, parent: s_c,
                             segments: s_segs, members: s_mbrs,
@@ -497,7 +556,7 @@ pub fn build_plan(
                         rows: variant_rows,
                         field_constraints: HashMap::new(),
                     }];
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &single_seg,
+                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &row_counts, &single_seg,
                         || ExecutionStep::GenerateStagingNode {
                             path: s_vpath, dataset: s_c,
                             rows: variant_rows, inherited: vec![],
@@ -525,7 +584,7 @@ pub fn build_plan(
             let (s_p, s_d) = (p.clone(), d.clone());
             let segs_for_witness = segments.clone();
             let (s_segs, s_mbrs) = (segments.clone(), mbrs.clone());
-            push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &segs_for_witness,
+            push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &row_counts, &segs_for_witness,
                 || ExecutionStep::GenerateStagingLowerCoverGroup {
                     parent_path: s_p, parent: s_d,
                     segments: s_segs, members: s_mbrs,
@@ -556,7 +615,7 @@ pub fn build_plan(
             rows,
             field_constraints: HashMap::new(),
         }];
-        push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &single_seg,
+        push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &row_counts, &single_seg,
             || ExecutionStep::GenerateStagingNode {
                 path: s_p, dataset: s_d, rows, inherited: s_inherited,
             },
@@ -625,13 +684,14 @@ fn push_with_list_link_steps(
     path: &Path,
     defer_emit: bool,
     all_datasets: &HashMap<PathBuf, SyntheticDataset>,
+    row_counts: &HashMap<PathBuf, usize>,
     segments: &[Segment],
     make_staging: impl FnOnce() -> ExecutionStep,
     make_normal: impl FnOnce(bool) -> ExecutionStep,
 ) {
     if dataset.data.iter().any(|f| f.is_list_link()) {
         steps.push(make_staging());
-        emit_witness_steps(dataset, path, all_datasets, segments, steps);
+        emit_witness_steps(dataset, path, all_datasets, row_counts, segments, steps);
     } else {
         steps.push(make_normal(defer_emit));
     }
@@ -641,6 +701,7 @@ fn emit_witness_steps(
     dataset: &SyntheticDataset,
     path: &Path,
     all_datasets: &HashMap<PathBuf, SyntheticDataset>,
+    row_counts: &HashMap<PathBuf, usize>,
     segments: &[Segment],
     steps: &mut Vec<ExecutionStep>,
 ) {
@@ -651,6 +712,16 @@ fn emit_witness_steps(
         let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else { continue };
         let Some(linked_path) = resolve_include(path, &link.file) else { continue };
         let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
+        // Compute shard_q for overlap:0 — the eligible linked rows divided evenly among all
+        // staging rows. Uses pre-filter count so shard boundaries are cross-segment stable.
+        let shard_q = if link.overlap == Some(0.0) {
+            let n_staging_rows = *row_counts.get(path).unwrap_or(&0);
+            let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
+            let n_eligible = eligible_linked_rows(linked_rows, link.ratio);
+            if n_staging_rows > 0 { Some(n_eligible / n_staging_rows) } else { None }
+        } else {
+            None
+        };
 
         let mut field_witness_keys: Vec<PathBuf> = Vec::new();
         let mut slot_start = 0usize;
@@ -672,6 +743,7 @@ fn emit_witness_steps(
                 slot_start,
                 slot_count: seg.rows,
                 segment_constraints: seg.field_constraints.clone(),
+                shard_q,
             });
             field_witness_keys.push(wkey.clone());
 

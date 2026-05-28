@@ -1,0 +1,16 @@
+name: outer
+format: csv
+rows: 5
+links:
+  - file: linked.yaml
+    ref: linked
+    cardinality: 3
+    overlap: 0.5  # error: 0 < overlap < 1 is not a valid value
+data:
+  - name: items
+    type: list
+    content:
+      from: linked
+      fields:
+        - name: id
+          ref: linked.id

@@ -54,7 +54,8 @@ Used in both `include:` (top-level constraint inclusion) and `links:` (list-link
 | `ref` | string | ✓ | Name used to reference fields from this include: `ref: <ref>.<field>`. |
 | `ratio` | float | — | Marginal row-membership probability (0.0–1.0). In `include:` this drives the child's row count from the parent: `parent_rows × ratio`. In `links:` this limits the fraction of linked-dataset rows eligible for sampling. |
 | `cardinality` | [`CountSpec`](#countspec) | — | **`links:` only.** How many items to draw per outer row. |
-| `reinforcement` | float | — | **`links:` only.** Sampling intensity: `0` = without-replacement (each linked row drawn at most once per outer row); `1` or absent = uniform with-replacement (default); `> 1` = Pólya-urn clumping (previously-drawn rows become progressively more likely). Values in the open interval `(0, 1)` are invalid. |
+| `reinforcement` | float | — | **`links:` only.** Intra-list sampling intensity: `0` = without-replacement (each linked row drawn at most once per outer row); `1` or absent = uniform with-replacement (default); `> 1` = Pólya-urn clumping (previously-drawn rows become progressively more likely within the same list). Values in the open interval `(0, 1)` are invalid. `reinforcement` applies Pólya sampling within the partition defined by `overlap`. |
+| `overlap` | float | — | **`links:` only.** Cross-list sampling scope: `0` = non-overlapping (each staging row draws from an exclusive index-based shard of the eligible linked pool, so the same linked row cannot appear in two different outer rows' lists); `1` or absent = unrestricted (all staging rows draw from the full eligible pool, default); `> 1` = power-law popularity bias (lower-indexed linked rows are progressively more probable across all staging rows, producing cross-list clumping). Values in the open interval `(0, 1)` are invalid. |
 | `fields` | string[] | — | Field names to automatically copy into this dataset as `ref: <ref>.<field>` entries. Use `["*"]` for all fields. |
 | `exclude` | string[] | — | Field names to suppress after `fields` expansion. Only valid when `fields` is non-empty. |
 
@@ -62,6 +63,17 @@ Used in both `include:` (top-level constraint inclusion) and `links:` (list-link
 `ratio` and `rows` are mutually exclusive on the same dataset. Use `ratio` when
 the child's size should be derived from the parent; use `rows` for root datasets
 with a fixed count.
+</Aside>
+
+<Aside type="caution">
+**`overlap: 0` and row ordering.** When `overlap: 0`, shards are assigned by index position
+in the eligible linked-row prefix (determined by `ratio`). If the linked dataset has a
+non-random internal row ordering — for example because it was written in sorted order or
+because only the first N rows pass a `ratio` filter applied to a structured file — adjacent
+shards may be compositionally similar, reducing the effective independence between outer rows.
+To mitigate this, ensure the linked dataset is generated with randomised row order (fakeset
+output is unordered by default) or explicitly shuffle it before use. This is a property of
+index-based partitioning, not unique to `overlap`.
 </Aside>
 
 ### Example

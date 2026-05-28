@@ -94,12 +94,12 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
             ExecutionStep::GenerateWitness {
                 witness_key, staging_path, list_field_name,
                 inner_fields, include, cardinality,
-                linked_path, slot_start, slot_count, segment_constraints,
+                linked_path, slot_start, slot_count, segment_constraints, shard_q,
             } => {
                 execute_witness(
                     witness_key, staging_path, list_field_name,
                     inner_fields, include, cardinality,
-                    linked_path, *slot_start, *slot_count, segment_constraints,
+                    linked_path, *slot_start, *slot_count, segment_constraints, *shard_q,
                     &mut computed,
                 )?;
             }
@@ -661,6 +661,7 @@ fn execute_witness(
     slot_start: usize,
     slot_count: usize,
     segment_constraints: &HashMap<String, FieldConstraints>,
+    shard_q: Option<usize>,
     computed: &mut HashMap<PathBuf, RecordBatch>,
 ) -> Result<()> {
     if !computed.contains_key(staging_path) {
@@ -671,56 +672,108 @@ fn execute_witness(
     })?.clone();
 
     // --- Phase 1: assign each draw to a staging slot and a linked slot ---
-    // Eligible linked rows: apply ratio to determine the eligible prefix, then filter
-    // by segment constraints to restrict to rows matching this segment's field constraints.
+    // Eligible linked rows: apply ratio to determine the eligible prefix.
     let n_eligible_pre_filter = eligible_linked_rows(linked_batch.num_rows(), include.ratio);
     let eligible_linked = linked_batch.slice(0, n_eligible_pre_filter);
-    let (filtered_linked, surviving_indices) =
-        filter_batch_by_constraints(&eligible_linked, segment_constraints)?;
-    let n_eligible = filtered_linked.num_rows();
 
-    let n = slot_count;
-    // If no linked rows survive constraint filtering, produce an empty witness (all slots
-    // get empty lists). Otherwise sample normally.
-    let counts: Vec<usize> = if n_eligible == 0 {
-        vec![0; n]
-    } else {
-        (0..n).map(|_| {
+    // Two sampling paths depending on overlap mode:
+    //
+    // overlap:0 — each staging slot draws from an exclusive shard of the pre-filter eligible
+    //   pool. Shards are index-contiguous; shard_q rows each. The surviving_indices passed to
+    //   build_witness_dedup are identity (slot_assignments are already absolute pre-filter
+    //   indices), so Phase 2 and 3 are unchanged.
+    //
+    // default (overlap absent/1) or overlap>1 — filter the full eligible set once, then sample
+    //   all slots against that filtered view. For overlap>1, initial weights are power-law
+    //   (lower-indexed rows are progressively more probable across all slots).
+    let (slot_assignments, staging_idxs, surviving_indices) = if include.overlap == Some(0.0) {
+        let q = shard_q.unwrap_or(0);
+        let mut all_assignments: Vec<u32> = Vec::new();
+        let mut all_staging: Vec<u32> = Vec::new();
+        for i in 0..slot_count {
+            let abs_slot = slot_start + i;
+            let shard_start = abs_slot * q;
+            let shard_len = q.min(n_eligible_pre_filter.saturating_sub(shard_start));
+            if shard_len == 0 { continue; }
+            let shard = eligible_linked.slice(shard_start, shard_len);
+            let (filtered_shard, surviving_shard) =
+                filter_batch_by_constraints(&shard, segment_constraints)?;
+            let n_shard = filtered_shard.num_rows();
+            if n_shard == 0 { continue; }
             let m_n = sample_count(cardinality);
-            // Clamp to n_eligible for without-replacement so Uniform max values that
-            // exceed the (constraint-filtered) eligible size don't panic the sampler.
-            if include.reinforcement == Some(0.0) { m_n.min(n_eligible) } else { m_n }
-        }).collect()
-    };
-    let total: usize = counts.iter().sum();
-
-    // Staging slot indices are ABSOLUTE (relative to the full staging batch), not relative
-    // to this segment — so AssembleFromWitness can fold them into the correct list positions.
-    let staging_idxs: Vec<u32> = counts.iter().enumerate()
-        .flat_map(|(i, &c)| std::iter::repeat((slot_start + i) as u32).take(c))
-        .collect();
-    // slot_assignments[k]: index into `filtered_linked` for draw k.
-    // Sampling mode controlled by include.reinforcement:
-    //   None / 1.0 → uniform with-replacement
-    //   0.0        → Fisher-Yates without-replacement per staging row
-    //   r > 1.0    → Polya-urn weighted re-selection per staging row
-    let slot_assignments: UInt32Array = {
-        let r = include.reinforcement;
-        if r == Some(0.0) {
-            counts.iter().flat_map(|&m_n| {
-                sample_linked_without_replacement(n_eligible, m_n)
-            }).collect::<Vec<u32>>().into()
-        } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
-            counts.iter().flat_map(|&m_n| {
-                sample_linked_weighted(n_eligible, m_n, reinf)
-            }).collect::<Vec<u32>>().into()
-        } else {
-            (0..total)
-                .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
-                .collect::<Vec<u32>>()
-                .into()
+            let m_n = if include.reinforcement == Some(0.0) { m_n.min(n_shard) } else { m_n };
+            let reinf = include.reinforcement.unwrap_or(1.0);
+            let local_samples = if include.reinforcement == Some(0.0) {
+                sample_linked_without_replacement(n_shard, m_n)
+            } else if reinf > 1.0 {
+                sample_linked_weighted(n_shard, m_n, reinf)
+            } else {
+                (0..m_n).map(|_| (0u64..n_shard as u64).fake::<u64>() as u32).collect()
+            };
+            for local_idx in local_samples {
+                let abs_idx = shard_start as u32 + surviving_shard[local_idx as usize];
+                all_assignments.push(abs_idx);
+                all_staging.push(abs_slot as u32);
+            }
         }
+        // Identity surviving_indices: slot_assignments are already absolute pre-filter indices.
+        let identity: Vec<u32> = (0..n_eligible_pre_filter as u32).collect();
+        let total = all_assignments.len();
+        (UInt32Array::from(all_assignments), all_staging, (identity, total))
+    } else {
+        // Filter the full eligible set once; segment constraints apply uniformly.
+        let (filtered_linked, surviving) =
+            filter_batch_by_constraints(&eligible_linked, segment_constraints)?;
+        let n_eligible = filtered_linked.num_rows();
+        let counts: Vec<usize> = if n_eligible == 0 {
+            vec![0; slot_count]
+        } else {
+            (0..slot_count).map(|_| {
+                let m_n = sample_count(cardinality);
+                if include.reinforcement == Some(0.0) { m_n.min(n_eligible) } else { m_n }
+            }).collect()
+        };
+        let total: usize = counts.iter().sum();
+        let s_idxs: Vec<u32> = counts.iter().enumerate()
+            .flat_map(|(i, &c)| std::iter::repeat((slot_start + i) as u32).take(c))
+            .collect();
+        // Sampling mode:
+        //   reinforcement:0               → Fisher-Yates without-replacement per slot
+        //   overlap>1 (with/without reinf) → power-law initial weights + optional Pólya urn
+        //   default                       → uniform with-replacement
+        let s_assignments: UInt32Array = if n_eligible == 0 {
+            UInt32Array::from(Vec::<u32>::new())
+        } else {
+            let r = include.reinforcement;
+            let ov = include.overlap;
+            if r == Some(0.0) {
+                counts.iter().flat_map(|&m_n| {
+                    sample_linked_without_replacement(n_eligible, m_n)
+                }).collect::<Vec<u32>>().into()
+            } else if let Some(ov_val) = ov.filter(|&v| v > 1.0) {
+                // Power-law initial weights: row j has weight (n_eligible - j)^(overlap - 1).
+                // Row 0 is most popular; relies on union_and_shuffle having randomised the batch.
+                let reinf = r.unwrap_or(1.0);
+                let initial_weights: Vec<f64> = (0..n_eligible)
+                    .map(|j| ((n_eligible - j) as f64).powf(ov_val - 1.0))
+                    .collect();
+                counts.iter().flat_map(|&m_n| {
+                    sample_with_polya(initial_weights.clone(), m_n, reinf)
+                }).collect::<Vec<u32>>().into()
+            } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
+                counts.iter().flat_map(|&m_n| {
+                    sample_linked_weighted(n_eligible, m_n, reinf)
+                }).collect::<Vec<u32>>().into()
+            } else {
+                (0..total)
+                    .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
+                    .collect::<Vec<u32>>()
+                    .into()
+            }
+        };
+        (s_assignments, s_idxs, (surviving, total))
     };
+    let (surviving_indices, total) = surviving_indices;
 
     // --- Phase 2: deduplicate draws by linked row ---
     let (unique_linked_idxs, staging_refs_array) =
@@ -1275,7 +1328,15 @@ fn sample_linked_without_replacement(linked_n: usize, count: usize) -> Vec<u32> 
 /// making previously-selected indices more likely to be selected again.
 /// `reinforcement > 1.0` produces clumping; `reinforcement = 1.0` degenerates to uniform.
 fn sample_linked_weighted(linked_n: usize, count: usize, reinforcement: f64) -> Vec<u32> {
-    let mut weights: Vec<f64> = vec![1.0; linked_n];
+    sample_with_polya(vec![1.0; linked_n], count, reinforcement)
+}
+
+/// Weighted random sampling with Pólya-urn updates.
+///
+/// `initial_weights` seeds the probability distribution; after each draw the chosen
+/// index's weight is multiplied by `reinforcement`. `reinforcement = 1.0` gives static
+/// categorical sampling with no urn dynamics.
+fn sample_with_polya(mut weights: Vec<f64>, count: usize, reinforcement: f64) -> Vec<u32> {
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
         let total: f64 = weights.iter().sum();
@@ -1327,8 +1388,22 @@ fn inject_linked_idx(
         let n_eligible = eligible_linked_rows(n_linked, link.ratio);
         let n_rows = batch.num_rows();
         let r = link.reinforcement;
-        let assignments: Vec<u32> = if r == Some(0.0) {
+        let ov = link.overlap;
+        let assignments: Vec<u32> = if ov == Some(0.0) {
+            // overlap:0 for junction: one exclusive linked row per junction row (partition of size 1).
+            // This degenerates to without-replacement across the eligible pool.
             sample_linked_without_replacement(n_eligible, n_rows)
+        } else if r == Some(0.0) {
+            sample_linked_without_replacement(n_eligible, n_rows)
+        } else if let Some(ov_val) = ov.filter(|&v| v > 1.0) {
+            // Power-law single draw per junction row.
+            let reinf = r.unwrap_or(1.0);
+            let initial_weights: Vec<f64> = (0..n_eligible)
+                .map(|j| ((n_eligible - j) as f64).powf(ov_val - 1.0))
+                .collect();
+            (0..n_rows).map(|_| {
+                sample_with_polya(initial_weights.clone(), 1, reinf)[0]
+            }).collect()
         } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
             sample_linked_weighted(n_eligible, n_rows, reinf)
         } else {

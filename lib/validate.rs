@@ -95,6 +95,22 @@ fn validate_dataset(
                 );
             }
         }
+        if let Some(ov) = link.overlap {
+            if ov < 0.0 || (ov > 0.0 && ov < 1.0) {
+                bail!(
+                    "dataset '{}': link '{}': `overlap` must be 0 (non-overlapping partitions), \
+                     1 (default, unrestricted), or > 1 (preferential popularity); got {ov}",
+                    dataset.name, link.reference
+                );
+            }
+            if ov > 1.0 && link.reinforcement == Some(0.0) {
+                bail!(
+                    "dataset '{}': link '{}': `overlap > 1` and `reinforcement: 0` are \
+                     incompatible — power-law weighting requires with-replacement sampling",
+                    dataset.name, link.reference
+                );
+            }
+        }
     }
     // group ref must match a link.
     for from_ref in &group_refs {
@@ -139,12 +155,19 @@ fn validate_dataset(
         }
     }
 
-    // Rule: reinforcement is links: only.
+    // Rule: reinforcement and overlap are links: only.
     if let Some(inc) = &dataset.include {
         if inc.reinforcement.is_some() {
             bail!(
                 "dataset '{}': `include.reinforcement` is not valid — \
                  `reinforcement` only applies to `links:` entries",
+                dataset.name
+            );
+        }
+        if inc.overlap.is_some() {
+            bail!(
+                "dataset '{}': `include.overlap` is not valid — \
+                 `overlap` only applies to `links:` entries",
                 dataset.name
             );
         }

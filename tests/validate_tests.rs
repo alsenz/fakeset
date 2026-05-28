@@ -445,6 +445,25 @@ fn test_link_reinforcement_invalid_value_errors() {
 }
 
 #[test]
+fn test_include_overlap_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/include_overlap")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("overlap on include: should error");
+    let msg = err.to_string();
+    assert!(msg.contains("overlap"), "error should mention 'overlap': {msg}");
+    assert!(msg.contains("links"), "error should mention 'links': {msg}");
+}
+
+#[test]
+fn test_link_overlap_invalid_value_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/link_overlap_invalid")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("overlap in (0,1) on a link should error");
+    let msg = err.to_string();
+    assert!(msg.contains("overlap"), "error should mention 'overlap': {msg}");
+}
+
+#[test]
 fn test_cardinality_min_zero_errors() {
     let paths = vec![PathBuf::from("tests/fixtures/validation/cardinality_min_zero")];
     let datasets = load_all_datasets(&paths).expect("should load");

@@ -122,6 +122,8 @@ links:
   - file: events.yaml
     ref: event
     cardinality: {min: 0, max: 3}   # items drawn per outer row
+    reinforcement: 0                 # 0 = without-replacement within each list; >1 = Pólya clumping
+    overlap: 0                       # 0 = non-overlapping across outer rows; >1 = popularity bias
 ```
 
 Supported field types: `number`, `boolean`, `string`, `object`, `list`, `date`, `date_time`, `variant`.

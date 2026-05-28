@@ -568,7 +568,16 @@ pub struct Include {
     /// `0` = without-replacement (Fisher-Yates); `1` or absent = uniform with-replacement;
     /// `> 1` = Pólya-urn clumping (previously-drawn rows are preferred on subsequent draws).
     /// Values in the range `(0, 1)` are invalid.
+    /// Note: `reinforcement` applies Pólya sampling *within the partition defined by `overlap`*.
     pub reinforcement: Option<f64>,
+    /// Cross-list sampling scope for list-link draws. `links:` only.
+    /// `0` = non-overlapping: each staging row draws from an exclusive shard of the eligible
+    ///       linked pool (the shard is determined by the staging row's index); `1` or absent =
+    ///       unrestricted (all staging rows draw from the full eligible pool); `> 1` = power-law
+    ///       preferential weighting (lower-indexed linked rows are progressively more likely to
+    ///       be drawn across all staging rows, producing cross-list clumping).
+    /// Values in the open interval `(0, 1)` are invalid.
+    pub overlap: Option<f64>,
     /// Field names to automatically copy from the included dataset into this dataset's `data`
     /// (driver `include`) or into the associated list field's `content.fields` (list links).
     /// Use `["*"]` to copy all fields; otherwise list specific field names.
