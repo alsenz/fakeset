@@ -1,0 +1,126 @@
+---
+title: Corporate Registry
+description: A worked example generating a multi-tier corporate registry with list links, Bernoulli segmentation, and nested datasets.
+---
+
+import { Aside, FileTree } from '@astrojs/starlight/components';
+
+The **corporate-registry** example ships in `examples/corporate-registry/` and exercises
+three core features together: **Bernoulli segmentation** across mutually exclusive tiers,
+**list links** for embedding linked rows as nested arrays, and **include chains** more
+than one level deep.
+
+## Running the example
+
+```bash
+cargo run --bin fakeset -- examples/corporate-registry --output ./output/corporate-registry
+```
+
+Output is written to `./output/corporate-registry/`:
+
+<FileTree>
+- output/corporate-registry/
+  - individuals.parquet
+  - organisations.parquet
+  - directors.parquet
+  - smes.parquet
+  - micro_enterprises.parquet
+  - small_enterprises.parquet
+  - medium_enterprises.parquet
+  - grants.parquet
+</FileTree>
+
+## Dataset structure
+
+```
+individuals (1 000 rows)
+  ├── directors          — 30% of individuals; role pinned to "director"
+  └── organisations (100 rows, links individuals → directors list)
+        └── smes         — 99% of organisations
+              ├── micro_enterprises   — 95% of SMEs; 1–9 employees
+              ├── small_enterprises   — 4.3% of SMEs; 10–49 employees
+              └── medium_enterprises  — 0.7% of SMEs; 50–249 employees
+                    └── grants        — 10% of micro enterprises
+```
+
+## Key patterns
+
+### Nested include chains
+
+`micro_enterprises`, `small_enterprises`, and `medium_enterprises` each include `smes`,
+which in turn includes `organisations`. A field defined at the top of the chain — such
+as `org_id` on `organisations` — can be referenced all the way down via the `sme_id →
+smes.sme_id` chain.
+
+```yaml title="micro.yaml"
+name: micro_enterprises
+include:
+  file: smes.yaml
+  ref: smes
+  ratio: 0.95
+data:
+  - name: sme_id
+    ref: smes.sme_id          # inherited from smes, which got it from organisations
+  - name: sme_status
+    ref: smes.sme_status
+    value: "micro"            # constant override — every micro enterprise gets this value
+  - name: employee_count
+    type: number
+    precision: 0
+    range:
+      min: 1
+      max: 9
+```
+
+### Bernoulli segmentation
+
+The three SME tiers are **mutually exclusive** subsets of `smes`. Their ratios sum to
+roughly 1.0 (0.95 + 0.0433 + 0.0067), so every SME row ends up in exactly one tier.
+fakeset detects the mutual exclusion automatically via conflict pruning and generates
+each tier's rows in separate segments.
+
+See [Bernoulli Factoring](/concepts/bernoulli-factoring/) for how this is computed.
+
+### List links
+
+`organisations` embeds a `directors` list field by linking to `individuals`. Each
+organisation row gets between 1 and 25 director objects drawn from the eligible
+individual population (the 20% with `ratio: 0.2`).
+
+```yaml title="organisations.yaml"
+links:
+  - file: individuals.yaml
+    ref: individual
+    ratio: 0.2               # eligible pool: 20% of individuals
+    cardinality:
+      min: 1
+      max: 25
+data:
+  - name: directors
+    type: list
+    content:
+      from: individual
+      fields:
+        - name: role
+          type: string
+          value: "director"
+        - name: status
+          ref: individual.status    # copied from the drawn individual row
+        - name: name
+          ref: individual.full_name
+        - name: employer
+          type: string
+          ref: company_name         # outer-scoped: copied from the parent organisation row
+```
+
+The `employer` field uses an **outer-scoped ref** (`ref: company_name` without a
+qualifier). This resolves to the `company_name` column of the enclosing `organisations`
+row rather than a field on the individual, so every director object in a given
+organisation gets the same employer name.
+
+<Aside type="tip">
+The `ratio:` on a `links:` stanza controls what fraction of the linked dataset is
+**eligible** to be drawn. Only the first `ratio * N` rows are in the pool (fakeset
+places the eligible rows first). This is independent of `cardinality:`, which controls
+how many items each outer row draws.
+</Aside>

@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, ListArray, StringArray,
-    TimestampMicrosecondArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::{cast, concat};
@@ -140,7 +140,14 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
                 .collect::<Vec<_>>(),
         )),
         FieldType::Object => {
-            bail!("object field generation not yet implemented (field: '{}')", field.name)
+            let sub_columns: Vec<(Arc<ArrowField>, ArrayRef)> = field.fields
+                .iter()
+                .map(|sub| {
+                    let col = generate_column(sub, n, &[])?;
+                    Ok((Arc::new(field_to_arrow(sub)), col))
+                })
+                .collect::<Result<_>>()?;
+            Arc::new(StructArray::from(sub_columns))
         }
         FieldType::Variant => {
             bail!("variant field '{}' must be expanded before execution; call expand_field_variants first", field.name)

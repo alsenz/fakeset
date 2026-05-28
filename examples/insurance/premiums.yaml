@@ -1,0 +1,50 @@
+name: premiums
+format: parquet
+include:
+  file: contracts.yaml
+  ref: contract
+  ratio: 0.85
+data:
+  - name: premium_id
+    type: string
+    generator: uuid
+  - name: contract_id
+    ref: contract.contract_id
+  - name: customer_id
+    ref: contract.customer_id
+  - name: amount
+    ref: contract.annual_premium
+  - name: billing_period
+    type: variant
+    variants:
+      - value: "monthly"
+        ratio: 0.5
+      - value: "quarterly"
+        ratio: 0.3
+      - value: "annual"
+  - name: due_date
+    type: date
+    generator: date
+  - name: paid_date
+    type: date
+    generator: date
+  - name: payment_method
+    type: variant
+    variants:
+      - value: "bank_transfer"
+        ratio: 0.4
+      - value: "credit_card"
+        ratio: 0.3
+      - value: "direct_debit"
+        ratio: 0.2
+      - value: "cheque"
+  - name: status
+    type: variant
+    variants:
+      - value: "paid"
+        ratio: 0.75
+      - value: "pending"
+        ratio: 0.1
+      - value: "overdue"
+        ratio: 0.1
+      - value: "failed"

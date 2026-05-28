@@ -1,10 +1,10 @@
 name: small_enterprises
 format: parquet
 output_file: small_enterprises
-includes:
-  - file: smes.yaml
-    ref: smes
-    distribution: 0.0433
+include:
+  file: smes.yaml
+  ref: smes
+  ratio: 0.0433
 data:
   - name: sme_id
     ref: smes.sme_id

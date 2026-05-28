@@ -20,6 +20,13 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Examples',
+          items: [
+            { label: 'Corporate Registry', link: '/examples/corporate-registry/' },
+            { label: 'Insurance', link: '/examples/insurance/' },
+          ],
+        },
+        {
           label: 'Reference',
           items: [
             { label: 'YAML Schema', link: '/reference/yaml-schema/' },

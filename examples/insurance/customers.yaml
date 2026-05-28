@@ -1,0 +1,35 @@
+name: customers
+format: parquet
+output_file: customers
+rows: 500
+data:
+  - name: customer_id
+    type: string
+    generator: uuid
+  - name: full_name
+    type: string
+    generator: name
+  - name: email
+    type: string
+    generator: email
+  - name: phone
+    type: string
+    generator: phone_number
+  - name: date_of_birth
+    type: date
+    generator: date
+  - name: address
+    type: object
+    fields:
+      - name: street
+        type: string
+        generator: street_name
+      - name: city
+        type: string
+        generator: city_name
+      - name: zip_code
+        type: string
+        generator: zip_code
+      - name: country
+        type: string
+        generator: country_name

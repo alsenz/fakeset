@@ -1,0 +1,31 @@
+name: policies
+format: parquet
+rows: 20
+data:
+  - name: policy_id
+    type: string
+    generator: uuid
+  - name: policy_type
+    type: variant
+    variants:
+      - value: "home"
+        ratio: 0.25
+      - value: "auto"
+        ratio: 0.25
+      - value: "life"
+        ratio: 0.2
+      - value: "health"
+        ratio: 0.2
+      - value: "travel"
+  - name: base_premium
+    type: number
+    precision: 2
+    range:
+      min: 50.00
+      max: 500.00
+  - name: coverage_limit
+    type: number
+    precision: 0
+    range:
+      min: 10000
+      max: 1000000

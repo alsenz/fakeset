@@ -1,0 +1,59 @@
+name: claims
+format: parquet
+include:
+  file: contracts.yaml
+  ref: contract
+  ratio: 0.4
+data:
+  - name: claim_id
+    type: string
+    generator: uuid
+  - name: contract_id
+    ref: contract.contract_id
+  - name: customer_id
+    ref: contract.customer_id
+  - name: claim_type
+    type: variant
+    variants:
+      - value: "property_damage"
+        ratio: 0.3
+      - value: "theft"
+        ratio: 0.2
+      - value: "liability"
+        ratio: 0.2
+      - value: "medical"
+        ratio: 0.2
+      - value: "accident"
+  - name: incident_date
+    type: date
+    generator: date
+  - name: filed_date
+    type: date
+    generator: date
+  - name: claim_amount
+    type: number
+    precision: 2
+    range:
+      min: 100.00
+      max: 500000.00
+  - name: deductible
+    type: number
+    precision: 2
+    range:
+      min: 0.00
+      max: 5000.00
+  - name: net_payout
+    expression: "claim_amount - deductible"
+  - name: status
+    type: variant
+    variants:
+      - value: "pending"
+        ratio: 0.2
+      - value: "under_review"
+        ratio: 0.25
+      - value: "approved"
+        ratio: 0.3
+      - value: "rejected"
+        ratio: 0.15
+      - value: "paid"
+        ratio: 0.1

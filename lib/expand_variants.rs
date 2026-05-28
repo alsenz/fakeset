@@ -35,7 +35,7 @@ pub fn expand_field_variants(
             cross_product_variants(&dataset.variants, &local_combos)
         };
 
-        remove_variant_fields_recursive(&mut dataset.data);
+        stub_variant_fields(&mut dataset.data, &variant_paths, &[]);
     }
     Ok(datasets)
 }
@@ -201,12 +201,35 @@ pub(crate) fn merge_delta_into(schema: &mut Schema, field: Field) {
     }
 }
 
-/// Remove all `type: variant` fields from a schema, recursing into objects.
-fn remove_variant_fields_recursive(schema: &mut Schema) {
-    schema.retain(|f| !matches!(f.field_type, Some(FieldType::Variant)));
+/// Replace all `type: variant` fields in a schema with name-preserving typed stubs.
+///
+/// The stub retains the field name and infers a concrete type from the variant choices
+/// (using the type common to all choices, or `None` if choices have inconsistent types).
+/// Keeping the field in `data` ensures `resolve_refs` can still locate it by name after
+/// variant expansion — without this, refs like `ref: policy.policy_type` would fail.
+fn stub_variant_fields(schema: &mut Schema, variant_paths: &VariantPaths, prefix: &[String]) {
     for field in schema.iter_mut() {
-        if matches!(field.field_type, Some(FieldType::Object)) {
-            remove_variant_fields_recursive(&mut field.fields);
+        if matches!(field.field_type, Some(FieldType::Variant)) {
+            let mut path = prefix.to_vec();
+            path.push(field.name.clone());
+            let unified_type = variant_paths
+                .iter()
+                .find(|(p, _, _)| p == &path)
+                .and_then(|(_, choices, _)| {
+                    let types: Vec<_> = choices.iter().filter_map(|v| infer_field_type(v)).collect();
+                    if types.is_empty() {
+                        None
+                    } else if types.windows(2).all(|w| w[0] == w[1]) {
+                        types.into_iter().next()
+                    } else {
+                        None // mixed types — leave untyped
+                    }
+                });
+            *field = Field { name: field.name.clone(), field_type: unified_type, ..Default::default() };
+        } else if matches!(field.field_type, Some(FieldType::Object)) {
+            let mut path = prefix.to_vec();
+            path.push(field.name.clone());
+            stub_variant_fields(&mut field.fields, variant_paths, &path);
         }
     }
 }

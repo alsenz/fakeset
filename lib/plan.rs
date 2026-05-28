@@ -141,6 +141,14 @@ pub enum ExecutionStep {
         output_file: String,
         format: Format,
     },
+    /// Concatenate all variant batches for a dataset into a single combined batch at
+    /// `original_path` in `computed`. Emitted after the N variant generation steps for any
+    /// dataset with `variants:`, so downstream witness steps can find a single linked batch
+    /// at the canonical path regardless of how many variants the linked dataset has.
+    CombineVariantBatches {
+        original_path: PathBuf,
+        variant_paths: Vec<PathBuf>,
+    },
 }
 
 /// A fully-resolved, ordered list of steps for the executor to interpret linearly.
@@ -568,6 +576,15 @@ pub fn build_plan(
                     );
                 }
             }
+            // Merge all variant batches into the original path in `computed` so downstream
+            // witnesses that link to this dataset can find a single combined batch.
+            let variant_keys: Vec<PathBuf> = (0..dataset.variants.len())
+                .map(|i| variant_key(path, i))
+                .collect();
+            steps.push(ExecutionStep::CombineVariantBatches {
+                original_path: path.clone(),
+                variant_paths: variant_keys,
+            });
             continue;
         }
 

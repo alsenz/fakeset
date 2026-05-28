@@ -1,0 +1,48 @@
+name: contracts
+format: parquet
+include:
+  file: customers.yaml
+  ref: customer
+  ratio: 0.6
+links:
+  - file: policies.yaml
+    ref: policy
+    cardinality:
+      min: 1
+      max: 3
+data:
+  - name: contract_id
+    type: string
+    generator: uuid
+  - name: customer_id
+    ref: customer.customer_id
+  - name: holder_name
+    ref: customer.full_name
+  - name: covered_policies
+    type: list
+    content:
+      from: policy
+      fields:
+        - name: policy_id
+          ref: policy.policy_id
+        - name: policy_type
+          ref: policy.policy_type
+        - name: coverage_limit
+          ref: policy.coverage_limit
+  - name: start_date
+    type: date
+    generator: date
+  - name: status
+    type: variant
+    variants:
+      - value: "active"
+        ratio: 0.7
+      - value: "lapsed"
+        ratio: 0.2
+      - value: "cancelled"
+  - name: annual_premium
+    type: number
+    precision: 2
+    range:
+      min: 100.00
+      max: 5000.00

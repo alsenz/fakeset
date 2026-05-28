@@ -1,10 +1,10 @@
 name: smes
 format: parquet
 output_file: smes
-includes:
-  - file: organisations.yaml
-    ref: organisations
-    distribution: 0.99
+include:
+  file: organisations.yaml
+  ref: organisations
+  ratio: 0.99
 data:
   - name: sme_id
     type: string

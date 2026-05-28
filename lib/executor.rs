@@ -14,7 +14,7 @@
 //! | `_slot_idx` | `UInt32` | `execute_lower_cover_group_core` (member batches) | `AssembleFromWitness` (fold into lists) | `strip_slot_idx` before member emit |
 //! | `_staging_refs` | `List<UInt32>` | `execute_witness` | `execute_assemble_from_witness` (fold) | stripped during assembly |
 //! | `_linked_idx` | `UInt32` | `inject_linked_idx` (junction) / `execute_witness` | `execute_accumulate_to_linked` | `strip_linked_idx` before junction emit |
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{Array, ArrayRef, Float64Array, ListArray, StringBuilder, StringArray, StructArray, UInt32Array, new_empty_array};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{concat, concat_batches, sort_to_indices, take};
@@ -129,6 +129,18 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                 if total_rows > 0 {
                     let combined = union_and_shuffle(batches.clone(), output_file).await?;
                     write_output(&combined, output_file, format, output_dir)?;
+                }
+            }
+            ExecutionStep::CombineVariantBatches { original_path, variant_paths } => {
+                let batches: Vec<RecordBatch> = variant_paths
+                    .iter()
+                    .filter_map(|vp| computed.get(vp))
+                    .cloned()
+                    .collect();
+                if let Some(first) = batches.first() {
+                    let combined = concat_batches(&first.schema(), &batches)
+                        .context("CombineVariantBatches: concat failed")?;
+                    computed.insert(original_path.clone(), combined);
                 }
             }
         }
@@ -304,7 +316,7 @@ async fn execute_lower_cover_group_core(
                 generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?
             } else {
                 grow_parent_from_children(
-                    &dataset.data, &child_batches, &seg.field_constraints,
+                    &dataset.data, seg.rows, &child_batches, &seg.field_constraints,
                 ).await?
             };
 
@@ -407,12 +419,10 @@ async fn execute_lower_cover_group_core(
 /// 3. Neither → generated fresh into the skeleton and pulled from there.
 async fn grow_parent_from_children(
     parent_schema: &Schema,
+    n: usize,
     child_batches: &[(&LowerCoverMember, RecordBatch)],
     field_constraints: &HashMap<String, FieldConstraints>,
 ) -> Result<RecordBatch> {
-    let n = child_batches.first()
-        .expect("grow_parent_from_children requires non-empty child_batches")
-        .1.num_rows();
 
     // Map parent field name → (child alias "c0"/"c1"/…, child column name).
     // or_insert preserves first-child-wins semantics.
