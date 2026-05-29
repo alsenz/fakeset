@@ -241,7 +241,7 @@ fn print_plan(plan: &ExecutionPlan) {
                     i + 1, dataset.name, dataset.format
                 );
             }
-            ExecutionStep::WriteSharedOutput { output_file, format } => {
+            ExecutionStep::WriteSharedOutput { output_file, format, .. } => {
                 println!(
                     "[{}] write shared: {} ({})",
                     i + 1, output_file, format
@@ -291,8 +291,8 @@ fn print_datasets(
             ds.name, ds.format, rows_str, locale_str
         );
 
-        if let Some(ref of) = ds.output_file {
-            println!("  output_file: {of}");
+        for out in ds.resolved_outputs() {
+            println!("  output: {}", out.file);
         }
 
         if let Some(ref inc) = ds.include {

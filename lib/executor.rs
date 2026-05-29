@@ -41,6 +41,7 @@ use std::sync::Arc;
 use crate::constraints::FieldConstraints;
 use crate::generator::{generate_column, sample_count};
 use crate::schema::{field_to_arrow, schema_to_arrow};
+use crate::dq::apply_data_quality;
 use crate::models::{eligible_linked_rows, resolve_include, split_ref, CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset};
 use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField};
 use crate::segment::{LowerCoverMember, Segment};
@@ -123,12 +124,16 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
             ExecutionStep::EmitDataset { path, dataset } => {
                 execute_emit_dataset(path, dataset.as_ref(), &computed, &mut shared).await?;
             }
-            ExecutionStep::WriteSharedOutput { output_file, format } => {
+            ExecutionStep::WriteSharedOutput { output_file, format, quality, schema } => {
                 let Some((_, batches)) = shared.get(output_file) else { continue };
                 let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 if total_rows > 0 {
                     let combined = union_and_shuffle(batches.clone(), output_file).await?;
-                    write_output(&combined, output_file, format, output_dir)?;
+                    let final_batch = match quality {
+                        Some(q) => apply_data_quality(combined, q, schema)?,
+                        None    => combined,
+                    };
+                    write_output(&final_batch, output_file, format, output_dir)?;
                 }
             }
             ExecutionStep::CombineVariantBatches { original_path, variant_paths } => {
@@ -142,6 +147,10 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                         .context("CombineVariantBatches: concat failed")?;
                     computed.insert(original_path.clone(), combined);
                 }
+                // The canonical combined batch is now the dataset's final representation.
+                // Mark it so that downstream lower cover group steps that see this dataset
+                // as a member reuse the combined batch rather than regenerating fresh rows.
+                parent_computed.insert(original_path.clone());
             }
         }
     }
@@ -203,7 +212,7 @@ async fn execute_dataset_core(
         let output = filter_hidden_columns(strip_sentinel(batch.clone(), "_linked_idx"), &dataset.data)?;
         computed.insert(path.to_path_buf(), batch);
         if !defer_emit {
-            emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
+            emit_batch(output, dataset, shared)?;
         }
         // When defer_emit is true (collect target): batch stored, file write deferred
         // to the EmitDataset step that follows AccumulateToLinked.
@@ -356,7 +365,7 @@ async fn execute_lower_cover_group_core(
         let parent_output = filter_hidden_columns(parent_shuffled.clone(), &dataset.data)?;
         computed.insert(path.to_path_buf(), parent_shuffled);
         if !defer_emit {
-            emit_batch(parent_output, &dataset.format, &dataset.output_file, shared)?;
+            emit_batch(parent_output, dataset, shared)?;
         }
         // When defer_emit is true (collect target): batch stored, file write deferred
         // to the EmitDataset step that follows AccumulateToLinked.
@@ -397,7 +406,7 @@ async fn execute_lower_cover_group_core(
             &m.dataset.data,
         )?;
         computed.insert(m.path.clone(), m_shuffled);
-        emit_batch(m_output, &m.dataset.format, &m.dataset.output_file, shared)?;
+        emit_batch(m_output, &m.dataset, shared)?;
     }
 
     Ok(())
@@ -441,9 +450,11 @@ async fn grow_parent_from_children(
                 }
             }
             // Rule 2: same-name field, not a cross-ref pointing elsewhere.
+            // Skip when the parent field has a constant `value`: it belongs in Rule 3
+            // (skeleton), which correctly emits the constant regardless of child values.
             let is_cross_ref = child_field.simple_ref()
                 .is_some_and(|r| r.starts_with(prefix.as_str()));
-            if !is_cross_ref && parent_schema.iter().any(|pf| pf.name == child_field.name) {
+            if !is_cross_ref && parent_schema.iter().any(|pf| pf.name == child_field.name && pf.value.is_none()) {
                 sources.entry(child_field.name.clone())
                     .or_insert_with(|| (alias.clone(), child_field.name.clone()));
             }
@@ -991,7 +1002,7 @@ async fn execute_assemble_from_witness(
     let batch = evaluate_expressions(batch, dataset).await?;
     let output = filter_hidden_columns(batch.clone(), &dataset.data)?;
     computed.insert(staging_path.clone(), batch);
-    emit_batch(output, &dataset.format, &dataset.output_file, shared)?;
+    emit_batch(output, dataset, shared)?;
     Ok(())
 }
 
@@ -1272,7 +1283,7 @@ async fn execute_emit_dataset(
         anyhow!("EmitDataset: batch at '{}' not computed", path.display())
     })?.clone();
     let output = filter_hidden_columns(batch, &dataset.data)?;
-    emit_batch(output, &dataset.format, &dataset.output_file, shared)
+    emit_batch(output, dataset, shared)
 }
 
 // ---------------------------------------------------------------------------
@@ -1514,16 +1525,16 @@ async fn combine_witness_source_first(
 
 fn emit_batch(
     batch: RecordBatch,
-    format: &Format,
-    output_file: &Option<String>,
+    dataset: &SyntheticDataset,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
-    let Some(of) = output_file else { return Ok(()) };
-    shared
-        .entry(of.clone())
-        .or_insert_with(|| (format.clone(), Vec::new()))
-        .1
-        .push(batch);
+    for output in dataset.resolved_outputs() {
+        shared
+            .entry(output.file.clone())
+            .or_insert_with(|| (dataset.format.clone(), Vec::new()))
+            .1
+            .push(batch.clone());
+    }
     Ok(())
 }
 
@@ -1609,7 +1620,16 @@ fn write_output(batch: &RecordBatch, name: &str, format: &Format, output_dir: &P
         Format::Json    => "json",
         Format::Jsonl   => "jsonl",
     };
-    let path = output_dir.join(format!("{name}.{ext}"));
+    // If name already ends with the correct extension (e.g. from an explicit `file:` path),
+    // use it as-is; otherwise append the extension (legacy `output_file:` name convention).
+    let path = if std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str()) == Some(ext)
+    {
+        output_dir.join(name)
+    } else {
+        output_dir.join(format!("{name}.{ext}"))
+    };
     let file = File::create(&path)?;
 
     match format {

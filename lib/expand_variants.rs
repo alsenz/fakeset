@@ -265,7 +265,8 @@ mod tests {
         SyntheticDataset {
             name: "test".into(),
             format: Format::Csv,
-            output_file: None,
+            output: None,
+            outputs: vec![],
             rows: Some(100),
             locale: None,
             include: None,

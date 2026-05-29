@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constraints::validate_field_constraints;
 use crate::expressions::extract_identifiers;
-use crate::models::{resolve_include, split_ref, CountSpec, Field, FieldType, FieldVariant, Generator, Include, Locale, RefBinding, Reducer, Schema, SyntheticDataset};
+use crate::models::{resolve_include, split_ref, Corruptions, CountSpec, DataQuality, Field, FieldType, FieldVariant, Generator, Include, Locale, RefBinding, Reducer, Schema, SyntheticDataset};
 
 /// Validate all loaded datasets, returning any non-fatal warnings.
 /// Hard errors (e.g. `rows` set alongside `ratio`) are returned as `Err`.
@@ -215,6 +215,216 @@ fn validate_dataset(
     // Rule 6: collect reducer bindings are structurally valid.
     validate_collect_bindings(path, dataset, all)?;
 
+    // Rule 7: data quality stanzas are structurally valid.
+    let output_has_quality = dataset.resolved_outputs().iter().any(|o| o.quality.is_some());
+    for out in &dataset.resolved_outputs() {
+        if let Some(ref q) = out.quality {
+            validate_data_quality(&dataset.name, &out.file, q, true)?;
+        }
+    }
+    for field in &dataset.data {
+        if let Some(ref q) = field.quality {
+            let field_path = format!("{}.{}", dataset.name, field.name);
+            validate_data_quality(&dataset.name, &field_path, q, false)?;
+            if !output_has_quality {
+                bail!(
+                    "field '{}' has a `quality` stanza but the dataset output block has no `quality` stanza",
+                    field_path
+                );
+            }
+            if let Some(ref c) = q.corruptions {
+                let ft = field.field_type.as_ref().unwrap_or(&FieldType::String);
+                validate_corruption_modes(&field_path, c, ft)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_data_quality(dataset_name: &str, ctx: &str, q: &DataQuality, is_output_level: bool) -> Result<()> {
+    let check_prob = |name: &str, val: f64| -> Result<()> {
+        if !(0.0..=1.0).contains(&val) {
+            bail!("dataset '{}': quality field '{}' must be between 0.0 and 1.0, got {}", dataset_name, name, val);
+        }
+        Ok(())
+    };
+
+    if let Some(v) = q.nulls        { check_prob("nulls", v)?; }
+    if let Some(v) = q.default_rate { check_prob("default_rate", v)?; }
+
+    if is_output_level {
+        if let Some(v) = q.duplication { check_prob("duplication", v)?; }
+        if let Some(v) = q.missing     { check_prob("missing", v)?; }
+        if q.default_values.is_some() {
+            bail!("dataset '{}' output '{}': `quality.default_values` is only valid on a field, not on the output block", dataset_name, ctx);
+        }
+        if q.defaults_mode.is_some() {
+            bail!("dataset '{}' output '{}': `quality.defaults_mode` is only valid on a field, not on the output block", dataset_name, ctx);
+        }
+    } else {
+        if q.duplication.is_some() {
+            bail!("field '{}': `quality.duplication` is only valid on an output block, not on a field", ctx);
+        }
+        if q.missing.is_some() {
+            bail!("field '{}': `quality.missing` is only valid on an output block, not on a field", ctx);
+        }
+    }
+
+    if let Some(ref c) = q.corruptions {
+        if let Some(v) = c.character_deletion  { check_prob("corruptions.character_deletion", v)?; }
+        if let Some(v) = c.character_insertion { check_prob("corruptions.character_insertion", v)?; }
+        if let Some(v) = c.truncation          { check_prob("corruptions.truncation", v)?; }
+        if let Some(v) = c.encoding            { check_prob("corruptions.encoding", v)?; }
+        if let Some(v) = c.noise               { check_prob("corruptions.noise", v)?; }
+        if let Some(v) = c.day_shift           { check_prob("corruptions.day_shift", v)?; }
+    }
+
+    Ok(())
+}
+
+fn validate_corruption_modes(field_path: &str, c: &Corruptions, ft: &FieldType) -> Result<()> {
+    let is_string = matches!(ft, FieldType::String);
+    let is_number = matches!(ft, FieldType::Number);
+    let is_temporal = matches!(ft, FieldType::Date | FieldType::DateTime);
+
+    if !is_string {
+        if c.character_deletion.is_some()  { bail!("field '{field_path}': `corruptions.character_deletion` is not applicable to {ft} fields"); }
+        if c.character_insertion.is_some() { bail!("field '{field_path}': `corruptions.character_insertion` is not applicable to {ft} fields"); }
+        if c.truncation.is_some()          { bail!("field '{field_path}': `corruptions.truncation` is not applicable to {ft} fields"); }
+        if c.encoding.is_some()            { bail!("field '{field_path}': `corruptions.encoding` is not applicable to {ft} fields"); }
+    }
+    if !is_number {
+        if c.noise.is_some() { bail!("field '{field_path}': `corruptions.noise` is not applicable to {ft} fields"); }
+    }
+    if !is_temporal {
+        if c.day_shift.is_some() { bail!("field '{field_path}': `corruptions.day_shift` is not applicable to {ft} fields"); }
+    }
+    Ok(())
+}
+
+fn validate_date_bounds(path: &str, field: &Field) -> Result<()> {
+    let ft = match &field.field_type {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    if field.after.is_none() && field.before.is_none() {
+        return Ok(());
+    }
+
+    match ft {
+        FieldType::Date => {
+            let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| anyhow!("field '{path}': `after`/`before` for date field must be YYYY-MM-DD, got '{s}': {e}"));
+            let after  = field.after.as_deref().map(parse).transpose()?;
+            let before = field.before.as_deref().map(parse).transpose()?;
+            if let (Some(a), Some(b)) = (after, before) {
+                if a >= b {
+                    bail!("field '{path}': `after` ({a}) must be before `before` ({b})");
+                }
+            }
+        }
+        FieldType::DateTime => {
+            let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| anyhow!("field '{path}': `after`/`before` for date_time field must be RFC 3339, got '{s}': {e}"));
+            let after  = field.after.as_deref().map(parse).transpose()?;
+            let before = field.before.as_deref().map(parse).transpose()?;
+            if let (Some(a), Some(b)) = (after, before) {
+                if a >= b {
+                    bail!("field '{path}': `after` must be before `before`");
+                }
+            }
+        }
+        _ => {
+            bail!(
+                "field '{path}': `after`/`before` is only valid on `date` or `date_time` fields, \
+                 but this field has type `{ft}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_args(path: &str, field: &Field) -> Result<()> {
+    let Some(ref args) = field.args else { return Ok(()) };
+
+    if let Some(ft) = &field.field_type {
+        if *ft == FieldType::Boolean {
+            // boolean ratio — no generator required
+            for key in args.keys() {
+                if key != "ratio" {
+                    bail!("field '{path}': unknown arg '{key}' for boolean field — valid key: `ratio`");
+                }
+            }
+            if let Some(v) = args.get("ratio") {
+                let ratio = v.as_u64().ok_or_else(|| anyhow!("field '{path}': `args.ratio` must be an integer 0–100"))?;
+                if ratio > 100 {
+                    bail!("field '{path}': `args.ratio` must be between 0 and 100, got {ratio}");
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // For all other types, args require a generator.
+    let g = match &field.generator {
+        Some(g) => g,
+        None => bail!("field '{path}': `args` requires a `generator` to be set (or `type: boolean` for `ratio`)"),
+    };
+
+    let valid_keys = match g.valid_args() {
+        Some(keys) => keys,
+        None => bail!("field '{path}': generator `{g}` does not accept `args`"),
+    };
+
+    for key in args.keys() {
+        if !valid_keys.contains(&key.as_str()) {
+            bail!(
+                "field '{path}': unknown arg '{key}' for generator `{g}` — valid keys: {}",
+                valid_keys.join(", ")
+            );
+        }
+    }
+
+    // Type-check each known key.
+    match g {
+        Generator::Sentence | Generator::Paragraph
+        | Generator::Words | Generator::Sentences | Generator::Paragraphs
+        | Generator::Password => {
+            for key in ["min", "max"] {
+                if let Some(v) = args.get(key) {
+                    v.as_u64().ok_or_else(|| anyhow!("field '{path}': `args.{key}` must be a non-negative integer"))?;
+                }
+            }
+            if let (Some(min_v), Some(max_v)) = (args.get("min"), args.get("max")) {
+                let min = min_v.as_u64().unwrap();
+                let max = max_v.as_u64().unwrap();
+                if min >= max {
+                    bail!("field '{path}': `args.min` ({min}) must be less than `args.max` ({max})");
+                }
+            }
+        }
+        Generator::Geohash => {
+            if let Some(v) = args.get("precision") {
+                let p = v.as_u64().ok_or_else(|| anyhow!("field '{path}': `args.precision` must be an integer 1–12"))?;
+                if !(1..=12).contains(&p) {
+                    bail!("field '{path}': `args.precision` must be between 1 and 12, got {p}");
+                }
+            }
+        }
+        Generator::NumberWithFormat => {
+            if let Some(v) = args.get("format") {
+                if v.as_str().is_none() {
+                    bail!("field '{path}': `args.format` must be a string");
+                }
+            } else {
+                bail!("field '{path}': generator `number_with_format` requires `args.format`");
+            }
+        }
+        _ => {}
+    }
+
     Ok(())
 }
 
@@ -278,6 +488,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     let range_max = field.range.as_ref().and_then(|r| r.max);
 
     validate_locale_generator(path, field.locale.as_ref(), field.generator.as_ref())?;
+    validate_args(path, field)?;
 
     // Type-dependent checks require a known type — deferred to the rewrite step for ref fields.
     if field.simple_ref().is_some() {
@@ -288,6 +499,8 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         Some(t) => t,
         None => bail!("field '{path}': must have `type`, `ref`, or `expression`"),
     };
+
+    validate_date_bounds(path, field)?;
 
     // Variant field: validate its choices and distribution, then stop.
     if *field_type == FieldType::Variant {

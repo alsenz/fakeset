@@ -131,3 +131,80 @@ Raising `--max-lower-cover` costs RAM quadratically — 2^20 = 1M segments.
 Consider whether your lower-cover members genuinely need joint distribution
 modelling or whether they can be split into independent groups.
 </Aside>
+
+## Implementation: taming the combinatorial explosion
+
+Naively, the three-step algorithm touches all 2^N subsets at every stage. The
+implementation in `segment.rs::plan_segments` applies four complementary strategies
+to keep the work tractable for realistic lower-cover sizes:
+
+### Opt A — pairwise conflict pre-screening
+
+Before evaluating any subset mask, `precompute_conflicts` builds a small N×N
+conflict table: for every pair (i, j), record whether their constraints are
+mutually incompatible. Then, for each mask, `mask_has_conflict` eliminates it in
+O(N) with pure bitwise arithmetic — no `HashMap` merges, no allocation.
+
+For *one-of* lower-cover groups (e.g. mutually exclusive size categories), this
+eliminates all joint masks in a single O(N·2^N) pass, reducing the feasible set
+from 2^N to exactly N+1 singletons-plus-remainder before any expensive work begins.
+
+### Opt B — sorted-budget sparse constraint computation
+
+The surviving masks are sorted by weight descending. Masks are then processed in
+order, accumulating their total weight fraction. Once the remaining weight is so
+small that it cannot contribute even one expected row (threshold: all-but-1/parent_rows
+of the post-conflict total), evaluation stops. Constraints — the expensive `HashMap`
+merge operation — are computed only for this sparse feasible set of K masks (K ≪ 2^N
+in practice).
+
+**Singleton guard.** Raw Bernoulli weights catastrophically underestimate the
+post-IPF contribution of singleton masks in near-mutually-exclusive groups: a 4%
+member alongside a 95% peer has a raw weight of ~0.2% (the marginal of "this member
+and not that one"), but its post-IPF contribution is the full 4%. To prevent
+budget pruning from dropping these, every singleton mask that survived conflict
+pre-screening is force-included into the feasible set regardless of budget position.
+Joint masks (two or more members) don't need this protection — their many alternatives
+absorb any dropped weight via Bernoulli rounding.
+
+### Opt C — sparse IPF
+
+Standard IPF iterates over all 2^N entries on each of its inner loops. Because the
+feasible set is already sparse after Opt A and Opt B, `ipf_rescale_sparse` iterates
+only the K feasible mask keys — O(K·N) per round rather than O(2^N·N). For one-of
+groups where K = N+1 this is thousands of times faster than the dense formulation.
+
+### Summary
+
+| Strategy | Cost reduction | Best case |
+|----------|---------------|-----------|
+| Pairwise conflict pre-screening | Eliminates infeasible masks cheaply | One-of groups: K = N+1 |
+| Sorted-budget sparse eval | Skips near-zero weight masks | High-ratio skew: K ≈ N |
+| Singleton guard | Prevents incorrect budget pruning | Near-exclusive members |
+| Sparse IPF | O(K·N) vs O(2^N·N) per round | K ≪ 2^N always helps |
+
+Together these make 16-member groups (65,536 raw subsets) tractable in milliseconds
+for typical schemas, even when the theoretical worst case would be expensive.
+
+## Further scaling work
+
+The strategies above handle realistic schemas well, but there are known directions
+for pushing the cap higher or handling adversarial cases:
+
+- **Branch-and-bound enumeration.** Replace the dense 2^N weight array with a
+  lattice walk that prunes entire subtrees when their accumulated Bernoulli weight
+  falls below the budget threshold. This would reduce the enumeration from O(2^N)
+  to O(K·N) — matching the already-sparse IPF — and could raise the practical cap
+  well beyond 16 without a quadratic RAM cost.
+
+- **Higher-arity conflict detection.** The current pre-screening checks pairs. A
+  triple (A, B, C) can be jointly infeasible without any pair being infeasible
+  (e.g. overlapping numeric ranges that only become empty when all three are
+  intersected). Extending to k-ary conflict checks would eliminate more masks in
+  the pre-screen at the cost of O(N^k) preprocessing.
+
+- **Independent group decomposition.** If the lower-cover members can be partitioned
+  into two subsets that share no constrained fields, their joint distribution
+  factors exactly — 2^(N/2) × 2^(N/2) = 2^N subsets collapse to 2·2^(N/2). A
+  graph-connectivity check on the shared-field graph before enumeration would
+  expose this structure automatically.

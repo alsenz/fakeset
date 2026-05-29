@@ -11,7 +11,7 @@ use serde_yaml::Value as YamlValue;
 use crate::constraints::FieldConstraints;
 use crate::segment::{plan_segments, LowerCoverMember, Segment};
 use crate::graph::DatasetGraph;
-use crate::models::{eligible_linked_rows, expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Locale, Reducer, RefBinding, Schema, SyntheticDataset, VariantSchema};
+use crate::models::{eligible_linked_rows, expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref, CountSpec, DataQuality, Field, Format, Include, Locale, Output, Reducer, RefBinding, Schema, SyntheticDataset, VariantSchema};
 use crate::rewrite::apply_locale_to_schema;
 
 const DEFAULT_ROWS: usize = 100;
@@ -136,10 +136,13 @@ pub enum ExecutionStep {
         path:    PathBuf,
         dataset: Arc<SyntheticDataset>,
     },
-    /// Flush a shared output file: union + shuffle all accumulated batches, write once.
+    /// Flush a shared output file: union + shuffle all accumulated batches, apply any
+    /// data-quality pass, then write once.
     WriteSharedOutput {
         output_file: String,
         format: Format,
+        quality: Option<DataQuality>,
+        schema: Vec<Field>,
     },
     /// Concatenate all variant batches for a dataset into a single combined batch at
     /// `original_path` in `computed`. Emitted after the N variant generation steps for any
@@ -200,7 +203,7 @@ fn merge_variant_fields(base: &Schema, variant_data: &Schema) -> Schema {
 ///
 /// Base fields are merged with the variant's own data (variant wins on name collisions).
 /// The effective locale (variant > dataset) is stamped onto any unstamped variant fields.
-/// `output_key` is used as `output_file` so all variants accumulate into the same shared
+/// `output_key` is used as the output file so all variants accumulate into the same shared
 /// output and are shuffled together by `WriteSharedOutput`.
 fn expand_variant_dataset(
     base: &SyntheticDataset,
@@ -223,7 +226,8 @@ fn expand_variant_dataset(
         format: base.format.clone(),
         locale: effective_locale,
         rows: Some(rows),
-        output_file: Some(output_key.to_string()),
+        output: Some(crate::models::OutputSpec::Shorthand(output_key.to_string())),
+        outputs: vec![],
         include: base.include.clone(),
         links: base.links.clone(),
         data: merge_variant_fields(&base.data, &variant_fields),
@@ -492,7 +496,7 @@ pub fn build_plan(
 
     let mut topo = Topo::new(&dag.graph);
     let mut steps: Vec<ExecutionStep> = Vec::new();
-    let mut shared_outputs: Vec<(String, Format)> = Vec::new();
+    let mut shared_outputs: Vec<(String, Format, Option<DataQuality>, Vec<Field>)> = Vec::new();
     let mut seen_shared: HashSet<String> = HashSet::new();
 
     while let Some(idx) = topo.next(&dag.graph) {
@@ -510,11 +514,12 @@ pub fn build_plan(
         }
 
         // Variant expansion: replace this dataset with N concrete variants.
-        // Each variant writes to the same output_file so WriteSharedOutput shuffles them.
+        // Each variant writes to the same output file so WriteSharedOutput shuffles them.
         // Note: inherited fields into a variant parent are not wired in v1 — they require
         // a single stable batch to pull columns from; variants produce N separate batches.
         if !dataset.variants.is_empty() {
-            let output_key = dataset.output_file.clone().unwrap_or_else(|| dataset.name.clone());
+            let output_key = dataset.resolved_outputs().into_iter()
+                .next().map(|o| o.file).unwrap_or_else(|| dataset.name.clone());
             let variant_dists: Vec<Option<f64>> = dataset.variants.iter().map(|v| v.ratio).collect();
             let dists = resolve_distributions(&variant_dists);
             let row_counts_v = distribute_rows(row_counts[path], &dists);
@@ -525,12 +530,14 @@ pub fn build_plan(
 
                 if let Some(members) = lower_cover_groups.get(path) {
                     // Each flat lower cover member accumulates rows from N variant groups; ensure it has
-                    // an output_file so WriteSharedOutput fires once for the combined output.
+                    // an output so WriteSharedOutput fires once for the combined output.
                     // Witness-source members (is_witness_source=true) have no standalone output.
                     let members_with_output: Vec<LowerCoverMember> = members.iter().map(|m| {
                         let mut s = m.clone();
-                        if s.dataset.output_file.is_none() && !s.is_witness_source {
-                            s.dataset.output_file = Some(m.dataset.name.clone());
+                        if s.dataset.resolved_outputs().is_empty() && !s.is_witness_source {
+                            s.dataset.output = Some(crate::models::OutputSpec::Shorthand(
+                                m.dataset.name.clone(),
+                            ));
                         }
                         s
                     }).collect();
@@ -643,8 +650,8 @@ pub fn build_plan(
         emit_top_level_collect_steps(dataset, path, datasets, &mut steps);
     }
 
-    for (output_file, format) in shared_outputs {
-        steps.push(ExecutionStep::WriteSharedOutput { output_file, format });
+    for (output_file, format, quality, schema) in shared_outputs {
+        steps.push(ExecutionStep::WriteSharedOutput { output_file, format, quality, schema });
     }
 
     // Verify that every GenerateWitness step is preceded by its staging counterpart.
@@ -869,12 +876,12 @@ fn emit_top_level_collect_steps(
 
 fn track_shared(
     dataset: &SyntheticDataset,
-    outputs: &mut Vec<(String, Format)>,
+    outputs: &mut Vec<(String, Format, Option<DataQuality>, Vec<Field>)>,
     seen: &mut HashSet<String>,
 ) {
-    if let Some(ref of) = dataset.output_file {
-        if seen.insert(of.clone()) {
-            outputs.push((of.clone(), dataset.format.clone()));
+    for Output { file, quality } in dataset.resolved_outputs() {
+        if seen.insert(file.clone()) {
+            outputs.push((file, dataset.format.clone(), quality, dataset.data.clone()));
         }
     }
 }
@@ -963,7 +970,8 @@ fn collect_linked_lower_cover_members(
         let member_dataset = SyntheticDataset {
             name: format!("{}__{}_linked", dataset.name, field.name),
             format: dataset.format.clone(),
-            output_file: None,
+            output: None,
+            outputs: vec![],
             rows: None,
             locale: dataset.locale.clone(),
             include: None,
@@ -1063,7 +1071,8 @@ mod tests {
             name: "test".into(),
             format: Format::Csv,
             rows,
-            output_file: None,
+            output: None,
+            outputs: vec![],
             locale: None,
             include: None,
             links: vec![],

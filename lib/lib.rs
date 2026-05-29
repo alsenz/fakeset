@@ -5,6 +5,7 @@
 //! topologically-sorted plan in which atoms (most-constrained nodes) are generated first
 //! and parent values are accumulated upward.
 pub mod constraints;
+pub mod dq;
 pub mod executor;
 pub mod expand_variants;
 pub mod expressions;

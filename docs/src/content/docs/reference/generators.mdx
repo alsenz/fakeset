@@ -26,9 +26,9 @@ Set `generator:` on any field to select a specific fake-rs generator:
 When `generator` is absent, fakeset uses the type default:
 - `string` → random alphanumeric string
 - `number` → random float64 (bounded by `range:` if set)
-- `boolean` → random true/false
-- `date` → random date
-- `date_time` → random timestamp
+- `boolean` → random true/false (or use `args: { ratio: N }` for a weighted boolean without a generator)
+- `date` → random date (or use `after:`/`before:` on the field for a bounded range)
+- `date_time` → random timestamp (or use `after:`/`before:` for a bounded range)
 
 ---
 
@@ -47,13 +47,16 @@ Locale-aware. Setting `locale:` on these fields will produce culturally appropri
 
 ## Lorem generators
 
-Locale-aware.
+Locale-aware. The range-bearing generators accept `args: { min: N, max: M }` to control how many words/sentences/paragraphs are produced.
 
-| Generator | Valid types | Example output |
-|-----------|-------------|----------------|
-| `word` | `string` | `lorem`, `ipsum` |
-| `sentence` | `string` | `Lorem ipsum dolor sit amet.` |
-| `paragraph` | `string` | Multi-sentence paragraph. |
+| Generator | Valid types | Default args | Example output |
+|-----------|-------------|--------------|----------------|
+| `word` | `string` | — | `lorem`, `ipsum` |
+| `sentence` | `string` | min: 5, max: 10 | `Lorem ipsum dolor sit amet.` |
+| `paragraph` | `string` | min: 3, max: 6 | Multi-sentence paragraph. |
+| `words` | `string` | min: 3, max: 8 | `lorem ipsum dolor` (words joined by spaces) |
+| `sentences` | `string` | min: 2, max: 5 | Multiple sentences joined by spaces. |
+| `paragraphs` | `string` | min: 2, max: 4 | Multiple paragraphs joined by blank lines. |
 
 ---
 
@@ -79,7 +82,7 @@ Not locale-aware.
 |-----------|-------------|----------------|
 | `email` | `string` | `user@example.com` |
 | `username` | `string` | `john_doe42` |
-| `password` | `string` | `xK9#mP2!` (8–20 chars) |
+| `password` | `string` | `xK9#mP2!` (default 8–20 chars; use `args: { min:, max: }` to control length) |
 | `ipv4` | `string` | `192.168.1.1` |
 | `ipv6` | `string` | `2001:db8::1` |
 | `mac_address` | `string` | `00:1B:44:11:3A:B7` |
@@ -101,6 +104,7 @@ Not locale-aware.
 | `zip_code` | `string` | ✓ | `75001`, `10115`, `SW1A 1AA` |
 | `state_abbr` | `string` | ✓ | `CA`, `TX`, `NY` |
 | `time_zone` | `string` | — | `America/New_York`, `Europe/Paris` |
+| `geohash` | `string` | — | `u4pruydqqvj` (args: `precision` 1–12, default 6) |
 
 ---
 
@@ -147,6 +151,7 @@ Valid on both `number` and `string` types. Not locale-aware.
 |-----------|-------------|----------------|
 | `positive_decimal` | `number`, `string` | `0.7312` |
 | `decimal` | `number`, `string` | `-0.4521` |
+| `number_with_format` | `string` | `"493-821"` — requires `args: { format: "###-###" }`. `#` = any digit, `^` = digit 1–9. |
 
 ---
 

@@ -2,6 +2,7 @@
 //! `Schema`, `CountSpec`, `Reducer`, …) plus lattice-traversal helpers (`for_each_content_include`,
 //! `resolve_include`) and the `links:`-visitor used by planner and executor.
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Specifies how many items to generate per list row.
@@ -161,6 +162,80 @@ pub struct FieldVariant {
     pub ratio: Option<f64>,
 }
 
+/// Normalised output file descriptor used inside `ExecutionPlan`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Output {
+    pub file: String,
+    pub quality: Option<DataQuality>,
+}
+
+/// YAML-level `output:` field — accepts either a plain path string or a full `Output` block.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OutputSpec {
+    Shorthand(String),
+    Block(Output),
+}
+
+impl OutputSpec {
+    pub fn into_output(self) -> Output {
+        match self {
+            OutputSpec::Shorthand(s) => Output { file: s, quality: None },
+            OutputSpec::Block(o)     => o,
+        }
+    }
+}
+
+/// Data quality degradation applied to an output file after the clean batch is finalised.
+///
+/// All probability fields are independent Bernoulli rates: each eligible cell fires
+/// independently at the stated probability. Dataset-level fields (`duplication`,
+/// `missing`) are applied first; per-column transforms follow in the order:
+/// nulls → defaults → corruptions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DataQuality {
+    // dataset-level only
+    pub duplication:  Option<f64>,
+    pub missing:      Option<f64>,
+    // all levels
+    pub nulls:        Option<f64>,
+    pub default_rate: Option<f64>,
+    pub corruptions:  Option<Corruptions>,
+    // field-level only
+    pub default_values: Option<Vec<serde_yaml::Value>>,
+    pub defaults_mode:  Option<DefaultsMode>,
+}
+
+/// Whether field-level `default_values` replaces or augments the built-in default set.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultsMode {
+    Override,
+    Extend,
+}
+
+/// Per-mode corruption probabilities. Each sub-field is an independent per-cell Bernoulli rate.
+/// Only modes applicable to the field's type are evaluated.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Corruptions {
+    // string modes
+    pub character_deletion:  Option<f64>,
+    pub character_insertion: Option<f64>,
+    pub truncation:          Option<f64>,
+    pub encoding:            Option<f64>,
+    // number modes
+    pub noise:       Option<f64>,
+    #[serde(default = "default_noise_scale")]
+    pub noise_scale: f64,
+    // date / date_time modes
+    pub day_shift:     Option<f64>,
+    #[serde(default = "default_day_shift_max")]
+    pub day_shift_max: i64,
+}
+
+fn default_noise_scale()    -> f64 { 1.0 }
+fn default_day_shift_max()  -> i64 { 30  }
+
 /// Selects a specific fake-rs faker to drive value generation.
 /// When absent the field type's default faker is used.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -175,6 +250,9 @@ pub enum Generator {
     Word,
     Sentence,
     Paragraph,
+    Words,
+    Sentences,
+    Paragraphs,
     // company — string only
     CompanyName,
     CompanySuffix,
@@ -210,9 +288,13 @@ pub enum Generator {
     // geo — number or string
     Latitude,
     Longitude,
+    // geo — string only
+    Geohash,
     // numeric — number or string
     PositiveDecimal,
     Decimal,
+    // numeric — string only
+    NumberWithFormat,
     // identity / codes — string only
     Uuid,
     Isin,
@@ -230,6 +312,7 @@ impl Generator {
         match self {
             Generator::FirstName | Generator::LastName | Generator::Name | Generator::NameWithTitle
             | Generator::Word | Generator::Sentence | Generator::Paragraph
+            | Generator::Words | Generator::Sentences | Generator::Paragraphs
             | Generator::CompanyName | Generator::CompanySuffix | Generator::Industry
             | Generator::Profession | Generator::Buzzword
             | Generator::Email | Generator::Username | Generator::Password
@@ -238,6 +321,7 @@ impl Generator {
             | Generator::StreetName | Generator::ZipCode | Generator::StateAbbr | Generator::TimeZone
             | Generator::PhoneNumber | Generator::CreditCardNumber | Generator::Bic
             | Generator::CurrencyCode | Generator::CurrencyName | Generator::CurrencySymbol
+            | Generator::Geohash | Generator::NumberWithFormat
             | Generator::Uuid | Generator::Isin | Generator::LicencePlate | Generator::Isbn
             | Generator::Semver => matches!(ft, FieldType::String),
             Generator::Latitude | Generator::Longitude | Generator::PositiveDecimal
@@ -253,6 +337,7 @@ impl Generator {
         matches!(self,
             Generator::FirstName | Generator::LastName | Generator::Name | Generator::NameWithTitle
             | Generator::Word | Generator::Sentence | Generator::Paragraph
+            | Generator::Words | Generator::Sentences | Generator::Paragraphs
             | Generator::CompanyName | Generator::CompanySuffix
             | Generator::Industry | Generator::Profession | Generator::Buzzword
             | Generator::CityName | Generator::CountryName | Generator::StreetName
@@ -260,6 +345,18 @@ impl Generator {
             | Generator::PhoneNumber
             | Generator::LicencePlate
         )
+    }
+
+    /// Returns the set of valid `args` keys for this generator, or `None` if it takes no args.
+    pub fn valid_args(&self) -> Option<&'static [&'static str]> {
+        match self {
+            Generator::Sentence | Generator::Paragraph
+            | Generator::Words | Generator::Sentences | Generator::Paragraphs
+            | Generator::Password => Some(&["min", "max"]),
+            Generator::Geohash => Some(&["precision"]),
+            Generator::NumberWithFormat => Some(&["format"]),
+            _ => None,
+        }
     }
 }
 
@@ -297,6 +394,9 @@ impl std::fmt::Display for Generator {
             Generator::Word => "word",
             Generator::Sentence => "sentence",
             Generator::Paragraph => "paragraph",
+            Generator::Words => "words",
+            Generator::Sentences => "sentences",
+            Generator::Paragraphs => "paragraphs",
             Generator::CompanyName => "company_name",
             Generator::CompanySuffix => "company_suffix",
             Generator::Industry => "industry",
@@ -324,8 +424,10 @@ impl std::fmt::Display for Generator {
             Generator::CurrencySymbol => "currency_symbol",
             Generator::Latitude => "latitude",
             Generator::Longitude => "longitude",
+            Generator::Geohash => "geohash",
             Generator::PositiveDecimal => "positive_decimal",
             Generator::Decimal => "decimal",
+            Generator::NumberWithFormat => "number_with_format",
             Generator::Uuid => "uuid",
             Generator::Isin => "isin",
             Generator::LicencePlate => "licence_plate",
@@ -441,6 +543,22 @@ pub struct Field {
     /// Must be type-compatible with `field_type`. List fields use `default: []`
     /// as the empty-collect fallback required by `reducer: collect` bindings.
     pub default: Option<serde_yaml::Value>,
+    /// Per-field data-quality overrides. Only valid when the owning dataset's output
+    /// block also declares a `quality` stanza.
+    pub quality: Option<DataQuality>,
+    /// Lower bound for `date` / `date_time` generation.
+    /// Format: `YYYY-MM-DD` for `date`, RFC 3339 for `date_time`.
+    /// If both `after` and `before` are set, `after` must precede `before`.
+    pub after: Option<String>,
+    /// Upper bound for `date` / `date_time` generation. See `after`.
+    pub before: Option<String>,
+    /// Generator-specific arguments. Only valid when `generator` is set (or for `boolean` ratio).
+    /// Valid keys per generator:
+    /// `sentence`/`paragraph`/`words`/`sentences`/`paragraphs`/`password` → `min`, `max` (integer);
+    /// `geohash` → `precision` (integer 1–12);
+    /// `number_with_format` → `format` (string);
+    /// `boolean` (no generator required) → `ratio` (integer 0–100, percent-true).
+    pub args: Option<HashMap<String, serde_yaml::Value>>,
 }
 
 impl Field {
@@ -614,10 +732,16 @@ pub struct SyntheticDataset {
     /// Explicit row count. Must not be set when any include specifies a
     /// `ratio` — in that case rows are derived from the parent size.
     pub rows: Option<usize>,
-    /// Write output appended into this named file rather than a per-dataset
-    /// file, allowing multiple combinatorial factor datasets to be unioned
-    /// and randomly shuffled into one output.
-    pub output_file: Option<String>,
+    /// Single output file for this dataset. Accepts either a plain path string
+    /// (shorthand) or a full `Output` block (with optional `quality` stanza).
+    /// Aliased as `output_file` for backward compatibility.
+    /// Sugar for a single-entry `outputs` list; if both are set, `outputs` wins.
+    #[serde(alias = "output_file")]
+    pub output: Option<OutputSpec>,
+    /// Multiple output files (e.g. a clean and a degraded copy). `output` is
+    /// syntactic sugar for `outputs` with a single entry.
+    #[serde(default)]
+    pub outputs: Vec<OutputSpec>,
     pub include: Option<Include>,
     /// Linked datasets for junction or list-link sampling.
     /// Each entry names a dataset (by file + ref) from which atoms draw linked-dataset values.
@@ -632,4 +756,21 @@ pub struct SyntheticDataset {
     /// All variant outputs are written to the same output file and shuffled together.
     #[serde(default)]
     pub variants: Vec<VariantSchema>,
+}
+
+impl SyntheticDataset {
+    /// Returns a flat, normalised list of output descriptors.
+    ///
+    /// - If `outputs` is non-empty it is returned as-is (wins over `output`).
+    /// - If only `output` is set, returns a single-element vec.
+    /// - If neither is set, returns an empty vec.
+    pub fn resolved_outputs(&self) -> Vec<Output> {
+        if !self.outputs.is_empty() {
+            return self.outputs.iter().cloned().map(OutputSpec::into_output).collect();
+        }
+        match &self.output {
+            Some(spec) => vec![spec.clone().into_output()],
+            None       => vec![],
+        }
+    }
 }

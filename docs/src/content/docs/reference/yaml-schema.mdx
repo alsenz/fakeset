@@ -22,7 +22,8 @@ Every YAML file defines one `SyntheticDataset`.
 | `format` | [`Format`](#format) | ✓ | Output format: `parquet`, `csv`, `json`, or `jsonl`. |
 | `rows` | integer | — | Explicit row count. Mutually exclusive with `ratio` on `include`. |
 | `locale` | [`Locale`](#locale) | — | Default locale for locale-capable generators. Field-level `locale` takes precedence. |
-| `output_file` | string | — | Override the output filename (default: `name`). Multiple datasets sharing the same `output_file` are unioned and shuffled into one file. |
+| `output` | string \| [`Output`](#output) | — | Output file: plain path string or `Output` block. Sugar for a single-entry `outputs` list. Accepts `output_file` as an alias. |
+| `outputs` | [`Output[]`](#output) | — | Multiple output files (e.g. one clean, one degraded). If both `output` and `outputs` are set, `outputs` wins. |
 | `include` | [`Include`](#include) | — | Declares this dataset as a constrained subset of another. |
 | `links` | [`Include[]`](#include) | — | Linked datasets for list-link sampling. Each entry names a dataset from which list items are drawn. |
 | `data` | [`Field[]`](#field) | — | Field definitions. Evaluated in declaration order for expressions. |
@@ -35,12 +36,129 @@ name: policies
 format: parquet
 rows: 10000
 locale: en
-output_file: policies
+output: policies.parquet      # plain string — shorthand for Output { file: policies.parquet }
 data:
   - name: policy_id
     type: string
     generator: uuid
 ```
+
+---
+
+## Output
+
+Describes one output file for a dataset. When `output:` is set to a plain string, it is shorthand for `Output { file: <string> }` with no quality stanza.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | string | ✓ | Output file path (relative to the `--output` directory). May include an extension; if the extension matches the dataset `format`, it is used as-is, otherwise the format extension is appended. |
+| `quality` | [`DataQuality`](#dataquality) | — | Data-quality degradation applied after the clean batch is finalised. |
+
+### Examples
+
+```yaml
+# Single output — shorthand string form (no quality)
+output: customers.parquet
+
+# Single output — block form with DQ
+output:
+  file: customers_dirty.parquet
+  quality:
+    nulls: 0.05
+    corruptions:
+      truncation: 0.1
+
+# Multiple outputs — clean + degraded from the same generated batch
+outputs:
+  - file: customers_clean.parquet
+  - file: customers_dirty.parquet
+    quality:
+      duplication: 0.05
+      missing: 0.02
+      nulls: 0.05
+      corruptions:
+        character_deletion: 0.02
+        truncation: 0.05
+        noise: 0.1
+```
+
+---
+
+## DataQuality
+
+Controls synthetic data degradation applied to an output file **after** the clean batch is finalised. The clean batch used by the include lattice, witness generation, and `AccumulateToLinked` is never touched.
+
+All probability fields are **independent Bernoulli rates**: each eligible cell fires independently at the stated probability.
+
+Transforms are applied in order: duplication → missing rows → per-column (nulls → defaults → corruptions).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `duplication` | float 0–1 | — | **Output-level only.** Fraction of rows to duplicate. Each selected row is appended once as an exact copy. Applied first. |
+| `missing` | float 0–1 | — | **Output-level only.** Fraction of rows to delete (applied after duplication). |
+| `nulls` | float 0–1 | — | Per-cell probability of replacing the value with null. |
+| `default_rate` | float 0–1 | — | Per-cell probability of replacing the value with a type-appropriate default (see default value table below). |
+| `corruptions` | [`Corruptions`](#corruptions) | — | Per-mode corruption probabilities. |
+| `default_values` | any[] | — | **Field-level only.** Custom default values to draw from when `default_rate` fires. Must be compatible with the field type. |
+| `defaults_mode` | [`DefaultsMode`](#defaultsmode) | — | **Field-level only.** Whether `default_values` replaces or extends the built-in set. Default: `extend`. |
+
+#### Built-in default values
+
+| Type | Defaults |
+|------|----------|
+| `string` | `""`, `"N/A"`, `"NA"`, `"None"`, `"NULL"`, `"n/a"` |
+| `number` | `0`, `0.0` |
+| `boolean` | `false` |
+| `date` | `1970-01-01`, `1900-01-01`, `9999-12-31` |
+| `date_time` | `1970-01-01T00:00:00Z` |
+| `object`, `list` | *(no-op — `default_rate` is silently ignored)* |
+
+---
+
+## Corruptions
+
+Sub-object controlling per-mode corruption probabilities. Each sub-field is an independent per-cell Bernoulli rate. At the **dataset level**, inapplicable modes (e.g. `noise` on a string column) are silently skipped. At the **field level**, inapplicable modes are a validation error.
+
+| Field | Type | Applies to | Description |
+|-------|------|-----------|-------------|
+| `character_deletion` | float 0–1 | string | Delete one random character. |
+| `character_insertion` | float 0–1 | string | Insert one random ASCII character at a random position. |
+| `truncation` | float 0–1 | string | Truncate to a random prefix length. Models VARCHAR overflow — a particularly common real-world corruption. |
+| `encoding` | float 0–1 | string | Introduce an encoding corruption via a lossy Latin-1 round-trip, producing mojibake. |
+| `noise` | float 0–1 | number | Add Gaussian noise. Amplitude = `noise_scale × σ` where σ is the column's empirical std dev over the clean batch. If the column is constant (σ = 0), `noise_scale` is used directly as the amplitude. |
+| `noise_scale` | float | number | Multiplier on the column std dev for noise amplitude. Default: `1.0`. Not a probability. |
+| `day_shift` | float 0–1 | date, date_time | Shift the value by a random number of days drawn uniformly from `[−day_shift_max, +day_shift_max]`. |
+| `day_shift_max` | integer | date, date_time | Maximum absolute shift in days. Default: `30`. Not a probability. |
+
+### Example
+
+```yaml
+quality:
+  duplication: 0.03
+  missing: 0.01
+  nulls: 0.04
+  default_rate: 0.02
+  corruptions:
+    character_deletion: 0.01
+    character_insertion: 0.01
+    truncation: 0.05
+    encoding: 0.005
+    noise: 0.08
+    noise_scale: 0.5
+    day_shift: 0.05
+    day_shift_max: 90
+```
+
+---
+
+## DefaultsMode
+
+Controls whether field-level `default_values` replaces or augments the built-in default set.
+
+| Value | Description |
+|-------|-------------|
+| `override` | `default_values` replaces the built-in defaults entirely. |
+| `extend` | `default_values` is merged with the built-in defaults. **Default.** |
 
 ---
 
@@ -111,6 +229,10 @@ Defines one column in a dataset's schema.
 | `count` | [`CountSpec`](#countspec) | — | Items per row for `list` fields. Ignored on other types. |
 | `precision` | integer | — | Decimal precision for `number` fields. Positive = decimal places; negative = rounds by powers of 10 (e.g. `-2` rounds to the nearest 100). |
 | `default` | any | — | Fallback value when no child provides an inherited value. List collect targets use `default: []`. |
+| `quality` | [`DataQuality`](#dataquality) | — | Per-field data-quality overrides. Only valid when the dataset's output block also declares a `quality` stanza. |
+| `after` | string | — | Lower bound for `date` / `date_time` generation. `YYYY-MM-DD` for `date`; RFC 3339 for `date_time`. Must precede `before` when both are set. |
+| `before` | string | — | Upper bound for `date` / `date_time` generation. See `after`. |
+| `args` | map | — | Generator-specific arguments. See the [generator args table](#generator-args) below. |
 
 ### Examples
 
@@ -134,6 +256,17 @@ Defines one column in a dataset's schema.
 - name: vat_amount
   expression: "price * 0.2"
 
+# Date field with bounded range
+- name: created_at
+  type: date
+  after: "2020-01-01"
+  before: "2025-12-31"
+
+# Weighted boolean (80% true)
+- name: is_active
+  type: boolean
+  args: { ratio: 80 }
+
 # Object field
 - name: address
   type: object
@@ -154,6 +287,48 @@ Defines one column in a dataset's schema.
     - value: "silver"
       ratio: 0.3
     - value: "bronze"
+```
+
+### Generator args
+
+Some generators accept an `args` map to control their output. Unknown keys are validation errors.
+
+| Generator | Key | Type | Default | Description |
+|-----------|-----|------|---------|-------------|
+| `sentence` | `min` | integer | 5 | Minimum word count. |
+| `sentence` | `max` | integer | 10 | Maximum word count. |
+| `paragraph` | `min` | integer | 3 | Minimum sentence count. |
+| `paragraph` | `max` | integer | 6 | Maximum sentence count. |
+| `words` | `min` | integer | 3 | Minimum word count. |
+| `words` | `max` | integer | 8 | Maximum word count. |
+| `sentences` | `min` | integer | 2 | Minimum sentence count. |
+| `sentences` | `max` | integer | 5 | Maximum sentence count. |
+| `paragraphs` | `min` | integer | 2 | Minimum paragraph count. |
+| `paragraphs` | `max` | integer | 4 | Maximum paragraph count. |
+| `password` | `min` | integer | 8 | Minimum password length (characters). |
+| `password` | `max` | integer | 20 | Maximum password length (characters). |
+| `geohash` | `precision` | integer 1–12 | 6 | Geohash precision level. |
+| `number_with_format` | `format` | string | — | **Required.** Format pattern: `#` = random digit, `^` = random digit 1–9. Example: `"###-###"`. |
+| `boolean` *(no generator required)* | `ratio` | integer 0–100 | 50 | Percentage of rows that are `true`. |
+
+```yaml
+# Short password
+- name: pin
+  type: string
+  generator: password
+  args: { min: 4, max: 6 }
+
+# Formatted account number
+- name: account_number
+  type: string
+  generator: number_with_format
+  args: { format: "####-####-####" }
+
+# Brief paragraph (2–3 sentences)
+- name: notes
+  type: string
+  generator: paragraph
+  args: { min: 2, max: 3 }
 ```
 
 ---

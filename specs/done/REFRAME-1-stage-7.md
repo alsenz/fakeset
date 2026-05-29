@@ -120,4 +120,4 @@ in one or two sentences using REFRAME-1 vocabulary.
 
 ## 5. `CLAUDE.md` update
 
-Feature specs table: `specs/REFRAME-1.md` marked complete ("all stages implemented and merged").
+Feature specs table: `REFRAME-1.md` marked complete ("all stages implemented and merged").

@@ -32,6 +32,7 @@ export default defineConfig({
             { label: 'YAML Schema', link: '/reference/yaml-schema/' },
             { label: 'Generators & Locales', link: '/reference/generators/' },
             { label: 'CLI', link: '/reference/cli/' },
+            { label: 'Statistical Tests', link: '/reference/testing/' },
           ],
         },
         {

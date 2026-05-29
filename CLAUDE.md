@@ -13,12 +13,39 @@ cargo test                   # all unit + integration tests (~184 tests)
 cargo check                  # fast type-check without linking
 ```
 
-Run the corporate-registry example:
+Run an example:
 ```bash
-cargo run -- examples/corporate-registry --output ./output/corporate-registry
+cargo run --bin fakeset -- examples/corporate-registry --output ./output/corporate-registry
+cargo run --bin fakeset -- examples/insurance --output ./output/insurance
 ```
 
 Output goes to `./output/` (gitignored).
+
+### Statistical regression tests
+
+A Python pytest suite in `tests/statistical/` runs both examples end-to-end and checks
+distributional correctness using polars and scipy:
+
+```bash
+# install Python deps (one-time)
+pip install pytest polars scipy
+
+# run all statistical tests (~40 tests)
+pytest
+```
+
+`pytest.ini` at the repo root points pytest at `tests/statistical/`.
+
+Two test files — `test_insurance.py` and `test_corporate_registry.py` — share session-scoped
+fixtures in `conftest.py` (builds the release binary once, runs each example once, loads
+Parquet files into DataFrames).
+
+**Hard invariants** (always true): numeric range bounds, variant value membership, referential
+integrity, expression formula correctness, list cardinality, lower-cover partition identity.
+
+**Soft invariants** (statistical, α=0.01): include ratios (binomial test), variant frequency
+distributions (chi-squared goodness-of-fit), numeric value distributions (KS test vs uniform).
+Tests auto-skip when sample size is too small for the chosen statistic.
 
 ## Documentation site
 
@@ -41,6 +68,8 @@ pnpm run preview    # preview the production build locally
 |------|---------|
 | `docs/src/content/docs/index.mdx` | Introduction / home page |
 | `docs/src/content/docs/getting-started.mdx` | Installation, first schema, quick-start |
+| `docs/src/content/docs/examples/corporate-registry.mdx` | Corporate-registry example walk-through |
+| `docs/src/content/docs/examples/insurance.mdx` | Insurance example walk-through |
 | `docs/src/content/docs/concepts/semi-lattice.mdx` | Concept semi-lattice model |
 | `docs/src/content/docs/concepts/execution-pipeline.mdx` | 8-stage pipeline, ExecutionStep types, sentinel columns |
 | `docs/src/content/docs/concepts/bernoulli-factoring.mdx` | Lower cover segmentation algorithm |
@@ -60,6 +89,7 @@ When you add or change features, update the docs in the same PR:
 - **New generator or locale** → update `docs/src/content/docs/reference/generators.mdx`.
 - **New CLI flag** → update `docs/src/content/docs/reference/cli.mdx`.
 - **New architectural concept or execution step** → add or extend a page under `docs/src/content/docs/concepts/`. Add it to the sidebar in `astro.config.mjs` if it's a new page.
+- **New or updated example** → update the corresponding page under `docs/src/content/docs/examples/`.
 - **Renamed terminology** → update the glossary in both this file and the relevant concepts page.
 
 ### Assets and styling
@@ -71,7 +101,7 @@ When you add or change features, update the docs in the same PR:
 ## Glossary
 
 These terms have precise meanings in this codebase — use them consistently.
-The full theoretical framing is in `specs/REFRAME-1.md`.
+The full theoretical framing is in `specs/done/REFRAME-1.md`.
 
 | Term | Meaning |
 |------|---------|
@@ -98,7 +128,7 @@ The full theoretical framing is in `specs/REFRAME-1.md`.
 
 fakeset is built around a **concept semi-lattice**: a partial order where `A ≤ B` means "dataset A is a more-constrained subset of B's population". An `include:` stanza expresses constraint specialisation — not data dependency. A child is a narrower, more-constrained cut of its parent's population. A `links:` stanza introduces a *linked dataset* — a target from which list items are drawn per outer row, governed by the witness/assembly pipeline.
 
-This framing is specified in full in `specs/REFRAME-1.md`. In brief: every dataset is a node in the semi-lattice; every pair of nodes with a shared ancestor has a **meet** (greatest lower bound); the most-constrained nodes — those covering ⊥ directly — are **atoms**, generated first.
+This framing is specified in full in `specs/done/REFRAME-1.md`. In brief: every dataset is a node in the semi-lattice; every pair of nodes with a shared ancestor has a **meet** (greatest lower bound); the most-constrained nodes — those covering ⊥ directly — are **atoms**, generated first.
 
 The algorithm has two symmetric phases:
 
@@ -149,6 +179,7 @@ load YAML files
 - `AssembleFromWitness` — folds witness batches into `ListArray` columns, evaluates expressions, emits the final output.
 - `AccumulateToLinked` — accumulates atom-level values into linked-dataset fields (collect bindings); followed by `EmitDataset` for the updated linked dataset.
 - `WriteSharedOutput` — union + shuffle all accumulated batches for a shared output file, write once.
+- `CombineVariantBatches` — after all N variant generation steps for a dataset with `variants:`, concatenates the N variant batches at the canonical path in `computed` so downstream witness steps can find a single linked batch regardless of how many variants the linked dataset has.
 
 ## Module map
 
@@ -158,14 +189,14 @@ load YAML files
 | `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, `eligible_linked_rows`, the list-link visitor, and lattice-traversal helpers |
 | `graph.rs` | `build_dag` — petgraph DAG construction and topo-sort |
 | `validate.rs` | Schema validation: structural rules, ref checks, expression ordering |
-| `expand_variants.rs` | Expand `type: variant` fields into concrete global `variants:` entries |
+| `expand_variants.rs` | Expand `type: variant` fields into concrete global `variants:` entries; stubs the original field with an inferred concrete type so downstream ref resolution can still find it |
 | `expressions.rs` | `pull_down_expression_deps`, identifier extraction for validation |
 | `rewrite.rs` | `resolve_refs` (ref chain resolution, constraint merging), `expand_include_fields` (wildcard field copying), `apply_global_locales`, `apply_locale_to_schema` |
 | `constraints.rs` | `FieldConstraints`, `Satisfiable`, `Merge`, `validate_field_constraints` |
 | `segment.rs` | `plan_segments` — Bernoulli weights, conflict pruning, IPF, rounding. `LowerCoverMember` and `Segment` types. |
 | `plan.rs` | `build_plan` — row counts, lower cover groups, inherited-field wiring, collect targets → `ExecutionPlan` / `ExecutionStep` |
 | `schema.rs` | `schema_to_arrow`, `field_to_arrow`, `parquet_datatype_to_arrow` — Arrow schema conversion |
-| `generator.rs` | `generate_column`, `sample_count` — per-field fake data generation via fake-rs |
+| `generator.rs` | `generate_column`, `sample_count` — per-field fake data generation via fake-rs; handles `type: object` by recursively generating sub-fields into a `StructArray`. `fake_date`/`fake_datetime` handle `after`/`before` bounds; `fake_string` threads `args` to range-bearing generators (`Sentence`, `Paragraph`, `Password`, `Words`, `Sentences`, `Paragraphs`, `Geohash`, `NumberWithFormat`); `locale_fake_join!` macro handles generators that return `Vec<String>`. |
 | `executor.rs` | `execute` — interprets the plan; staging node generation, witness generation, assembly, `grow_parent_from_children`, `AccumulateToLinked`. All DataFusion and Arrow batch operations. |
 
 ## DataFusion usage
@@ -175,7 +206,7 @@ DataFusion is used for query-engine operations, not as a storage layer:
 - **`union_and_shuffle`** — `ctx.read_batch(combined).sort([random()])` for reproducibility-agnostic shuffles.
 - **`evaluate_expressions`** — CTE chain in SQL evaluates expression fields in YAML order. Fresh `SessionContext::new()` per call; table registered as `"src"` so there is no registration lifecycle to manage.
 - **`filter_hidden_columns`** — `ctx.read_batch(batch).select(visible_cols)` to project out hidden fields.
-- **`grow_parent_from_children`** — LEFT JOIN on `_row_idx` expressing parent-field inheritance: skeleton (rule-3 fresh columns) joined with indexed child batches; the SELECT clause names exactly which source each parent field comes from.
+- **`grow_parent_from_children`** — LEFT JOIN on `_row_idx` expressing parent-field inheritance: skeleton (rule-3 fresh columns) joined with indexed child batches; the SELECT clause names exactly which source each parent field comes from. Takes an explicit `n: usize` (= `seg.rows`) so the skeleton is always the planned size — a precomputed child batch that is shorter than `seg.rows` (due to stochastic rounding in its own segment plan) is handled gracefully by the LEFT JOIN producing fresh values for unmatched skeleton rows.
 
 Each function creates its own `SessionContext::new()` — there is no shared context threaded through the executor.
 
@@ -197,6 +228,14 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 
 `segment::tests::conflicting_constants_zeroed_and_redistributed` — Bernoulli rounding in `plan_segments` is stochastic; when run in parallel with the full suite it occasionally hits a rounding edge that produces 101 rows instead of 100. Passes reliably in isolation (`cargo test conflicting_constants`). Pre-existing; not introduced by recent changes.
 
+## Known limitations
+
+**Mixed-type variant fields** — `type: variant` fields whose choices span more than one type (e.g. one choice is a string, another is a number) are not currently rejected at validation time. Instead, `expand_field_variants` produces an untyped stub (`field_type = None`), which causes a runtime panic when `schema_to_arrow` or `generate_column_raw` hits the unresolved type. Workaround: ensure all choices in a `type: variant` field share the same type. See `specs/VAR-1.md` for the planned fix and the longer-term `type: any` encoding design.
+
+**BUG-VAR — variant values not applied in lower-cover members** — Field-level `type: variant` fields (e.g. `billing_period: monthly/quarterly/annual`) are not applied when the dataset is a lower-cover member of another dataset. The typed stub that `expand_field_variants` leaves in the base schema has no `value` or `generator`, so `generate_fresh_batch` produces random strings instead of the declared values. Affects `premiums` and `claims` in the insurance example (both include `contracts`). Documented by `_BUG_VAR` xfail markers in `tests/statistical/test_insurance.py`.
+
+**BUG-REF (first-child-wins) — overlap segment ref integrity** — In overlap segments where two lower-cover members both appear, `grow_parent_from_children` inherits shared fields (e.g. `contract_id`) from whichever child is first in `child_batches` (HashMap iteration order). The other child's rows were generated with different values for that field and will not match the parent. Affects `claims.contract_id` / `claims.customer_id` in the `{premiums ∩ claims}` overlap segment (~34% of contract rows). Non-deterministic. Documented by `_BUG_REF` xfail markers in `tests/statistical/test_insurance.py`.
+
 ## Feature specs
 
 Full design specs and implementation plans live in `specs/`:
@@ -207,7 +246,10 @@ Full design specs and implementation plans live in `specs/`:
 | `specs/done/MULT-2a.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-2.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-3.md` | **Complete** — implemented and merged |
-| `specs/REFRAME-1.md` | **Complete** — all stages implemented and merged |
+| `specs/done/REFRAME-1.md` | **Complete** — all stages implemented and merged |
+| `specs/VAR-1.md` | **Planned** — Phase 1 (validation gate); Phase 2 (`type: any` encoding) pending design sign-off |
+| `specs/done/DQ-1.md` | **Complete** — post-write DQ layer implemented: nulls, defaults, corruptions (char deletion/insertion/truncation/encoding, noise, day shift), duplication, row deletion; field-level overrides; multiple output files per dataset |
+| *(no spec file)* ARGS-1 | **Complete** — `args` map on `Field` for generator-specific parameters; `after`/`before` top-level date bounds (parallel to `range`); new generators `words`, `sentences`, `paragraphs`, `geohash`, `number_with_format`; boolean `ratio` via `args` |
 
 ## Planned next steps
 
@@ -221,4 +263,4 @@ Full design specs and implementation plans live in `specs/`:
 - **REPO** — allow definitions to be imported and included from remote GitHub repositories
 - **IMPORT** — allow imports from pre-existing files and database connections
 - **CNV-1** — field and excluded (field) wildcards on includes to default-define fields from includes as refs
-- **DQ** — data quality: final execution stage post-processing the generated output to introduce realistic data quality issues (null fields, typos, inconsistent ID keys, formatting errors, etc.). Row duplication (data-entry clones) is expressed separately via a top-level `quality: {inflation: 0.05}` stanza, not via include machinery — this keeps the include model semantically clean.
+- **VAR-SPECIALIZE** — allow a child dataset to *specialise* a parent's `type: variant` field by restricting it to a subset of the parent's variant choices (e.g. `cats.yaml` constrains `animals.eats` from `[birds, mice, grass, fish]` to `[birds, mice]`). Architecturally this interacts with BUG-VAR's two-level factoring plan: at Level 1 (outer Bernoulli segmentation over base lower-cover members), sibling field constraints are already intersected. At Level 2 (inner variant sub-distribution for a single member within a segment), the same conflict-pruning logic must apply — some of the member's own variant combos may be incompatible with the outer segment's `field_constraints` contributed by sibling members. Level 2 therefore needs its own IPF pass (zero incompatible variant combos → redistribute surviving weights) before generating rows. Structurally identical to Level 1's `plan_segments`; implementation should reuse the same machinery rather than duplicating it.

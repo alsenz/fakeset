@@ -117,7 +117,7 @@ DataFusion is used for JOIN operations and expression evaluation.
 | `GenerateWitness` | Generate the witness batch — one row per unique linked-dataset row drawn, carrying `_staging_refs`. |
 | `AssembleFromWitness` | Fold witness batches into list columns, evaluate expressions, emit the final output. |
 | `AccumulateToLinked` | Accumulate atom-level values back into linked-dataset fields via collect/reduce bindings. |
-| `WriteSharedOutput` | Union and shuffle all accumulated batches for a shared output file and write once. |
+| `WriteSharedOutput` | Union and shuffle all accumulated batches for a shared output file, apply any data-quality pass, then write once. |
 
 ## Sentinel columns
 
@@ -130,6 +130,16 @@ from emitted output.
 | `_slot_idx` | `UInt32` | Staging-node slot index; maps each child row to its parent slot for list assembly and grandchild access |
 | `_staging_refs` | `List<UInt32>` | Per-witness-row list of all staging slot indices that drew that linked row; consumed and dropped by `AssembleFromWitness` |
 | `_linked_idx` | `UInt32` | Index into the eligible linked-dataset batch; retained for `AccumulateToLinked` collect bindings |
+
+## Data quality
+
+The `quality:` stanza on an `Output` block declares a **post-processing pass** applied inside `WriteSharedOutput` — after `union_and_shuffle` and immediately before the file is written. The clean batch stored in `computed` (used by ref inheritance, witness generation, and `AccumulateToLinked`) is never modified.
+
+Transforms run in order: row duplication → row deletion → per-column nulls → defaults → corruptions. Multiple `outputs:` entries on one dataset each get their own independent DQ pass; a clean entry (no `quality:`) and a degraded entry can coexist.
+
+Because DQ is applied after the full execution DAG completes, row-count changes from `duplication` or `missing` do not affect the row counts of any included or linked dataset.
+
+---
 
 ## DataFusion usage
 

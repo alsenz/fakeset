@@ -77,7 +77,7 @@ include:
 ```yaml
 name: policies           # table name; also used as the output filename
 format: parquet          # parquet | csv | json | jsonl
-output_file: policies    # override output filename (default: name)
+output: policies.parquet # output file (or use outputs: [] for multiple files)
 rows: 1000               # explicit row count — omit when using ratio (mutually exclusive)
 
 include:                 # parent dataset this file is a constrained subset of
@@ -94,8 +94,13 @@ data:                    # flat list of field definitions
     range:
       min: 100
       max: 5000
+  - name: inception_date
+    type: date
+    after: "2020-01-01"     # bounded date range
+    before: "2025-12-31"
   - name: active
     type: boolean
+    args: { ratio: 80 }     # 80% true; omit for 50/50
   - name: holder          # nested object
     type: object
     fields:
@@ -127,6 +132,11 @@ links:
 ```
 
 Supported field types: `number`, `boolean`, `string`, `object`, `list`, `date`, `date_time`, `variant`.
+
+Fields also accept:
+- `range: { min:, max: }` — inclusive bounds for `number` fields
+- `after:` / `before:` — bounded date/datetime generation (ISO 8601 / RFC 3339)
+- `args: { ... }` — generator-specific parameters: `min`/`max` (word/length count) for `sentence`, `paragraph`, `words`, `sentences`, `paragraphs`, `password`; `precision` for `geohash`; `format` for `number_with_format`; `ratio` (0–100) for `boolean`
 
 ## Dependencies
 
@@ -169,6 +179,45 @@ cargo build --release
 
 The binary is placed at `target/release/fakeset`.
 
+## Testing
+
+### Rust unit and integration tests
+
+```bash
+cargo test          # ~184 tests
+```
+
+### Statistical regression tests
+
+A Python pytest suite exercises the two bundled examples end-to-end and verifies
+statistical properties of the generated data using
+[polars](https://pola.rs) and [scipy](https://scipy.org):
+
+```bash
+# install Python deps (one-time)
+pip install pytest polars scipy
+
+# run all statistical tests
+pytest
+```
+
+The suite runs both examples, then checks:
+
+| Check | Type |
+|---|---|
+| Numeric fields within declared `range` bounds | Hard invariant |
+| Variant values restricted to declared set | Hard invariant |
+| Referential integrity (`ref` fields point to valid rows) | Hard invariant |
+| Expression results match formula (e.g. `net_payout = claim_amount - deductible`) | Hard invariant |
+| List cardinality within declared `min`/`max` | Hard invariant |
+| Mutually exclusive lower-cover segments partition parent exactly | Hard invariant |
+| Include ratios match declared values (binomial test, α=0.01) | Statistical |
+| Variant distributions match declared ratios (χ² test, α=0.01) | Statistical |
+| Numeric distributions consistent with Uniform[min, max] (KS test, α=0.01) | Statistical |
+
+Statistical tests use α=0.01 (1% false-positive rate per test) and skip automatically
+when the sample is too small for the chosen test.
+
 ## Running
 
 ```bash
@@ -185,18 +234,25 @@ fakeset definitions/ extra.yaml --output ./generated
 fakeset --help
 ```
 
-Each dataset with an `output_file` (or name, as default) produces one output
-file under the output directory (default: `./output`), named
-`<output_file>.<format>`.
+Each dataset produces one or more output files under the output directory
+(default: `./output`). Use `output:` for a single file or `outputs:` for
+multiple (e.g. a clean copy and a synthetically degraded copy — see
+[Data Quality](docs/src/content/docs/reference/yaml-schema.mdx#dataquality)).
 
 ## Examples
 
 ### corporate-registry
 
-A three-dataset DAG modelling officers, organisations, and SMEs.
+An 8-dataset DAG modelling a corporate registry: individuals, organisations (with an embedded `directors` list), SMEs, three mutually exclusive SME size tiers (micro/small/medium), directors, and grants. Exercises Bernoulli segmentation, list links with outer-scoped refs, and multi-level include chains.
 
 ```bash
-cargo run -- examples/corporate-registry --output ./output/corporate-registry
+cargo run --bin fakeset -- examples/corporate-registry --output ./output/corporate-registry
 ```
 
-See [`examples/corporate-registry/README.md`](examples/corporate-registry/README.md) for details.
+### insurance
+
+A 5-dataset schema covering customers, policy products, contracts, claims, and premium payments. Exercises object fields (`address` struct), variant types, list links (contracts embedding linked policy objects), expression fields (`net_payout = claim_amount - deductible`), and two-level include chains.
+
+```bash
+cargo run --bin fakeset -- examples/insurance --output ./output/insurance
+```

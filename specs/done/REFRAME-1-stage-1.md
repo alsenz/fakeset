@@ -36,7 +36,7 @@ Once merged, no old vocabulary should remain in `CLAUDE.md` or `README.md`.
 > of its parent's population. A `links:` stanza introduces a *linked dataset* — a target from
 > which list items are drawn per outer row, governed by the witness/assembly pipeline.
 >
-> This framing is specified in full in `specs/REFRAME-1.md`. In brief: every dataset is a node
+> This framing is specified in full in `REFRAME-1.md`. In brief: every dataset is a node
 > in the semi-lattice; every pair of nodes with a shared ancestor has a **meet** (greatest lower
 > bound); the most-constrained nodes — those covering ⊥ directly — are **atoms**, generated first.
 >

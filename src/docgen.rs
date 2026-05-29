@@ -46,7 +46,8 @@ fn main() {
             f("format",      "Format",           true,  "Output format: parquet, csv, json, or jsonl."),
             f("rows",        "integer?",         false, "Explicit row count. Mutually exclusive with ratio on include."),
             f("locale",      "Locale?",          false, "Default locale for locale-capable generators. Field-level locale takes precedence."),
-            f("output_file", "string?",          false, "Override the output filename (default: name). Datasets sharing the same output_file are unioned and shuffled."),
+            f("output",      "OutputSpec?",      false, "Output file: plain path string or Output block. Sugar for a single-entry outputs list. Accepts output_file as an alias."),
+            f("outputs",     "Output[]",         false, "Multiple output files (e.g. a clean and a degraded copy). If both output and outputs are set, outputs wins."),
             f("include",     "Include?",         false, "Declares this dataset as a constrained subset of another."),
             f("links",       "Include[]",        false, "Linked datasets for list-link sampling."),
             f("data",        "Field[]",          false, "Field definitions. Evaluated in declaration order for expressions."),
@@ -89,8 +90,59 @@ fn main() {
             f("count",       "CountSpec?",       false, "Items per row for list fields."),
             f("precision",   "integer?",         false, "Decimal precision for number fields. Positive = decimal places; negative = rounds by powers of 10."),
             f("default",     "any?",             false, "Fallback when no child provides an inherited value. List collect targets use default: []."),
+            f("quality",     "DataQuality?",     false, "Per-field data-quality overrides. Only valid when the dataset output block also declares a quality stanza."),
+            f("after",       "string?",          false, "Lower bound for date / date_time generation. Format: YYYY-MM-DD for date, RFC 3339 for date_time. Must precede before if both set."),
+            f("before",      "string?",          false, "Upper bound for date / date_time generation. See after."),
+            f("args",        "map?",             false, "Generator-specific arguments. Valid keys: sentence/paragraph/words/sentences/paragraphs/password → min, max (integer); geohash → precision (1–12); number_with_format → format (string); boolean (no generator required) → ratio (0–100, percent-true)."),
         ]),
         variants: None,
+    });
+
+    types.insert("Output".into(), TypeDoc {
+        description: "Describes one output file for a dataset, with an optional data-quality degradation pass.".into(),
+        fields: Some(vec![
+            f("file",    "string",        true,  "Output file path."),
+            f("quality", "DataQuality?",  false, "Data-quality degradation applied after the clean batch is finalised."),
+        ]),
+        variants: None,
+    });
+
+    types.insert("DataQuality".into(), TypeDoc {
+        description: "Controls synthetic data degradation applied to an output file. All probability fields are independent Bernoulli rates.".into(),
+        fields: Some(vec![
+            f("duplication",    "float?",       false, "Dataset-level only. Fraction of rows to duplicate (each selected row appended once as an exact copy)."),
+            f("missing",        "float?",       false, "Dataset-level only. Fraction of rows to delete (applied after duplication)."),
+            f("nulls",          "float?",       false, "Per-cell probability of replacing the value with null."),
+            f("default_rate",   "float?",       false, "Per-cell probability of replacing the value with a type-appropriate default."),
+            f("corruptions",    "Corruptions?", false, "Sub-object controlling per-mode corruption probabilities."),
+            f("default_values", "any[]?",       false, "Field-level only. Custom default values drawn from when default_rate fires."),
+            f("defaults_mode",  "DefaultsMode?",false, "Field-level only. Whether default_values replaces or augments the built-in set."),
+        ]),
+        variants: None,
+    });
+
+    types.insert("Corruptions".into(), TypeDoc {
+        description: "Per-mode corruption probabilities. Each sub-field is an independent per-cell Bernoulli rate. Inapplicable modes are silently skipped at dataset level; a validation error at field level.".into(),
+        fields: Some(vec![
+            f("character_deletion",  "float?", false, "string — delete one random character."),
+            f("character_insertion", "float?", false, "string — insert one random ASCII character at a random position."),
+            f("truncation",          "float?", false, "string — truncate to a random prefix length. Models VARCHAR overflow."),
+            f("encoding",            "float?", false, "string — re-encode a random substring through a lossy codepage, producing mojibake."),
+            f("noise",               "float?", false, "number — add Gaussian noise. Amplitude = noise_scale × column std dev (or noise_scale directly if std dev is 0)."),
+            f("noise_scale",         "float",  false, "number — multiplier on column std dev for noise amplitude. Default: 1.0. Not a probability."),
+            f("day_shift",           "float?", false, "date, date_time — shift by a uniform random number of days in [−day_shift_max, +day_shift_max]."),
+            f("day_shift_max",       "integer",false, "date, date_time — maximum absolute shift in days. Default: 30. Not a probability."),
+        ]),
+        variants: None,
+    });
+
+    types.insert("DefaultsMode".into(), TypeDoc {
+        description: "Controls whether field-level default_values replaces or augments the built-in default set.".into(),
+        fields: None,
+        variants: Some(vec![
+            ev("override", "default_values replaces the built-in defaults entirely."),
+            ev("extend",   "default_values is merged with the built-in defaults (default)."),
+        ]),
     });
 
     types.insert("ListContent".into(), TypeDoc {
@@ -222,8 +274,11 @@ fn main() {
             ev("name",               "Locale-aware full name."),
             ev("name_with_title",    "Locale-aware full name with title."),
             ev("word",               "Locale-aware lorem word."),
-            ev("sentence",           "Locale-aware lorem sentence."),
-            ev("paragraph",          "Locale-aware lorem paragraph."),
+            ev("sentence",           "Locale-aware lorem sentence. args: min, max (word count; defaults 5, 10)."),
+            ev("paragraph",          "Locale-aware lorem paragraph. args: min, max (sentence count; defaults 3, 6)."),
+            ev("words",              "Locale-aware lorem words joined by spaces. args: min, max (word count; defaults 3, 8)."),
+            ev("sentences",          "Locale-aware lorem sentences joined by spaces. args: min, max (sentence count; defaults 2, 5)."),
+            ev("paragraphs",         "Locale-aware lorem paragraphs joined by blank lines. args: min, max (paragraph count; defaults 2, 4)."),
             ev("company_name",       "Locale-aware company name."),
             ev("company_suffix",     "Locale-aware company suffix."),
             ev("industry",           "Locale-aware industry."),
@@ -231,7 +286,7 @@ fn main() {
             ev("buzzword",           "Locale-aware business buzzword."),
             ev("email",              "Email address."),
             ev("username",           "Internet username."),
-            ev("password",           "Password (8–20 chars)."),
+            ev("password",           "Password. args: min, max (length in chars; defaults 8, 20)."),
             ev("ipv4",               "IPv4 address."),
             ev("ipv6",               "IPv6 address."),
             ev("mac_address",        "MAC address."),
@@ -251,8 +306,10 @@ fn main() {
             ev("currency_symbol",    "Currency symbol."),
             ev("latitude",           "Latitude (number or string)."),
             ev("longitude",          "Longitude (number or string)."),
+            ev("geohash",            "Geohash string. args: precision (integer 1–12; default 6)."),
             ev("positive_decimal",   "Positive float (number or string)."),
             ev("decimal",            "Float, possibly negative (number or string)."),
+            ev("number_with_format", "Number formatted by a pattern string. args: format (required, e.g. \\\"###-###\\\"). # = random digit, ^ = random digit 1–9."),
             ev("uuid",               "UUID v4."),
             ev("isin",               "ISIN financial identifier."),
             ev("licence_plate",      "Licence plate (fr_fr, it_it, nl_nl locales supported)."),

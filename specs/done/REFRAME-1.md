@@ -619,9 +619,9 @@ The constraint throughout: no old vocabulary is left in any file after each stag
 
 | Stage | Title | Files primarily affected | Risk | Status |
 |-------|-------|--------------------------|------|--------|
-| 1 | Documentation | `CLAUDE.md`, `specs/` | None | ✓ Complete |
-| 2 | Naming pass | All `.rs`, `src/main.rs`, test strings | Low | ✓ Complete |
-| 3 | Staging node as explicit step | `plan.rs`, `executor.rs`, `src/main.rs` | Low | ✓ Complete |
+| 1 | Documentation | `../../CLAUDE.md`, `..` | None | ✓ Complete |
+| 2 | Naming pass | All `.rs`, `../../src/main.rs`, test strings | Low | ✓ Complete |
+| 3 | Staging node as explicit step | `plan.rs`, `executor.rs`, `../../src/main.rs` | Low | ✓ Complete |
 | 4 | `_staging_refs` witness schema | `executor.rs`, `plan.rs`, test fixtures | High | ✓ Complete |
 | 5 | Per-segment witness correctness | `plan.rs`, `executor.rs`, new fixtures | High | Next |
 | 6 | Cardinality validation | `plan.rs`, new test fixtures | Medium | |
@@ -631,13 +631,13 @@ The constraint throughout: no old vocabulary is left in any file after each stag
 
 ### Stage 1 — Documentation ✓ Complete
 
-No code changes. Updated `CLAUDE.md` with the full semi-lattice glossary (atom, lower cover,
+No code changes. Updated `../../CLAUDE.md` with the full semi-lattice glossary (atom, lower cover,
 lower cover group, staging node, witness node, assembly node, inherited field, etc.), rewrote
 the "Core architectural framing" section, renamed "Sibling segmentation" to "Lower cover
 segmentation (Bernoulli factoring)", and updated the execution pipeline step list and module
-map. `README.md` received matching glossary additions and YAML example updates.
+map. `../../README.md` received matching glossary additions and YAML example updates.
 
-*Full plan: [`specs/done/REFRAME-1-stage-1.md`](done/REFRAME-1-stage-1.md)*
+*Full plan: [`REFRAME-1-stage-1.md`](REFRAME-1-stage-1.md)*
 
 ---
 
@@ -651,7 +651,7 @@ Every symbol, constant, CLI flag, doc comment, and printed string now uses the n
 `--max-siblings`), `content.from` (was `content.group`). 23 fixture YAML files had `group:`
 renamed to `from:`.
 
-*Full plan: [`specs/done/REFRAME-1-stage-2.md`](done/REFRAME-1-stage-2.md)*
+*Full plan: [`REFRAME-1-stage-2.md`](REFRAME-1-stage-2.md)*
 
 ---
 
@@ -664,7 +664,7 @@ and the collect-target deferral role (`defer_emit: bool`, emit after `Accumulate
 now self-documenting from the step type alone. Shared helpers `execute_dataset_core` and
 `execute_lower_cover_group_core` serve both the staging and non-staging paths.
 
-*Full plan: [`specs/done/REFRAME-1-stage-3.md`](done/REFRAME-1-stage-3.md)*
+*Full plan: [`REFRAME-1-stage-3.md`](REFRAME-1-stage-3.md)*
 
 ---
 
@@ -675,9 +675,9 @@ with `_staging_refs: List<UInt32>` recording all source-slot indices that drew t
 The old junction-table model (one row per (source-slot, linked-row) pair with `_slot_idx +
 _linked_idx + inner content fields`) has been replaced.
 
-*Implemented in `lib/executor.rs`: `execute_witness`, `unnest_staging_refs`,
+*Implemented in `../../lib/executor.rs`: `execute_witness`, `unnest_staging_refs`,
 `execute_assemble_from_witness`, `execute_accumulate_to_linked`. New fixture:
-`tests/fixtures/execute/staging_refs_dedup/`. New test:
+`../../tests/fixtures/execute/staging_refs_dedup`. New test:
 `test_staging_refs_deduplicates_linked_rows`. All 174 tests pass.*
 
 ---
@@ -691,14 +691,14 @@ matching that segment's field constraints. Staging batches concatenated in segme
 witness batches before unnesting. Cumulative `Collect` reducer in `AccumulateToLinked`:
 subsequent calls carry forward existing list items rather than replacing them.
 
-*Implemented in `lib/plan.rs` (`emit_witness_steps`, `push_with_list_link_steps`,
-`GenerateWitness`, `AssembleFromWitness`), `lib/executor.rs` (`execute_witness`,
+*Implemented in `../../lib/plan.rs` (`emit_witness_steps`, `push_with_list_link_steps`,
+`GenerateWitness`, `AssembleFromWitness`), `../../lib/executor.rs` (`execute_witness`,
 `execute_lower_cover_group_core`, `execute_assemble_from_witness`,
 `execute_accumulate_to_linked`). New fixture:
-`tests/fixtures/execute/segmented_list_link/`. New test:
+`../../tests/fixtures/execute/segmented_list_link`. New test:
 `test_segmented_list_link_assembles_correctly`. All tests pass.*
 
-*Full plan: [`specs/done/REFRAME-1-stage-5.md`](done/REFRAME-1-stage-5.md)*
+*Full plan: [`REFRAME-1-stage-5.md`](REFRAME-1-stage-5.md)*
 ---
 
 ### Stage 5.5 — Cumulative scalar reducers for multi-segment staging nodes ✓ Complete
@@ -709,12 +709,12 @@ existing value unchanged for unmapped rows) rather than overwriting with the def
 `TakeOne` (renamed from `TakeFirst`, backward-compatible via serde alias) keeps the first
 segment's captured value unchanged on subsequent calls.
 
-*Implemented in `lib/executor.rs` (`execute_accumulate_to_linked`,
-`accumulate_scalar_cumulative`), `lib/models.rs` (`Reducer::TakeOne`), `lib/validate.rs`.
-New fixture: `tests/fixtures/execute/segmented_scalar_reduce/`. New test:
+*Implemented in `../../lib/executor.rs` (`execute_accumulate_to_linked`,
+`accumulate_scalar_cumulative`), `../../lib/models.rs` (`Reducer::TakeOne`), `../../lib/validate.rs`.
+New fixture: `../../tests/fixtures/execute/segmented_scalar_reduce`. New test:
 `test_segmented_scalar_sum_accumulates_correctly`. All tests pass.*
 
-*Full plan: [`specs/done/REFRAME-1-stage-5.5.md`](done/REFRAME-1-stage-5.5.md)*
+*Full plan: [`REFRAME-1-stage-5.5.md`](REFRAME-1-stage-5.5.md)*
 
 ---
 
@@ -727,15 +727,15 @@ bails, Uniform{min} > n_eligible bails (new check), Uniform{max} > n_eligible is
 by a silent runtime cap in `execute_witness` rather than a plan-time error.
 `max_cardinality_bound` helper removed.
 
-*Implemented in `lib/plan.rs` (`check_cardinality_feasibility`), `lib/executor.rs`
+*Implemented in `../../lib/plan.rs` (`check_cardinality_feasibility`), `../../lib/executor.rs`
 (Uniform max-cap in `execute_witness`). New fixtures:
-`tests/fixtures/validation/card_fixed_pool_too_small/`,
-`tests/fixtures/validation/card_uniform_min_too_large/`,
-`tests/fixtures/execute/no_replacement_max_cap/`. New tests:
+`../../tests/fixtures/validation/card_fixed_pool_too_small`,
+`../../tests/fixtures/validation/card_uniform_min_too_large`,
+`../../tests/fixtures/execute/no_replacement_max_cap`. New tests:
 `card_fixed_pool_too_small_errors`, `card_uniform_min_too_large_errors` (plan_tests.rs),
 `test_no_replacement_max_cap` (executor_tests.rs). All tests pass.*
 
-*Full plan: [`specs/done/REFRAME-1-stage-6.md`](done/REFRAME-1-stage-6.md)*
+*Full plan: [`REFRAME-1-stage-6.md`](REFRAME-1-stage-6.md)*
 
 ---
 
@@ -750,11 +750,11 @@ fixture directories. Added `//!` doc comments to all 13 `lib/*.rs` files. Added 
 `#[cfg(debug_assertions)]` assertion in `build_plan` verifying staging steps precede
 witness steps. Documented the staging → witness ordering dependency in `graph.rs`.
 
-*Implemented across all `lib/*.rs` modules, `tests/executor_tests.rs`,
-`tests/validate_tests.rs`, `tests/plan_tests.rs`, `tests/rewrite_tests.rs`,
-`tests/dag_tests.rs`, `CLAUDE.md`. All tests pass.*
+*Implemented across all `lib/*.rs` modules, `../../tests/executor_tests.rs`,
+`../../tests/validate_tests.rs`, `../../tests/plan_tests.rs`, `../../tests/rewrite_tests.rs`,
+`../../tests/dag_tests.rs`, `../../CLAUDE.md`. All tests pass.*
 
-*Full plan: [`specs/done/REFRAME-1-stage-7.md`](done/REFRAME-1-stage-7.md)*
+*Full plan: [`REFRAME-1-stage-7.md`](REFRAME-1-stage-7.md)*
 
 ---
 
