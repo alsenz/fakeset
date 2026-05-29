@@ -5,7 +5,7 @@ use fakeset::{
     expressions::pull_down_expression_deps, graph::build_dag,
     load_all_datasets, models::{Format, SyntheticDataset},
     plan::{build_plan, ExecutionPlan, ExecutionStep},
-    rewrite::{apply_global_locales, expand_include_fields, resolve_refs}, segment::DEFAULT_MAX_LOWER_COVER, validate::validate,
+    rewrite::{apply_global_locales, expand_include_fields, resolve_refs}, validate::validate,
 };
 use petgraph::visit::Topo;
 use std::collections::HashMap;
@@ -34,11 +34,6 @@ struct Cli {
     /// Print the execution plan (row counts, lower cover segments, inherited field wiring), then exit
     #[arg(long)]
     print_plan: bool,
-
-    /// Maximum number of lower cover members in one lower cover group (default 16).
-    /// Segment enumeration is 2^N, so raising this requires proportionally more RAM.
-    #[arg(long, default_value_t = DEFAULT_MAX_LOWER_COVER)]
-    max_lower_cover: usize,
 
     /// Override the output format for every dataset (parquet, csv, json, jsonl).
     /// Takes precedence over per-dataset `format:` declarations.
@@ -79,7 +74,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let plan = build_plan(&dag, &resolved, cli.max_lower_cover)?;
+    let plan = build_plan(&dag, &resolved)?;
 
     if cli.print_plan {
         println!("=== Execution Plan ({} steps) ===\n", plan.steps.len());

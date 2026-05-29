@@ -24,7 +24,7 @@ fn plan_for(fixture: &str) -> Vec<ExecutionStep> {
     let datasets = expand_field_variants(datasets).expect("expand field variants");
     let datasets = expand_include_fields(&datasets).expect("expand include fields");
     let resolved = resolve_refs(&datasets).expect("resolve");
-    build_plan(&dag, &resolved, 16).expect("plan").steps
+    build_plan(&dag, &resolved).expect("plan").steps
 }
 
 fn plan_err_for(fixture: &str) -> anyhow::Error {
@@ -35,7 +35,7 @@ fn plan_err_for(fixture: &str) -> anyhow::Error {
     let datasets = expand_field_variants(datasets).expect("expand field variants");
     let datasets = expand_include_fields(&datasets).expect("expand include fields");
     let resolved = resolve_refs(&datasets).expect("resolve");
-    match build_plan(&dag, &resolved, 16) {
+    match build_plan(&dag, &resolved) {
         Ok(_) => panic!("expected plan error but build_plan succeeded"),
         Err(e) => e,
     }

@@ -175,7 +175,7 @@ fn variant_key(path: &Path, i: usize) -> PathBuf {
 
 /// Split `parent_rows` into `dists.len()` integer counts that sum exactly to `parent_rows`.
 /// Uses largest-remainder (Hamilton) rounding.
-fn distribute_rows(parent_rows: usize, dists: &[f64]) -> Vec<usize> {
+pub(crate) fn distribute_rows(parent_rows: usize, dists: &[f64]) -> Vec<usize> {
     let raw: Vec<f64> = dists.iter().map(|d| d * parent_rows as f64).collect();
     let mut counts: Vec<usize> = raw.iter().map(|r| r.floor() as usize).collect();
     let remainder = parent_rows - counts.iter().sum::<usize>();
@@ -190,7 +190,7 @@ fn distribute_rows(parent_rows: usize, dists: &[f64]) -> Vec<usize> {
 /// Merge base schema with variant schema: variant fields override same-named base fields.
 /// Object fields are deep-merged (sub-fields are individually overridden rather than
 /// replacing the entire object), matching the semantics of boolean factoring.
-fn merge_variant_fields(base: &Schema, variant_data: &Schema) -> Schema {
+pub(crate) fn merge_variant_fields(base: &Schema, variant_data: &Schema) -> Schema {
     use crate::expand_variants::merge_delta_into;
     let mut result = base.clone();
     for vfield in variant_data {
@@ -482,7 +482,6 @@ fn linked_field_default(
 pub fn build_plan(
     dag: &DatasetGraph,
     datasets: &HashMap<PathBuf, SyntheticDataset>,
-    max_lower_cover: usize,
 ) -> Result<ExecutionPlan> {
     let row_counts = plan_row_counts(datasets);
     let lower_cover_groups = build_lower_cover_groups(datasets);
@@ -541,7 +540,7 @@ pub fn build_plan(
                         }
                         s
                     }).collect();
-                    let segments = plan_segments(variant_rows, &members_with_output, max_lower_cover)?;
+                    let segments = plan_segments(variant_rows, &members_with_output)?;
                     for m in &members_with_output {
                         track_shared(&m.dataset, &mut shared_outputs, &mut seen_shared);
                     }
@@ -596,7 +595,7 @@ pub fn build_plan(
         }
 
         if let Some(members) = lower_cover_groups.get(path) {
-            let segments = plan_segments(row_counts[path], members, max_lower_cover)?;
+            let segments = plan_segments(row_counts[path], members)?;
             for m in members.iter() {
                 track_shared(&m.dataset, &mut shared_outputs, &mut seen_shared);
             }

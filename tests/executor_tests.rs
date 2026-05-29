@@ -28,7 +28,7 @@ async fn run(fixture: &str) -> PathBuf {
     let datasets = expand_field_variants(datasets).expect("expand field variants");
     let datasets = expand_include_fields(&datasets).expect("expand include fields");
     let resolved = resolve_refs(&datasets).expect("resolve refs");
-    let plan = build_plan(&dag, &resolved, 16).expect("build plan");
+    let plan = build_plan(&dag, &resolved).expect("build plan");
     execute(&plan, &out).await.expect("execute");
     out
 }

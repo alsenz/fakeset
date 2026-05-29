@@ -18,13 +18,6 @@ ALPHA = 0.01  # significance level; 1% false-positive rate per test
 # Known bugs that cause test failures — mark xfail so the suite stays green
 # while documenting what should eventually be fixed.
 #
-# BUG-VAR: Field-level variant values (billing_period, payment_method, status,
-#   claim_type) are not applied when a dataset is a member of another dataset's
-#   lower cover group.  The stub field (type:string, no value/generator) is
-#   generated with a random string instead of the declared variant constant.
-#   Affects: premiums and claims (both include contracts, which is the parent).
-#   Contracts.status is correct because contracts is processed as an atom first.
-#
 # BUG-REF (partial — first-child-wins): For overlap segments where both premiums
 #   and claims appear as lower cover members, grow_parent_from_children assigns
 #   contracts.contract_id / contracts.customer_id from whichever child is first in
@@ -34,7 +27,6 @@ ALPHA = 0.01  # significance level; 1% false-positive rate per test
 #   overlap segment (~34% of contract rows).  Non-deterministic: the test may pass
 #   or fail depending on HashMap iteration order.
 # ---------------------------------------------------------------------------
-_BUG_VAR = pytest.mark.xfail(reason="BUG-VAR: variant values not applied in lower-cover member", strict=True)
 # strict=False: which member wins the first-child-wins race in grow_parent_from_children
 # depends on HashMap iteration order, so the test may pass or fail non-deterministically.
 _BUG_REF = pytest.mark.xfail(reason="BUG-REF: first-child-wins in overlap segment breaks ref integrity for losing child", strict=False)
@@ -116,35 +108,35 @@ def test_contract_status_values(insurance):
     assert not bad.any(), f"Unexpected contract status values: {insurance['contracts'].filter(bad)['status'].to_list()}"
 
 
-@_BUG_VAR
+
 def test_premium_billing_period_values(insurance):
     valid = {"monthly", "quarterly", "annual"}
     bad = ~insurance["premiums"]["billing_period"].is_in(valid)
     assert not bad.any(), f"Unexpected billing_period values: {insurance['premiums'].filter(bad)['billing_period'].to_list()}"
 
 
-@_BUG_VAR
+
 def test_premium_payment_method_values(insurance):
     valid = {"bank_transfer", "credit_card", "direct_debit", "cheque"}
     bad = ~insurance["premiums"]["payment_method"].is_in(valid)
     assert not bad.any(), f"Unexpected payment_method values: {insurance['premiums'].filter(bad)['payment_method'].to_list()}"
 
 
-@_BUG_VAR
+
 def test_premium_status_values(insurance):
     valid = {"paid", "pending", "overdue", "failed"}
     bad = ~insurance["premiums"]["status"].is_in(valid)
     assert not bad.any(), f"Unexpected premium status values: {insurance['premiums'].filter(bad)['status'].to_list()}"
 
 
-@_BUG_VAR
+
 def test_claim_type_values(insurance):
     valid = {"property_damage", "theft", "liability", "medical", "accident"}
     bad = ~insurance["claims"]["claim_type"].is_in(valid)
     assert not bad.any(), f"Unexpected claim_type values: {insurance['claims'].filter(bad)['claim_type'].to_list()}"
 
 
-@_BUG_VAR
+
 def test_claim_status_values(insurance):
     valid = {"pending", "under_review", "approved", "rejected", "paid"}
     bad = ~insurance["claims"]["status"].is_in(valid)
@@ -295,7 +287,7 @@ def test_contract_status_distribution(insurance):
     assert p > ALPHA, f"Contract status distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
 
 
-@_BUG_VAR
+
 def test_claim_status_distribution(insurance):
     """Claim status: pending 20%, under_review 25%, approved 30%, rejected 15%, paid 10%."""
     _require_rows(insurance["claims"], 50, "claims")
@@ -307,7 +299,7 @@ def test_claim_status_distribution(insurance):
     assert p > ALPHA, f"Claim status distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
 
 
-@_BUG_VAR
+
 def test_claim_type_distribution(insurance):
     """Claim type: property_damage 30%, theft 20%, liability 20%, medical 20%, accident 10%."""
     _require_rows(insurance["claims"], 50, "claims")
@@ -319,7 +311,7 @@ def test_claim_type_distribution(insurance):
     assert p > ALPHA, f"Claim type distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
 
 
-@_BUG_VAR
+
 def test_premium_billing_period_distribution(insurance):
     """Billing period: monthly 50%, quarterly 30%, annual 20%."""
     stat, p = _chi2_goodness_of_fit(
@@ -330,7 +322,7 @@ def test_premium_billing_period_distribution(insurance):
     assert p > ALPHA, f"Billing period distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
 
 
-@_BUG_VAR
+
 def test_premium_payment_method_distribution(insurance):
     """Payment method: bank_transfer 40%, credit_card 30%, direct_debit 20%, cheque 10%."""
     stat, p = _chi2_goodness_of_fit(
@@ -341,7 +333,7 @@ def test_premium_payment_method_distribution(insurance):
     assert p > ALPHA, f"Payment method distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
 
 
-@_BUG_VAR
+
 def test_premium_status_distribution(insurance):
     """Premium status: paid 75%, pending 10%, overdue 10%, failed 5%."""
     stat, p = _chi2_goodness_of_fit(

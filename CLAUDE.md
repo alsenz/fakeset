@@ -232,8 +232,6 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 
 **Mixed-type variant fields** — `type: variant` fields whose choices span more than one type (e.g. one choice is a string, another is a number) are not currently rejected at validation time. Instead, `expand_field_variants` produces an untyped stub (`field_type = None`), which causes a runtime panic when `schema_to_arrow` or `generate_column_raw` hits the unresolved type. Workaround: ensure all choices in a `type: variant` field share the same type. See `specs/VAR-1.md` for the planned fix and the longer-term `type: any` encoding design.
 
-**BUG-VAR — variant values not applied in lower-cover members** — Field-level `type: variant` fields (e.g. `billing_period: monthly/quarterly/annual`) are not applied when the dataset is a lower-cover member of another dataset. The typed stub that `expand_field_variants` leaves in the base schema has no `value` or `generator`, so `generate_fresh_batch` produces random strings instead of the declared values. Affects `premiums` and `claims` in the insurance example (both include `contracts`). Documented by `_BUG_VAR` xfail markers in `tests/statistical/test_insurance.py`.
-
 **BUG-REF (first-child-wins) — overlap segment ref integrity** — In overlap segments where two lower-cover members both appear, `grow_parent_from_children` inherits shared fields (e.g. `contract_id`) from whichever child is first in `child_batches` (HashMap iteration order). The other child's rows were generated with different values for that field and will not match the parent. Affects `claims.contract_id` / `claims.customer_id` in the `{premiums ∩ claims}` overlap segment (~34% of contract rows). Non-deterministic. Documented by `_BUG_REF` xfail markers in `tests/statistical/test_insurance.py`.
 
 ## Feature specs
@@ -250,17 +248,19 @@ Full design specs and implementation plans live in `specs/`:
 | `specs/VAR-1.md` | **Planned** — Phase 1 (validation gate); Phase 2 (`type: any` encoding) pending design sign-off |
 | `specs/done/DQ-1.md` | **Complete** — post-write DQ layer implemented: nulls, defaults, corruptions (char deletion/insertion/truncation/encoding, noise, day shift), duplication, row deletion; field-level overrides; multiple output files per dataset |
 | *(no spec file)* ARGS-1 | **Complete** — `args` map on `Field` for generator-specific parameters; `after`/`before` top-level date bounds (parallel to `range`); new generators `words`, `sentences`, `paragraphs`, `geohash`, `number_with_format`; boolean `ratio` via `args` |
+| `specs/done/SEG-1.md` | **Complete** — branch-and-bound DFS replaces dense 2^N weight pass; N-based cap removed; `MAX_FEASIBLE_SEGMENTS` K-based cap; O(K·N) memory |
+| `specs/done/VAR-2.md` | **Complete** — two-level variant factoring; `generate_member_batch` applies Level 2 variant sub-distribution in the lower cover segment loop; BUG-VAR resolved |
+| `specs/VAR-SPECIALIZE.md` | **Future** — child specialisation of parent variant fields; Level 2 IPF upgrade; needs design sign-off on YAML syntax and `FieldConstraints` set-value encoding; depends on VAR-2 |
 
 ## Planned next steps
 
 - **DF5** — make `execute_witness` async; use DataFusion to shuffle and limit the linked batch before Arrow-based with-replacement sampling.
 - **DF4** — write output via DataFusion `DataSink`; needs care around single-file vs partitioned output.
 - **T1** — unit tests for `generate_column` per field type.
-- **branch-and-bound segment enumeration** — replace the dense 2^N weight pass in `plan_segments` with an O(K·N) lattice traversal for large lower cover groups.
 
 ## Future work (needs planning)
 - **REL** — model relationships induced by nested lists
 - **REPO** — allow definitions to be imported and included from remote GitHub repositories
 - **IMPORT** — allow imports from pre-existing files and database connections
 - **CNV-1** — field and excluded (field) wildcards on includes to default-define fields from includes as refs
-- **VAR-SPECIALIZE** — allow a child dataset to *specialise* a parent's `type: variant` field by restricting it to a subset of the parent's variant choices (e.g. `cats.yaml` constrains `animals.eats` from `[birds, mice, grass, fish]` to `[birds, mice]`). Architecturally this interacts with BUG-VAR's two-level factoring plan: at Level 1 (outer Bernoulli segmentation over base lower-cover members), sibling field constraints are already intersected. At Level 2 (inner variant sub-distribution for a single member within a segment), the same conflict-pruning logic must apply — some of the member's own variant combos may be incompatible with the outer segment's `field_constraints` contributed by sibling members. Level 2 therefore needs its own IPF pass (zero incompatible variant combos → redistribute surviving weights) before generating rows. Structurally identical to Level 1's `plan_segments`; implementation should reuse the same machinery rather than duplicating it.
+- **VAR-SPECIALIZE** — see `specs/VAR-SPECIALIZE.md`

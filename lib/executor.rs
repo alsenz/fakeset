@@ -42,9 +42,9 @@ use crate::constraints::FieldConstraints;
 use crate::generator::{generate_column, sample_count};
 use crate::schema::{field_to_arrow, schema_to_arrow};
 use crate::dq::apply_data_quality;
-use crate::models::{eligible_linked_rows, resolve_include, split_ref, CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset};
-use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField};
-use crate::segment::{LowerCoverMember, Segment};
+use crate::models::{eligible_linked_rows, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset};
+use crate::plan::{distribute_rows, merge_variant_fields, ExecutionPlan, ExecutionStep, InheritedField};
+use crate::segment::{constraints_conflict, lower_cover_field_constraints, try_merge_incremental, LowerCoverMember, Segment};
 
 /// Execute the plan produced by `plan::build_plan`, writing outputs to `output_dir`.
 ///
@@ -288,11 +288,11 @@ async fn execute_lower_cover_group_core(
                         // parent slot). Generate a fresh canonical batch for assembly and an
                         // expanded batch tagged with _slot_idx so the lattice position is
                         // recorded in computed after all segments are processed.
-                        let canonical = generate_fresh_batch(
-                            &m.dataset.data, seg.rows, &seg.field_constraints,
+                        let canonical = generate_member_batch(
+                            m, seg.rows, &seg.field_constraints,
                         )?;
-                        let expanded = generate_expanded_batch(
-                            &m.dataset.data, seg.rows, &seg.field_constraints, card, slot_offset,
+                        let expanded = generate_member_expanded_batch(
+                            m, seg.rows, &seg.field_constraints, card, slot_offset,
                         )?;
                         member_buffers.entry(m.path.clone()).or_default().push(expanded);
                         child_batches.push((m, canonical));
@@ -303,13 +303,13 @@ async fn execute_lower_cover_group_core(
                     }
                 } else {
                     // Canonical batch: one row per slot, used for parent assembly.
-                    let canonical = generate_fresh_batch(
-                        &m.dataset.data, seg.rows, &seg.field_constraints,
+                    let canonical = generate_member_batch(
+                        m, seg.rows, &seg.field_constraints,
                     )?;
                     if let Some(ref card) = m.cardinality {
                         // Expanded batch: M_n rows per slot, tagged with _slot_idx for output.
-                        let expanded = generate_expanded_batch(
-                            &m.dataset.data, seg.rows, &seg.field_constraints, card, slot_offset,
+                        let expanded = generate_member_expanded_batch(
+                            m, seg.rows, &seg.field_constraints, card, slot_offset,
                         )?;
                         member_buffers.entry(m.path.clone()).or_default().push(expanded);
                         child_batches.push((m, canonical));
@@ -1321,6 +1321,113 @@ fn generate_expanded_batch(
 
     let inner_schema = slot_batches.first().map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(schema_to_arrow(fields)));
+    let combined = concat_batches(&inner_schema, &slot_batches)?;
+    let slot_col: ArrayRef = Arc::new(UInt32Array::from(slot_tags));
+    prepend_column(&combined, "_slot_idx", slot_col)
+}
+
+/// Generate a canonical batch (one row per segment slot) for a lower cover member,
+/// applying Level 2 variant sub-distribution when the member has `variants:`.
+///
+/// Without variants: delegates to `generate_fresh_batch` unchanged.
+/// With variants: distributes `rows` across compatible variant schemas proportionally,
+/// generates one sub-batch per surviving variant, and concatenates them.
+fn generate_member_batch(
+    m: &LowerCoverMember,
+    rows: usize,
+    seg_constraints: &HashMap<String, FieldConstraints>,
+) -> Result<RecordBatch> {
+    if m.dataset.variants.is_empty() {
+        return generate_fresh_batch(&m.dataset.data, rows, seg_constraints);
+    }
+
+    // Build concrete schemas and extract their parent-ref constraints.
+    let variant_schemas: Vec<_> = m.dataset.variants.iter()
+        .map(|v| merge_variant_fields(&m.dataset.data, &v.data))
+        .collect();
+
+    let variant_ref_constraints: Vec<HashMap<String, FieldConstraints>> = variant_schemas.iter()
+        .map(|schema| {
+            let tmp = LowerCoverMember {
+                path: m.path.clone(),
+                dataset: crate::models::SyntheticDataset {
+                    name: m.dataset.name.clone(),
+                    format: m.dataset.format.clone(),
+                    rows: None, output: None, outputs: vec![],
+                    locale: None, include: None, links: vec![],
+                    data: schema.clone(),
+                    variants: vec![],
+                },
+                ratio: m.ratio,
+                cardinality: None,
+                reference: m.reference.clone(),
+                is_witness_source: false,
+            };
+            lower_cover_field_constraints(&tmp)
+        })
+        .collect();
+
+    // Filter to variants whose ref constraints are compatible with this segment.
+    let surviving: Vec<usize> = (0..m.dataset.variants.len())
+        .filter(|&i| !constraints_conflict(&variant_ref_constraints[i], seg_constraints))
+        .collect();
+
+    if surviving.is_empty() {
+        return generate_fresh_batch(&m.dataset.data, rows, seg_constraints);
+    }
+
+    // Distribute rows across surviving variants, normalising their ratios.
+    let surviving_option_ratios: Vec<Option<f64>> = surviving.iter()
+        .map(|&i| m.dataset.variants[i].ratio)
+        .collect();
+    let dists = resolve_distributions(&surviving_option_ratios);
+    let row_counts = distribute_rows(rows, &dists);
+
+    // Generate one sub-batch per surviving variant with >0 rows.
+    let mut sub_batches: Vec<RecordBatch> = Vec::new();
+    for (pos, &vi) in surviving.iter().enumerate() {
+        let r = row_counts[pos];
+        if r == 0 { continue; }
+        let merged_constraints = try_merge_incremental(
+            seg_constraints.clone(), &variant_ref_constraints[vi],
+        ).unwrap_or_else(|| seg_constraints.clone());
+        sub_batches.push(generate_fresh_batch(&variant_schemas[vi], r, &merged_constraints)?);
+    }
+
+    if sub_batches.is_empty() {
+        return generate_fresh_batch(&m.dataset.data, rows, seg_constraints);
+    }
+
+    let schema = sub_batches[0].schema();
+    Ok(concat_batches(&schema, &sub_batches)?)
+}
+
+/// Generate an expanded batch (M_n rows per slot, tagged with `_slot_idx`) for a lower
+/// cover member with cardinality, applying Level 2 variant sub-distribution per slot.
+fn generate_member_expanded_batch(
+    m: &LowerCoverMember,
+    slot_count: usize,
+    seg_constraints: &HashMap<String, FieldConstraints>,
+    cardinality: &CountSpec,
+    slot_offset: usize,
+) -> Result<RecordBatch> {
+    if m.dataset.variants.is_empty() {
+        return generate_expanded_batch(&m.dataset.data, slot_count, seg_constraints, cardinality, slot_offset);
+    }
+
+    let mut slot_tags: Vec<u32> = Vec::new();
+    let mut slot_batches: Vec<RecordBatch> = Vec::new();
+
+    for i in 0..slot_count {
+        let m_n = sample_count(cardinality).max(1);
+        let batch = generate_member_batch(m, m_n, seg_constraints)?;
+        let slot = (slot_offset + i) as u32;
+        slot_tags.extend(std::iter::repeat(slot).take(m_n));
+        slot_batches.push(batch);
+    }
+
+    let inner_schema = slot_batches.first().map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(schema_to_arrow(&m.dataset.data)));
     let combined = concat_batches(&inner_schema, &slot_batches)?;
     let slot_col: ArrayRef = Arc::new(UInt32Array::from(slot_tags));
     prepend_column(&combined, "_slot_idx", slot_col)
