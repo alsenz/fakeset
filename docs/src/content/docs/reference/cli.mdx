@@ -35,19 +35,6 @@ per-dataset `format:` declaration in the YAML.
 fakeset definitions/ --output-format csv
 ```
 
-### `--max-lower-cover <N>`
-
-Maximum number of lower-cover members in one lower-cover group. Segment
-enumeration is 2^N, so raising this requires proportionally more RAM.
-
-**Default:** `16` (65,536 segments)
-
-```bash
-fakeset definitions/ --max-lower-cover 20
-```
-
-See [Bernoulli Factoring](/concepts/bernoulli-factoring/) for details.
-
 ### `--print-dag`
 
 Print the DAG with field details **before** the rewrite pass, then exit.
@@ -95,7 +82,4 @@ fakeset ./definitions/ --output-format csv --output ./csv-output
 
 # Inspect the execution plan
 fakeset ./definitions/ --print-plan
-
-# Larger lower-cover cap (uses more RAM)
-fakeset ./definitions/ --max-lower-cover 20
 ```

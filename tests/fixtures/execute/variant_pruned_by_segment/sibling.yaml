@@ -1,0 +1,12 @@
+name: sibling
+format: csv
+include:
+  file: parent.yaml
+  ref: p
+  ratio: 1.0
+data:
+  - name: id
+    ref: p.id
+  - name: category
+    ref: p.category
+    value: "premium"

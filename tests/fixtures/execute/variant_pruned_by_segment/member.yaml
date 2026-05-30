@@ -1,0 +1,25 @@
+name: member
+format: csv
+output_file: member
+include:
+  file: parent.yaml
+  ref: p
+  ratio: 0.5
+data:
+  - name: id
+    ref: p.id
+  - name: category
+    ref: p.category
+variants:
+  - ratio: 0.5
+    data:
+      - name: category
+        type: string
+        ref: p.category
+        value: "premium"
+  - ratio: 0.5
+    data:
+      - name: category
+        type: string
+        ref: p.category
+        value: "basic"

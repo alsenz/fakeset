@@ -588,6 +588,52 @@ async fn test_variant_lower_cover_total_rows() {
 }
 
 // ---------------------------------------------------------------------------
+// VAR-2: variant values applied when dataset is a lower-cover member
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_variant_lower_cover_member_applies_variant_values() {
+    // parent: 100 rows.  member: lower cover member at ratio 0.6 with two variants
+    // (V0 sets code="alpha" at 50%, V1 sets code="beta" at 50%).
+    // Before VAR-2 this produced random strings; after VAR-2 all rows must be alpha or beta.
+    let out = run("tests/fixtures/execute/variant_in_lower_cover").await;
+
+    let codes = csv_column(&out, "member", "code");
+    assert!(!codes.is_empty(), "member should have rows");
+    let unexpected: Vec<_> = codes.iter()
+        .filter(|v| v.as_str() != "alpha" && v.as_str() != "beta")
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "all member.code values must be 'alpha' or 'beta'; unexpected: {unexpected:?}"
+    );
+    assert!(codes.iter().any(|v| v == "alpha"), "expected some 'alpha' rows");
+    assert!(codes.iter().any(|v| v == "beta"),  "expected some 'beta' rows");
+}
+
+#[tokio::test]
+async fn test_variant_incompatible_with_segment_constraint_is_pruned() {
+    // sibling: ratio=1.0, pins category="premium" for all parent rows.
+    // member: ratio=0.5, two variants — V0 sets category="premium" (50%), V1 sets
+    //   category="basic" (50%).
+    // Because sibling has ratio=1.0, all member rows fall in the {sibling, member}
+    // segment where seg_constraints = {category: "premium"}.  V1 ("basic") conflicts
+    // with that constraint and is pruned.  All member output rows must have
+    // category="premium".
+    let out = run("tests/fixtures/execute/variant_pruned_by_segment").await;
+
+    let categories = csv_column(&out, "member", "category");
+    assert!(!categories.is_empty(), "member should have rows");
+    let unexpected: Vec<_> = categories.iter()
+        .filter(|v| v.as_str() != "premium")
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "all member.category values must be 'premium' (V1='basic' pruned by segment constraint); unexpected: {unexpected:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Field-local variant tests
 // ---------------------------------------------------------------------------
 

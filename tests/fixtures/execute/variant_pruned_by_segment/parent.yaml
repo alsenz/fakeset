@@ -1,0 +1,9 @@
+name: parent
+format: csv
+rows: 100
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: category
+    type: string

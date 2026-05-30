@@ -5,19 +5,42 @@ description: Build fakeset from source and generate your first dataset.
 
 import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
-## Prerequisites
-
-- [Rust](https://rustup.rs) 1.80 or later (edition 2024)
-- Cargo (included with Rust)
-
 ## Installation
+
+<Tabs>
+  <TabItem label="Pre-built binary">
+
+Download the latest binary for your platform from the
+[Releases page](https://github.com/alsenz/fakeset/releases):
+
+| File | Platform |
+|------|----------|
+| `fakeset-linux-x86_64` | Linux (x86-64) |
+| `fakeset-macos-aarch64` | macOS (Apple Silicon) |
+| `fakeset-macos-x86_64` | macOS (Intel) |
+| `fakeset-windows-x86_64.exe` | Windows (x86-64) |
+
+**Linux / macOS** — make it executable and move it onto your `PATH`:
+
+```bash
+chmod +x fakeset-linux-x86_64
+mv fakeset-linux-x86_64 ~/.local/bin/fakeset
+```
+
+**Windows** — rename the `.exe` to `fakeset.exe` and place it in a directory on
+your `%PATH%`.
+
+  </TabItem>
+  <TabItem label="Build from source">
+
+**Prerequisites:** [Rust](https://rustup.rs) 1.80 or later (edition 2024) with Cargo.
 
 <Steps>
 
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/tomplowy/fakeset
+   git clone https://github.com/alsenz/fakeset
    cd fakeset
    ```
 
@@ -36,6 +59,9 @@ import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
    ```
 
 </Steps>
+
+  </TabItem>
+</Tabs>
 
 ## Your first schema
 
@@ -116,7 +142,7 @@ everything is consistent.
 The repository ships a larger worked example under `examples/corporate-registry/`:
 
 ```bash
-cargo run --bin fakeset -- examples/corporate-registry --output ./output/corporate-registry
+fakeset examples/corporate-registry --output ./output/corporate-registry
 ```
 
 This produces five datasets:

@@ -119,92 +119,86 @@ cover of `people`, factoring proceeds:
 
 ## The segment cap
 
-The default cap is **16 lower-cover members** per group (2^16 = 65,536 segments).
-Override with `--max-lower-cover`:
+The hard cap is **1,000,000 feasible segments** (`MAX_FEASIBLE_SEGMENTS`). Unlike a
+member-count cap, this bounds the number of *surviving* segments — not the raw 2^N
+enumeration space. In practice, conflict pruning reduces the feasible set to a
+small fraction of 2^N (often just N+1 singletons for mutually-exclusive groups),
+so groups with many more than 16 members are handled correctly as long as their
+feasible segments stay below the cap.
 
-```bash
-fakeset definitions/ --max-lower-cover 20
-```
-
-<Aside type="caution">
-Raising `--max-lower-cover` costs RAM quadratically — 2^20 = 1M segments.
-Consider whether your lower-cover members genuinely need joint distribution
-modelling or whether they can be split into independent groups.
+<Aside type="note">
+There is no `--max-lower-cover` flag. The branch-and-bound enumeration (see below)
+makes a member-count cap unnecessary: the work is proportional to the number of
+*surviving* feasible segments K, not to 2^N.
 </Aside>
 
-## Implementation: taming the combinatorial explosion
+## Implementation: branch-and-bound DFS
 
-Naively, the three-step algorithm touches all 2^N subsets at every stage. The
-implementation in `segment.rs::plan_segments` applies four complementary strategies
-to keep the work tractable for realistic lower-cover sizes:
+`segment.rs::plan_segments` avoids touching all 2^N subsets by using a
+**branch-and-bound depth-first search** over the inclusion lattice:
 
-### Opt A — pairwise conflict pre-screening
+### Step 1 — Precompute pairwise conflict masks
 
-Before evaluating any subset mask, `precompute_conflicts` builds a small N×N
-conflict table: for every pair (i, j), record whether their constraints are
-mutually incompatible. Then, for each mask, `mask_has_conflict` eliminates it in
-O(N) with pure bitwise arithmetic — no `HashMap` merges, no allocation.
+Before the DFS, `precompute_conflicts` builds a compact N-element array
+`conflict_masks`: for member `i`, `conflict_masks[i]` is the bitmask of all
+members `j > i` whose constraints conflict with member `i`. This requires only N×(N−1)/2
+`try_merge_incremental` checks — one per pair — and is O(N²) overall.
 
-For *one-of* lower-cover groups (e.g. mutually exclusive size categories), this
-eliminates all joint masks in a single O(N·2^N) pass, reducing the feasible set
-from 2^N to exactly N+1 singletons-plus-remainder before any expensive work begins.
+### Step 2 — Branch-and-bound DFS
 
-### Opt B — sorted-budget sparse constraint computation
+`enumerate_segments_dfs` walks the inclusion lattice recursively. At each level
+`idx` (one per lower-cover member), it takes two branches:
 
-The surviving masks are sorted by weight descending. Masks are then processed in
-order, accumulating their total weight fraction. Once the remaining weight is so
-small that it cannot contribute even one expected row (threshold: all-but-1/parent_rows
-of the post-conflict total), evaluation stops. Constraints — the expensive `HashMap`
-merge operation — are computed only for this sparse feasible set of K masks (K ≪ 2^N
-in practice).
+- **Exclude branch** — multiply the running weight by `1 − ratio[idx]`; recurse to `idx+1`.
+- **Include branch** — first check `(mask & conflict_masks[idx]) == 0` (any already-included
+  member conflicts with this one?). If not, try `try_merge_incremental` to add
+  member `idx`'s constraints to the running merged set. If that also succeeds,
+  multiply weight by `ratio[idx]` and recurse.
 
-**Singleton guard.** Raw Bernoulli weights catastrophically underestimate the
-post-IPF contribution of singleton masks in near-mutually-exclusive groups: a 4%
-member alongside a 95% peer has a raw weight of ~0.2% (the marginal of "this member
-and not that one"), but its post-IPF contribution is the full 4%. To prevent
-budget pruning from dropping these, every singleton mask that survived conflict
-pre-screening is force-included into the feasible set regardless of budget position.
-Joint masks (two or more members) don't need this protection — their many alternatives
-absorb any dropped weight via Bernoulli rounding.
+Entire subtrees are pruned immediately when a conflict is detected — no work is
+done for infeasible descendants. For one-of groups (mutually exclusive members),
+every joint branch is pruned, reducing the feasible set to exactly N+1 entries.
 
-### Opt C — sparse IPF
+Constraint merging is incremental: each recursive call extends the *parent call's*
+already-merged `HashMap<String, FieldConstraints>` by one new member. The expensive
+per-field merge is paid at most once per member per path through the DFS, not once
+per 2^N mask.
 
-Standard IPF iterates over all 2^N entries on each of its inner loops. Because the
-feasible set is already sparse after Opt A and Opt B, `ipf_rescale_sparse` iterates
-only the K feasible mask keys — O(K·N) per round rather than O(2^N·N). For one-of
-groups where K = N+1 this is thousands of times faster than the dense formulation.
+The DFS halts with an error if `K > MAX_FEASIBLE_SEGMENTS` (1,000,000).
+
+### Step 3 — Sparse IPF and Bernoulli rounding
+
+`ipf_rescale_sparse` iterates only the K feasible segments (stored as
+`HashMap<usize, f64>` of mask → weight). Each pass is O(K·N). For one-of groups,
+K = N+1, making this thousands of times faster than dense O(2^N·N) IPF.
+
+Integer row counts are derived by Bernoulli rounding: each segment's fractional
+weight is rounded to an integer, with the fractional remainder converted to a
+Bernoulli trial.
 
 ### Summary
 
-| Strategy | Cost reduction | Best case |
-|----------|---------------|-----------|
-| Pairwise conflict pre-screening | Eliminates infeasible masks cheaply | One-of groups: K = N+1 |
-| Sorted-budget sparse eval | Skips near-zero weight masks | High-ratio skew: K ≈ N |
-| Singleton guard | Prevents incorrect budget pruning | Near-exclusive members |
-| Sparse IPF | O(K·N) vs O(2^N·N) per round | K ≪ 2^N always helps |
+| Phase | Cost | Best case |
+|-------|------|-----------|
+| Pairwise conflict precompute | O(N²) | Amortised once per group |
+| Branch-and-bound DFS | O(K·N) | One-of groups: K = N+1 |
+| Sparse IPF | O(K·N) per round | Always proportional to K |
 
-Together these make 16-member groups (65,536 raw subsets) tractable in milliseconds
-for typical schemas, even when the theoretical worst case would be expensive.
+The work is proportional to K — the number of feasible segments — rather than 2^N.
 
-## Further scaling work
+## Further scaling directions
 
-The strategies above handle realistic schemas well, but there are known directions
-for pushing the cap higher or handling adversarial cases:
+The current implementation handles arbitrarily large lower-cover groups efficiently
+when K is small. Two known directions remain for adversarial cases:
 
-- **Branch-and-bound enumeration.** Replace the dense 2^N weight array with a
-  lattice walk that prunes entire subtrees when their accumulated Bernoulli weight
-  falls below the budget threshold. This would reduce the enumeration from O(2^N)
-  to O(K·N) — matching the already-sparse IPF — and could raise the practical cap
-  well beyond 16 without a quadratic RAM cost.
-
-- **Higher-arity conflict detection.** The current pre-screening checks pairs. A
+- **Higher-arity conflict detection.** The current precomputation checks pairs. A
   triple (A, B, C) can be jointly infeasible without any pair being infeasible
   (e.g. overlapping numeric ranges that only become empty when all three are
-  intersected). Extending to k-ary conflict checks would eliminate more masks in
-  the pre-screen at the cost of O(N^k) preprocessing.
+  intersected). Extending to k-ary conflict checks would prune more branches in
+  the DFS at the cost of O(N^k) preprocessing.
 
 - **Independent group decomposition.** If the lower-cover members can be partitioned
   into two subsets that share no constrained fields, their joint distribution
   factors exactly — 2^(N/2) × 2^(N/2) = 2^N subsets collapse to 2·2^(N/2). A
   graph-connectivity check on the shared-field graph before enumeration would
-  expose this structure automatically.
+  expose this structure and allow the two halves to be factored independently.

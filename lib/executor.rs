@@ -1377,10 +1377,18 @@ fn generate_member_batch(
     }
 
     // Distribute rows across surviving variants, normalising their ratios.
+    // resolve_distributions fills free (None) shares but does not normalise fixed ratios —
+    // we must renormalise explicitly so pruned variants' weight is redistributed correctly.
     let surviving_option_ratios: Vec<Option<f64>> = surviving.iter()
         .map(|&i| m.dataset.variants[i].ratio)
         .collect();
-    let dists = resolve_distributions(&surviving_option_ratios);
+    let raw_dists = resolve_distributions(&surviving_option_ratios);
+    let total: f64 = raw_dists.iter().sum();
+    let dists: Vec<f64> = if total > 0.0 {
+        raw_dists.iter().map(|d| d / total).collect()
+    } else {
+        vec![1.0 / surviving.len() as f64; surviving.len()]
+    };
     let row_counts = distribute_rows(rows, &dists);
 
     // Generate one sub-batch per surviving variant with >0 rows.

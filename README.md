@@ -184,7 +184,7 @@ The binary is placed at `target/release/fakeset`.
 ### Rust unit and integration tests
 
 ```bash
-cargo test          # ~184 tests
+cargo test          # ~194 tests
 ```
 
 ### Statistical regression tests

@@ -9,7 +9,7 @@ A declarative, DAG-structured synthetic dataset generator. Users write YAML sche
 ```bash
 cargo build                  # debug
 cargo build --release        # release binary → target/release/fakeset
-cargo test                   # all unit + integration tests (~184 tests)
+cargo test                   # all unit + integration tests (~194 tests)
 cargo check                  # fast type-check without linking
 ```
 
@@ -150,7 +150,7 @@ When two or more datasets include the same parent they form the parent's **lower
 2. **Conflict pruning** — zero out any subset whose field constraints are mutually contradictory (e.g. two lower cover members both pinning `status` to different constants). Rows from zeroed subsets are redistributed to surviving subsets.
 3. **IPF (Iterative Proportional Fitting)** — scale the surviving weights so declared marginals are exactly restored, then apply Bernoulli rounding to integer row counts.
 
-The default cap is 16 lower cover members per group (65,536 subsets); override with `--max-lower-cover`. Raising it costs RAM quadratically.
+Enumeration uses a branch-and-bound DFS over the inclusion lattice. At each DFS step the algorithm tries excluding the current member (multiply weight by `1 − ratio`) then including it (multiply by `ratio`, reject immediately if the new member conflicts with any previously-included member). The `MAX_FEASIBLE_SEGMENTS` cap (1,000,000 segments) is a K-based safety valve — it bounds the number of *surviving* feasible segments, not the raw 2^N enumeration space, so arbitrarily large lower-cover groups are handled as long as the feasible set stays small. IPF and Bernoulli rounding operate on the sparse feasible set only.
 
 ## Execution pipeline
 

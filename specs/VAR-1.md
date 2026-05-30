@@ -2,8 +2,8 @@
 
 ## Status
 
-Planned — Phase 1 (validation gate) is a quick fix; Phase 2 (`type: any`) needs
-design sign-off before implementation.
+Planned — Phase 1 (validation gate) is a quick fix ready to implement; Phase 2
+(`type: any`) needs design sign-off before implementation.
 
 ## Background
 
@@ -24,6 +24,12 @@ typed stub in `data`:
 
 There is currently no validation gate that catches this before execution.
 
+VAR-2 introduced Level 2 variant factoring so that variant fields are correctly
+applied when a dataset is used as a lower-cover member. This addressed the BUG-VAR
+symptom (random strings instead of declared variant values in lower-cover generation).
+VAR-1 is complementary: it addresses the validation gap (P1) and the schema-level
+ref propagation gap (P2) that remain.
+
 ## Problem scope
 
 ### P1 — Mixed-type variant field causes a runtime panic (not a clean error)
@@ -35,17 +41,27 @@ opaque thread-panic instead of a diagnostic. Affects:
 - Any child `ref:` to that field (the ref inherits `field_type = None` via
   `resolve_refs`).
 
-### P2 — Same-type variants can't be meaningfully `ref:`-d by a child
+VAR-2 does **not** affect this: a mixed-type stub still has `field_type = None`, and
+Level 2 factoring will panic for the same reason during schema construction.
 
-Even when the stub is correctly typed, the stub's `value` is `None` — the variant
-choices are expressed as global `variants:` entries, not on the stub itself. A child
-that refs the field gets the correct Arrow type but generates a fresh random value
-(not one of the variant choices). This is a semantic gap: the user expects the child
-to see the same constrained value the parent carries in each variant context.
+### P2 — Variant values not visible to external `ref:` targets
 
-P2 is a deeper design question about constraint propagation direction (children are
-generated before parents in the lattice) and is **out of scope for this spec**. It
-is noted here for completeness; VAR-1 addresses P1 only.
+When a dataset B does `ref: A.field_name` where `field_name` is a `type: variant`
+field in A, B sees the stub field — which has the correct Arrow type but `value = None`.
+B generates fresh random values for that field rather than one of the declared variant
+choices.
+
+This affects datasets that **are not lower-cover members of A**. Within a lower-cover
+group, VAR-2's Level 2 factoring applies variant values correctly at generation time,
+so this gap does not affect the within-group case. The remaining gap is cross-group
+refs: a sibling, parent, or unrelated dataset that refs a variant field gets no
+variant-context information.
+
+P2 is a deeper design question — children are generated before parents in the
+lattice, so by the time A's rows are generated with a specific variant context, any
+external datasets that already referenced A have long since executed. VAR-1 does not
+solve P2; it documents it for completeness. The VAR-SPECIALIZE spec is the right
+place to revisit ref semantics as variant constraint propagation evolves.
 
 ## Proposed solution
 

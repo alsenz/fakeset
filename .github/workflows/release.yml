@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  # ── Gate: full CI must pass before anything is published ──────────────────
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # ── Build release binaries for each target platform ───────────────────────
+  build:
+    needs: ci
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: fakeset
+            asset_name: fakeset-linux-x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary: fakeset
+            asset_name: fakeset-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: fakeset
+            asset_name: fakeset-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: fakeset.exe
+            asset_name: fakeset-windows-x86_64.exe
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin fakeset
+      - name: Stage binary
+        shell: bash
+        run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  # ── Publish GitHub release with all binaries ──────────────────────────────
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+
+  # ── Build docs (needs Rust for the prebuild schema generation step) ────────
+  docs-build:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      - uses: withastro/action@v3
+        with:
+          root: docs
+
+  # ── Deploy docs to GitHub Pages ───────────────────────────────────────────
+  docs-deploy:
+    needs: docs-build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
