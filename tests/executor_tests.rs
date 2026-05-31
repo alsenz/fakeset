@@ -9,6 +9,7 @@ use fakeset::{
     validate::validate,
 };
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -17,10 +18,10 @@ use std::path::{Path, PathBuf};
 async fn run(fixture: &str) -> PathBuf {
     let fixture_path = PathBuf::from(fixture);
     let out = std::env::temp_dir().join(format!(
-        "fakeset_test_{}",
-        fixture.replace(['/', '\\', '.'], "_")
+        "fakeset_test_{}_{}",
+        fixture.replace(['/', '\\', '.'], "_"),
+        uuid::Uuid::new_v4()
     ));
-    let _ = std::fs::remove_dir_all(&out);
 
     let datasets = load_all_datasets(&[fixture_path]).expect("load datasets");
     let dag = build_dag(&datasets).expect("build dag");
