@@ -1,6 +1,6 @@
 name: policies
 format: parquet
-rows: 20
+rows: 100
 data:
   - name: policy_id
     type: string

@@ -259,6 +259,7 @@ Full design specs and implementation plans live in `specs/`:
 - **T1** — unit tests for `generate_column` per field type.
 
 ## Future work (needs planning)
+- **SERDE-YAML** — migrate off deprecated `serde_yaml = "0.9.34+deprecated"` to `serde_yaml_neo` (direct API-compatible fork); find-and-replace crate name in `Cargo.toml` and all `use serde_yaml::` imports
 - **REL** — model relationships induced by nested lists
 - **REPO** — allow definitions to be imported and included from remote GitHub repositories
 - **IMPORT** — allow imports from pre-existing files and database connections

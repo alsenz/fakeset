@@ -373,7 +373,7 @@ def test_claim_deductible_distribution(insurance):
 
 
 def test_policy_base_premium_distribution(insurance):
-    """base_premium ~ Uniform[50, 500]. Only 20 rows — low power, but checks basic shape."""
+    """base_premium ~ Uniform[50, 500]."""
     _require_rows(insurance["policies"], 15, "policies")
     sample = insurance["policies"]["base_premium"].to_numpy()
     stat, p = kstest(sample, uniform(loc=50, scale=450).cdf)
