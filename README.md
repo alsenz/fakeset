@@ -1,6 +1,9 @@
 # fakeset
 
 [![CI](https://github.com/alsenz/fakeset/actions/workflows/ci.yml/badge.svg)](https://github.com/alsenz/fakeset/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/alsenz/fakeset)](https://github.com/alsenz/fakeset/releases/latest)
+[![Docs](https://img.shields.io/badge/docs-fakeset-blue)](https://alsenz.github.io/fakeset)
+<!-- TODO: add a license badge once a license has been decided -->
 
 A declarative, DAG-structured synthetic dataset generator written in Rust.
 Loosely inspired by [synth](https://github.com/getsynth/synth).
