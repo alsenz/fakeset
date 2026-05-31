@@ -1,10 +1,12 @@
 import { defineConfig } from 'astro/config';
+import sitemap from '@astrojs/sitemap';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
   site: 'https://alsenz.github.io/fakeset',
   base: '/fakeset',
   integrations: [
+    sitemap(),
     starlight({
       title: 'fakeset',
       description: 'Declarative synthetic dataset generator',

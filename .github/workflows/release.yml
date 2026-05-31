@@ -81,6 +81,7 @@ jobs:
       - uses: withastro/action@v3
         with:
           path: docs
+          node-version: '20'
 
   # ── Deploy docs to GitHub Pages ───────────────────────────────────────────
   docs-deploy:

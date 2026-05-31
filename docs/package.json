@@ -12,11 +12,12 @@
     "prebuild": "node scripts/gen-schema.mjs"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.28.0",
-    "astro": "^4.16.0"
+    "@astrojs/sitemap": "^3.7.3",
+    "@astrojs/starlight": "^0.37.7",
+    "astro": "^5.18.2"
   },
   "packageManager": "pnpm@8.6.12",
   "engines": {
-    "node": ">=18.17.1"
+    "node": ">=20.0.0"
   }
 }
