@@ -271,16 +271,16 @@ fn check_collect_segmentation_restrictions(
             let Some(linked_path) = resolve_include(path, &link.file) else {
                 continue;
             };
-            if let Some(members) = lower_cover_groups.get(&linked_path) {
-                if members.iter().any(|m| !m.is_witness_source) {
-                    anyhow::bail!(
-                        "dataset '{}': list-link collect on field '{}' is not supported \
+            if let Some(members) = lower_cover_groups.get(&linked_path)
+                && members.iter().any(|m| !m.is_witness_source)
+            {
+                anyhow::bail!(
+                    "dataset '{}': list-link collect on field '{}' is not supported \
                          when the linked dataset is jointly segmented with another lower cover member; \
                          use a top-level junction dataset instead",
-                        dataset.name,
-                        field.name
-                    );
-                }
+                    dataset.name,
+                    field.name
+                );
             }
         }
     }
@@ -398,7 +398,7 @@ fn check_cardinality_feasibility(
                             _ => {}
                         }
                     }
-                    if link.reinforcement.map_or(false, |r| r > 1.0) && shard_q < 3 {
+                    if link.reinforcement.is_some_and(|r| r > 1.0) && shard_q < 3 {
                         eprintln!(
                             "warning: dataset '{}' field '{}': `overlap: 0` partition size is \
                              {shard_q} row(s) — Pólya clumping from `reinforcement` may have \
@@ -480,15 +480,15 @@ fn scan_collect_targets(datasets: &HashMap<PathBuf, SyntheticDataset>) -> HashSe
                 }
             }
             // List-link content field collect bindings (Case 2).
-            if let Some(content) = &field.content {
-                if content.from.is_some() {
-                    for cf in &content.item.fields {
-                        for binding in cf.collect_bindings() {
-                            if let Some(linked_path) =
-                                resolve_collect_bind_target(path, dataset, binding)
-                            {
-                                targets.insert(linked_path);
-                            }
+            if let Some(content) = &field.content
+                && content.from.is_some()
+            {
+                for cf in &content.item.fields {
+                    for binding in cf.collect_bindings() {
+                        if let Some(linked_path) =
+                            resolve_collect_bind_target(path, dataset, binding)
+                        {
+                            targets.insert(linked_path);
                         }
                     }
                 }
@@ -819,6 +819,7 @@ fn witness_key_seg(staging_path: &Path, field_name: &str, seg_idx: usize) -> Pat
 /// `segments` is used to emit one `GenerateWitness` per (field, segment) pair. For
 /// standalone datasets (no lower cover group) pass a single synthetic segment covering
 /// all rows.
+#[allow(clippy::too_many_arguments)]
 fn push_with_list_link_steps(
     steps: &mut Vec<ExecutionStep>,
     dataset: &SyntheticDataset,
@@ -934,13 +935,11 @@ fn emit_witness_steps(
             .fields
             .iter()
             .any(|cf| !cf.collect_bindings().is_empty());
-        if has_collect {
-            if let Some(linked_ds) = all_datasets.get(&linked_path) {
-                steps.push(ExecutionStep::EmitDataset {
-                    path: linked_path.clone(),
-                    dataset: Arc::new(linked_ds.clone()),
-                });
-            }
+        if has_collect && let Some(linked_ds) = all_datasets.get(&linked_path) {
+            steps.push(ExecutionStep::EmitDataset {
+                path: linked_path.clone(),
+                dataset: Arc::new(linked_ds.clone()),
+            });
         }
 
         let project_col = content
@@ -1011,10 +1010,10 @@ fn emit_top_level_collect_steps(
                 reducer: binding.reducer.clone().unwrap_or(Reducer::Collect),
                 default_val: def,
             });
-            if seen_linked.insert(linked_path.clone()) {
-                if let Some(linked_ds) = all_datasets.get(&linked_path) {
-                    linked_to_emit.push((linked_path.clone(), Arc::new(linked_ds.clone())));
-                }
+            if seen_linked.insert(linked_path.clone())
+                && let Some(linked_ds) = all_datasets.get(&linked_path)
+            {
+                linked_to_emit.push((linked_path.clone(), Arc::new(linked_ds.clone())));
             }
         }
     }

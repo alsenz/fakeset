@@ -239,8 +239,7 @@ fn stub_variant_fields(schema: &mut Schema, variant_paths: &VariantPaths, prefix
                     .iter()
                     .find(|(p, _, _)| p == &path)
                     .and_then(|(_, choices, _)| {
-                        let types: Vec<_> =
-                            choices.iter().filter_map(|v| infer_field_type(v)).collect();
+                        let types: Vec<_> = choices.iter().filter_map(infer_field_type).collect();
                         if types.is_empty() {
                             None
                         } else if types.windows(2).all(|w| w[0] == w[1]) {

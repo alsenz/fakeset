@@ -165,6 +165,7 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
 ///
 /// Weights are products of marginal probabilities accumulated along the path.
 /// Both `feasible` and `weights` are populated at leaves (when `idx == members.len()`).
+#[allow(clippy::too_many_arguments)]
 fn enumerate_segments_dfs(
     idx: usize,
     mask: usize,
@@ -205,20 +206,20 @@ fn enumerate_segments_dfs(
     )?;
 
     // Branch B: include member idx — prune if any already-included member conflicts
-    if (mask & conflict_masks[idx]) == 0 {
-        if let Some(new_merged) = try_merge_incremental(merged, &member_constraints[idx]) {
-            enumerate_segments_dfs(
-                idx + 1,
-                mask | (1 << idx),
-                new_merged,
-                weight * ratio,
-                members,
-                conflict_masks,
-                member_constraints,
-                feasible,
-                weights,
-            )?;
-        }
+    if (mask & conflict_masks[idx]) == 0
+        && let Some(new_merged) = try_merge_incremental(merged, &member_constraints[idx])
+    {
+        enumerate_segments_dfs(
+            idx + 1,
+            mask | (1 << idx),
+            new_merged,
+            weight * ratio,
+            members,
+            conflict_masks,
+            member_constraints,
+            feasible,
+            weights,
+        )?;
     }
 
     Ok(())
@@ -284,8 +285,8 @@ fn ipf_rescale_sparse(
 
     for _ in 0..200 {
         let mut converged = true;
-        for i in 0..n {
-            let target = members[i].ratio;
+        for (i, member) in members.iter().enumerate().take(n) {
+            let target = member.ratio;
             let mass_in: f64 = feasible
                 .keys()
                 .filter(|&&m| in_subset(m, i))
@@ -333,10 +334,10 @@ pub(crate) fn lower_cover_field_constraints(
     let prefix = format!("{}.", member.reference);
     let mut map = HashMap::new();
     for field in &member.dataset.data {
-        if let Some(ref_str) = field.simple_ref() {
-            if let Some(parent_field_name) = ref_str.strip_prefix(prefix.as_str()) {
-                map.insert(parent_field_name.to_string(), FieldConstraints::from(field));
-            }
+        if let Some(ref_str) = field.simple_ref()
+            && let Some(parent_field_name) = ref_str.strip_prefix(prefix.as_str())
+        {
+            map.insert(parent_field_name.to_string(), FieldConstraints::from(field));
         }
     }
     map
@@ -508,7 +509,7 @@ mod tests {
         // finite rounds, so Bernoulli rounding may produce ±1 on the total.
         let total: usize = segs.iter().map(|s| s.rows).sum();
         assert!(
-            total >= 99 && total <= 101,
+            (99..=101).contains(&total),
             "total should be ~100, got {total}"
         );
     }
@@ -594,7 +595,7 @@ mod tests {
         ];
         let segs = plan_segments(100, &members).unwrap();
         let has = |ms: &[&str]| {
-            let paths: Vec<PathBuf> = ms.iter().map(|s| PathBuf::from(s)).collect();
+            let paths: Vec<PathBuf> = ms.iter().map(|&s| PathBuf::from(s)).collect();
             segs.iter().any(|s| {
                 let mut sp = s.members.clone();
                 sp.sort();

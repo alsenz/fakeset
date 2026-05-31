@@ -296,6 +296,7 @@ fn resolve_inherited_fields(
 /// expression evaluation or emit. When not staging, evaluates expressions, handles
 /// `_linked_idx` injection for junction links, and either emits or defers based on
 /// `defer_emit` (collect-target deferral).
+#[allow(clippy::too_many_arguments)]
 async fn execute_dataset_core(
     is_staging: bool,
     defer_emit: bool,
@@ -333,6 +334,7 @@ async fn execute_dataset_core(
 
 /// Shared core for `GenerateStagingLowerCoverGroup` (`is_staging=true`) and
 /// `GenerateLowerCoverGroup` (`is_staging=false`).
+#[allow(clippy::too_many_arguments)]
 async fn execute_lower_cover_group_core(
     is_staging: bool,
     defer_emit: bool,
@@ -588,13 +590,13 @@ async fn grow_parent_from_children(
                 continue;
             }
             // Rule 1: cross-schema ref — child's ref points back to a parent field by name.
-            if let Some(ref_str) = child_field.simple_ref() {
-                if let Some(parent_col) = ref_str.strip_prefix(prefix.as_str()) {
-                    sources
-                        .entry(parent_col.to_string())
-                        .or_insert_with(|| (alias.clone(), child_field.name.clone()));
-                    continue;
-                }
+            if let Some(ref_str) = child_field.simple_ref()
+                && let Some(parent_col) = ref_str.strip_prefix(prefix.as_str())
+            {
+                sources
+                    .entry(parent_col.to_string())
+                    .or_insert_with(|| (alias.clone(), child_field.name.clone()));
+                continue;
             }
             // Rule 2: same-name field, not a cross-ref pointing elsewhere.
             // Skip when the parent field has a constant `value`: it belongs in Rule 3
@@ -725,9 +727,9 @@ fn filter_batch_by_constraints(
             continue;
         };
         let col = batch.column(col_idx);
-        for row in 0..batch.num_rows() {
-            if mask[row] {
-                mask[row] = row_satisfies_field_constraints(col, row, fc);
+        for (row, m) in mask.iter_mut().enumerate() {
+            if *m {
+                *m = row_satisfies_field_constraints(col, row, fc);
             }
         }
     }
@@ -753,26 +755,28 @@ fn row_satisfies_field_constraints(col: &ArrayRef, row: usize, fc: &FieldConstra
     if let Some(ref val) = fc.value {
         match val {
             YamlValue::String(expected) => {
-                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    if !col.is_null(row) && arr.value(row) != expected.as_str() {
-                        return false;
-                    }
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>()
+                    && !col.is_null(row)
+                    && arr.value(row) != expected.as_str()
+                {
+                    return false;
                 }
             }
             YamlValue::Number(n) => {
-                if let Some(expected) = n.as_f64() {
-                    if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-                        if !col.is_null(row) && (arr.value(row) - expected).abs() > 1e-9 {
-                            return false;
-                        }
-                    }
+                if let Some(expected) = n.as_f64()
+                    && let Some(arr) = col.as_any().downcast_ref::<Float64Array>()
+                    && !col.is_null(row)
+                    && (arr.value(row) - expected).abs() > 1e-9
+                {
+                    return false;
                 }
             }
             YamlValue::Bool(expected) => {
-                if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
-                    if !col.is_null(row) && arr.value(row) != *expected {
-                        return false;
-                    }
+                if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>()
+                    && !col.is_null(row)
+                    && arr.value(row) != *expected
+                {
+                    return false;
                 }
             }
             _ => {}
@@ -781,15 +785,15 @@ fn row_satisfies_field_constraints(col: &ArrayRef, row: usize, fc: &FieldConstra
 
     if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
         let v = arr.value(row);
-        if let Some(min) = fc.min {
-            if v < min {
-                return false;
-            }
+        if let Some(min) = fc.min
+            && v < min
+        {
+            return false;
         }
-        if let Some(max) = fc.max {
-            if v > max {
-                return false;
-            }
+        if let Some(max) = fc.max
+            && v > max
+        {
+            return false;
         }
     }
 
@@ -847,9 +851,10 @@ fn build_witness_dedup(
 ///   - linked-scoped refs: value taken from the linked batch (same for every draw)
 ///   - plain fields: generated once per unique linked row
 ///   - outer-scoped refs: **not stored**; resolved from the staging batch at assembly time
+#[allow(clippy::too_many_arguments)]
 fn execute_witness(
-    witness_key: &PathBuf,
-    staging_path: &PathBuf,
+    witness_key: &Path,
+    staging_path: &Path,
     list_field_name: &str,
     inner_fields: &[Field],
     include: &Include,
@@ -957,7 +962,7 @@ fn execute_witness(
         let s_idxs: Vec<u32> = counts
             .iter()
             .enumerate()
-            .flat_map(|(i, &c)| std::iter::repeat((slot_start + i) as u32).take(c))
+            .flat_map(|(i, &c)| std::iter::repeat_n((slot_start + i) as u32, c))
             .collect();
         // Sampling mode:
         //   reinforcement:0               → Fisher-Yates without-replacement per slot
@@ -1055,7 +1060,7 @@ fn execute_witness(
         "_linked_idx",
         Arc::new(UInt32Array::from(unique_linked_idxs)) as ArrayRef,
     )?;
-    computed.insert(witness_key.clone(), witness_batch);
+    computed.insert(witness_key.to_path_buf(), witness_batch);
     Ok(())
 }
 
@@ -1319,6 +1324,7 @@ fn yaml_value_to_array(val: &YamlValue, dtype: &DataType, n: usize) -> ArrayRef 
 /// - `Max`/`Min` → `max`/`min`: scalar; unmapped rows keep their existing default.
 /// - `TakeFirst` → `first_value`: first value in an arbitrary within-group order; unmapped
 ///   rows keep their existing default.
+#[allow(clippy::too_many_arguments)]
 async fn execute_accumulate_to_linked(
     source_path: &PathBuf,
     source_field: &str,
@@ -1697,7 +1703,7 @@ fn generate_expanded_batch(
         let m_n = sample_count(cardinality).max(1);
         let batch = generate_fresh_batch(fields, m_n, constraints)?;
         let slot = (slot_offset + i) as u32;
-        slot_tags.extend(std::iter::repeat(slot).take(m_n));
+        slot_tags.extend(std::iter::repeat_n(slot, m_n));
         slot_batches.push(batch);
     }
 
@@ -1835,7 +1841,7 @@ fn generate_member_expanded_batch(
         let m_n = sample_count(cardinality).max(1);
         let batch = generate_member_batch(m, m_n, seg_constraints)?;
         let slot = (slot_offset + i) as u32;
-        slot_tags.extend(std::iter::repeat(slot).take(m_n));
+        slot_tags.extend(std::iter::repeat_n(slot, m_n));
         slot_batches.push(batch);
     }
 

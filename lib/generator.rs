@@ -238,7 +238,7 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
         }
         FieldType::List => match field.content.as_deref() {
             None => {
-                let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::repeat(0).take(n));
+                let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::repeat_n(0, n));
                 let child = Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef;
                 let child_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
                 Arc::new(ListArray::new(child_field, offsets, child, None))

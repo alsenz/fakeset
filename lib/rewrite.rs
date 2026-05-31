@@ -28,32 +28,29 @@ pub fn expand_include_fields(
     let mut result = datasets.clone();
     for (path, dataset) in datasets {
         // Driver include expansion.
-        if let Some(inc) = &dataset.include {
-            if !inc.fields.is_empty() {
-                if let Some(target_path) = resolve_include(path, &inc.file) {
-                    if let Some(target) = datasets.get(&target_path) {
-                        let existing: HashSet<&str> =
-                            dataset.data.iter().map(|f| f.name.as_str()).collect();
-                        let exclude: HashSet<&str> = inc
-                            .exclude
-                            .iter()
-                            .flat_map(|v| v.iter())
-                            .map(|s| s.as_str())
-                            .collect();
-                        let injected = expand_field_patterns(
-                            &inc.fields,
-                            &exclude,
-                            &target.data,
-                            &inc.reference,
-                            &existing,
-                        );
-                        let out = result.get_mut(path).unwrap();
-                        let mut new_data = injected;
-                        new_data.extend(std::mem::take(&mut out.data));
-                        out.data = new_data;
-                    }
-                }
-            }
+        if let Some(inc) = &dataset.include
+            && !inc.fields.is_empty()
+            && let Some(target_path) = resolve_include(path, &inc.file)
+            && let Some(target) = datasets.get(&target_path)
+        {
+            let existing: HashSet<&str> = dataset.data.iter().map(|f| f.name.as_str()).collect();
+            let exclude: HashSet<&str> = inc
+                .exclude
+                .iter()
+                .flat_map(|v| v.iter())
+                .map(|s| s.as_str())
+                .collect();
+            let injected = expand_field_patterns(
+                &inc.fields,
+                &exclude,
+                &target.data,
+                &inc.reference,
+                &existing,
+            );
+            let out = result.get_mut(path).unwrap();
+            let mut new_data = injected;
+            new_data.extend(std::mem::take(&mut out.data));
+            out.data = new_data;
         }
         // List link expansion: inject into the matching content.item.fields.
         for link in &dataset.links {
@@ -70,10 +67,10 @@ pub fn expand_include_fields(
                 }
                 // `project` injection: if project is set and no fields yet, inject a single ref.
                 if let Some(ref proj) = content.project.clone() {
-                    if content.item.fields.is_empty() {
-                        if let Some((_, field_part)) = split_ref(proj) {
-                            content.item.fields = vec![make_ref_field(field_part, &link.reference)];
-                        }
+                    if content.item.fields.is_empty()
+                        && let Some((_, field_part)) = split_ref(proj)
+                    {
+                        content.item.fields = vec![make_ref_field(field_part, &link.reference)];
                     }
                     continue; // project and fields are mutually exclusive; skip wildcard expansion
                 }
@@ -183,22 +180,20 @@ pub fn resolve_refs(
                 };
 
                 // Resolve linked-dataset refs inside list-link content.
-                if let Some(content) = &field.content {
-                    if let Some(ref from_ref) = content.from {
-                        let from_ref = from_ref.clone();
-                        if let Some(link) = dataset.links.iter().find(|l| l.reference == from_ref) {
-                            let link = link.clone();
-                            let new_content_fields: Vec<Field> = content
-                                .item
-                                .fields
-                                .iter()
-                                .map(|cf| {
-                                    resolve_list_link_content_field(path, datasets, cf, &link)
-                                })
-                                .collect::<Result<_>>()?;
-                            if let Some(ref mut c) = out.content {
-                                c.item.fields = new_content_fields;
-                            }
+                if let Some(content) = &field.content
+                    && let Some(ref from_ref) = content.from
+                {
+                    let from_ref = from_ref.clone();
+                    if let Some(link) = dataset.links.iter().find(|l| l.reference == from_ref) {
+                        let link = link.clone();
+                        let new_content_fields: Vec<Field> = content
+                            .item
+                            .fields
+                            .iter()
+                            .map(|cf| resolve_list_link_content_field(path, datasets, cf, &link))
+                            .collect::<Result<_>>()?;
+                        if let Some(ref mut c) = out.content {
+                            c.item.fields = new_content_fields;
                         }
                     }
                 }
@@ -465,12 +460,11 @@ pub fn apply_locale_to_schema(fields: &mut [Field], locale: &Locale) {
 }
 
 pub(crate) fn stamp_locale(field: &mut Field, global: &Locale) {
-    if field.locale.is_none() {
-        if let Some(ref g) = field.generator {
-            if g.supports_locale() {
-                field.locale = Some(global.clone());
-            }
-        }
+    if field.locale.is_none()
+        && let Some(ref g) = field.generator
+        && g.supports_locale()
+    {
+        field.locale = Some(global.clone());
     }
     for sub in &mut field.fields {
         stamp_locale(sub, global);

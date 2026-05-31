@@ -287,7 +287,7 @@ fn non_ref_dataset_has_no_inherited_fields() {
         _ => None,
     });
     assert!(
-        inherited.map_or(false, |p| p.is_empty()),
+        inherited.is_some_and(|p| p.is_empty()),
         "person has no ref relationships and should have no inherited fields"
     );
 }

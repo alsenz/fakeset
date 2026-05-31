@@ -44,12 +44,12 @@ pub fn validate_field_constraints(path: &str, field: &Field) -> Result<()> {
             );
         }
     }
-    if let (Some(lo), Some(hi)) = (fc.min, fc.max) {
-        if lo > hi {
-            bail!(
-                "field '{path}': `range.min` ({lo}) must be less than or equal to `range.max` ({hi})"
-            );
-        }
+    if let (Some(lo), Some(hi)) = (fc.min, fc.max)
+        && lo > hi
+    {
+        bail!(
+            "field '{path}': `range.min` ({lo}) must be less than or equal to `range.max` ({hi})"
+        );
     }
     Ok(())
 }

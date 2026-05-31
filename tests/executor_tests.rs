@@ -1200,15 +1200,15 @@ async fn test_junction_link_with_no_collect_produces_correct_rows() {
 
         // Ref fields exist and are non-empty strings (type resolved from linked dataset).
         assert!(
-            row["emp_id"].as_str().map_or(false, |s| !s.is_empty()),
+            row["emp_id"].as_str().is_some_and(|s| !s.is_empty()),
             "emp_id should be a non-empty string"
         );
         assert!(
-            row["dept_id"].as_str().map_or(false, |s| !s.is_empty()),
+            row["dept_id"].as_str().is_some_and(|s| !s.is_empty()),
             "dept_id should be a non-empty string"
         );
         assert!(
-            row["dept_name"].as_str().map_or(false, |s| !s.is_empty()),
+            row["dept_name"].as_str().is_some_and(|s| !s.is_empty()),
             "dept_name should be a non-empty string"
         );
     }

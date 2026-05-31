@@ -297,10 +297,10 @@ fn replace_with_defaults(
                 .iter()
                 .enumerate()
                 .map(|(i, orig)| {
-                    if let Some(idx) = replacements[i] {
-                        if let DefaultValue::Str(s) = &defaults[idx] {
-                            return Some(s.as_str());
-                        }
+                    if let Some(idx) = replacements[i]
+                        && let DefaultValue::Str(s) = &defaults[idx]
+                    {
+                        return Some(s.as_str());
                     }
                     *orig
                 })
@@ -311,10 +311,10 @@ fn replace_with_defaults(
             let floats = col.as_any().downcast_ref::<Float64Array>();
             let result: Float64Array = (0..col.len())
                 .map(|i| {
-                    if let Some(idx) = replacements[i] {
-                        if let DefaultValue::F64(v) = defaults[idx] {
-                            return Some(v);
-                        }
+                    if let Some(idx) = replacements[i]
+                        && let DefaultValue::F64(v) = defaults[idx]
+                    {
+                        return Some(v);
                     }
                     floats.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
                 })
@@ -339,10 +339,10 @@ fn replace_with_defaults(
             let bools = col.as_any().downcast_ref::<BooleanArray>();
             let result: BooleanArray = (0..col.len())
                 .map(|i| {
-                    if let Some(idx) = replacements[i] {
-                        if let DefaultValue::Bool(b) = defaults[idx] {
-                            return Some(b);
-                        }
+                    if let Some(idx) = replacements[i]
+                        && let DefaultValue::Bool(b) = defaults[idx]
+                    {
+                        return Some(b);
                     }
                     bools.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
                 })
@@ -353,10 +353,10 @@ fn replace_with_defaults(
             let dates = col.as_any().downcast_ref::<Date32Array>();
             let result: Date32Array = (0..col.len())
                 .map(|i| {
-                    if let Some(idx) = replacements[i] {
-                        if let DefaultValue::Date32(d) = defaults[idx] {
-                            return Some(d);
-                        }
+                    if let Some(idx) = replacements[i]
+                        && let DefaultValue::Date32(d) = defaults[idx]
+                    {
+                        return Some(d);
                     }
                     dates.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
                 })
@@ -366,10 +366,10 @@ fn replace_with_defaults(
         DataType::Timestamp(_, _) => {
             let result: TimestampMicrosecondArray = (0..col.len())
                 .map(|i| {
-                    if let Some(idx) = replacements[i] {
-                        if let DefaultValue::TsUs(t) = defaults[idx] {
-                            return Some(t);
-                        }
+                    if let Some(idx) = replacements[i]
+                        && let DefaultValue::TsUs(t) = defaults[idx]
+                    {
+                        return Some(t);
                     }
                     // Leave original value unchanged; downcast attempt below
                     None::<i64>
@@ -379,7 +379,7 @@ fn replace_with_defaults(
             let orig = col
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .or_else(|| None); // Handle millis case below
+                .or(None); // Handle millis case below
             let merged: TimestampMicrosecondArray = (0..col.len())
                 .map(|i| {
                     if result.is_valid(i) {

@@ -58,12 +58,7 @@ fn validate_dataset(
     }
 
     // Rule 1: explicit rows is incompatible with ratio includes.
-    if dataset.rows.is_some()
-        && dataset
-            .include
-            .as_ref()
-            .map_or(false, |i| i.ratio.is_some())
-    {
+    if dataset.rows.is_some() && dataset.include.as_ref().is_some_and(|i| i.ratio.is_some()) {
         bail!(
             "dataset '{}': `rows` cannot be set when `include` specifies a `ratio` \
              — the row count is derived from the ratio and the included \
@@ -102,15 +97,15 @@ fn validate_dataset(
                 );
             }
         }
-        if let Some(r) = link.reinforcement {
-            if r < 0.0 || (r > 0.0 && r < 1.0) {
-                bail!(
-                    "dataset '{}': link '{}': `reinforcement` must be 0 (without-replacement), \
+        if let Some(r) = link.reinforcement
+            && (r < 0.0 || (r > 0.0 && r < 1.0))
+        {
+            bail!(
+                "dataset '{}': link '{}': `reinforcement` must be 0 (without-replacement), \
                      1 (uniform), or > 1 (clumping); got {r}",
-                    dataset.name,
-                    link.reference
-                );
-            }
+                dataset.name,
+                link.reference
+            );
         }
         if let Some(ov) = link.overlap {
             if ov < 0.0 || (ov > 0.0 && ov < 1.0) {
@@ -197,16 +192,16 @@ fn validate_dataset(
     }
 
     // Rule: top-level include cardinality constraints.
-    if let Some(inc) = &dataset.include {
-        if let Some(card) = &inc.cardinality {
-            if dataset.rows.is_some() {
-                bail!(
-                    "dataset '{}': `rows` cannot be set when `include.cardinality` is present",
-                    dataset.name
-                );
-            }
-            validate_cardinality(card, &format!("dataset '{}'", dataset.name))?;
+    if let Some(inc) = &dataset.include
+        && let Some(card) = &inc.cardinality
+    {
+        if dataset.rows.is_some() {
+            bail!(
+                "dataset '{}': `rows` cannot be set when `include.cardinality` is present",
+                dataset.name
+            );
         }
+        validate_cardinality(card, &format!("dataset '{}'", dataset.name))?;
     }
 
     // Rule 3: field-level structural constraints (type/ref/schema/content consistency).
@@ -218,22 +213,21 @@ fn validate_dataset(
         validate_field(&field_path, field, warnings)?;
 
         // Link-content fields need full dataset context — handle separately.
-        if let Some(content) = &field.content {
-            if let Some(ref from_ref) = content.from {
-                if let Some(link) = dataset.links.iter().find(|l| &l.reference == from_ref) {
-                    let content_path = format!("{field_path}[]");
-                    validate_project(content, link, &content_path, path, all)?;
-                    validate_list_link_content(
-                        &content_path,
-                        link,
-                        &content.item.fields,
-                        path,
-                        dataset,
-                        all,
-                        warnings,
-                    )?;
-                }
-            }
+        if let Some(content) = &field.content
+            && let Some(ref from_ref) = content.from
+            && let Some(link) = dataset.links.iter().find(|l| &l.reference == from_ref)
+        {
+            let content_path = format!("{field_path}[]");
+            validate_project(content, link, &content_path, path, all)?;
+            validate_list_link_content(
+                &content_path,
+                link,
+                &content.item.fields,
+                path,
+                dataset,
+                all,
+                warnings,
+            )?;
         }
     }
 
@@ -386,15 +380,11 @@ fn validate_corruption_modes(field_path: &str, c: &Corruptions, ft: &FieldType) 
             bail!("field '{field_path}': `corruptions.encoding` is not applicable to {ft} fields");
         }
     }
-    if !is_number {
-        if c.noise.is_some() {
-            bail!("field '{field_path}': `corruptions.noise` is not applicable to {ft} fields");
-        }
+    if !is_number && c.noise.is_some() {
+        bail!("field '{field_path}': `corruptions.noise` is not applicable to {ft} fields");
     }
-    if !is_temporal {
-        if c.day_shift.is_some() {
-            bail!("field '{field_path}': `corruptions.day_shift` is not applicable to {ft} fields");
-        }
+    if !is_temporal && c.day_shift.is_some() {
+        bail!("field '{field_path}': `corruptions.day_shift` is not applicable to {ft} fields");
     }
     Ok(())
 }
@@ -417,10 +407,10 @@ fn validate_date_bounds(path: &str, field: &Field) -> Result<()> {
             };
             let after = field.after.as_deref().map(parse).transpose()?;
             let before = field.before.as_deref().map(parse).transpose()?;
-            if let (Some(a), Some(b)) = (after, before) {
-                if a >= b {
-                    bail!("field '{path}': `after` ({a}) must be before `before` ({b})");
-                }
+            if let (Some(a), Some(b)) = (after, before)
+                && a >= b
+            {
+                bail!("field '{path}': `after` ({a}) must be before `before` ({b})");
             }
         }
         FieldType::DateTime => {
@@ -430,10 +420,10 @@ fn validate_date_bounds(path: &str, field: &Field) -> Result<()> {
             };
             let after = field.after.as_deref().map(parse).transpose()?;
             let before = field.before.as_deref().map(parse).transpose()?;
-            if let (Some(a), Some(b)) = (after, before) {
-                if a >= b {
-                    bail!("field '{path}': `after` must be before `before`");
-                }
+            if let (Some(a), Some(b)) = (after, before)
+                && a >= b
+            {
+                bail!("field '{path}': `after` must be before `before`");
             }
         }
         _ => {
@@ -451,26 +441,24 @@ fn validate_args(path: &str, field: &Field) -> Result<()> {
         return Ok(());
     };
 
-    if let Some(ft) = &field.field_type {
-        if *ft == FieldType::Boolean {
-            // boolean ratio — no generator required
-            for key in args.keys() {
-                if key != "ratio" {
-                    bail!(
-                        "field '{path}': unknown arg '{key}' for boolean field — valid key: `ratio`"
-                    );
-                }
+    if let Some(ft) = &field.field_type
+        && *ft == FieldType::Boolean
+    {
+        // boolean ratio — no generator required
+        for key in args.keys() {
+            if key != "ratio" {
+                bail!("field '{path}': unknown arg '{key}' for boolean field — valid key: `ratio`");
             }
-            if let Some(v) = args.get("ratio") {
-                let ratio = v.as_u64().ok_or_else(|| {
-                    anyhow!("field '{path}': `args.ratio` must be an integer 0–100")
-                })?;
-                if ratio > 100 {
-                    bail!("field '{path}': `args.ratio` must be between 0 and 100, got {ratio}");
-                }
-            }
-            return Ok(());
         }
+        if let Some(v) = args.get("ratio") {
+            let ratio = v
+                .as_u64()
+                .ok_or_else(|| anyhow!("field '{path}': `args.ratio` must be an integer 0–100"))?;
+            if ratio > 100 {
+                bail!("field '{path}': `args.ratio` must be between 0 and 100, got {ratio}");
+            }
+        }
+        return Ok(());
     }
 
     // For all other types, args require a generator.
@@ -672,19 +660,17 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         );
     }
 
-    if range_min.is_some() || range_max.is_some() {
-        if *field_type != FieldType::Number {
-            bail!(
-                "field '{path}': `range` is only valid on `number` type fields, \
+    if (range_min.is_some() || range_max.is_some()) && *field_type != FieldType::Number {
+        bail!(
+            "field '{path}': `range` is only valid on `number` type fields, \
                  but this field has type `{field_type}`"
-            );
-        }
+        );
     }
 
-    if let Some(g) = &field.generator {
-        if !g.valid_for(field_type) {
-            bail!("field '{path}': generator `{g}` is not valid for type `{field_type}`");
-        }
+    if let Some(g) = &field.generator
+        && !g.valid_for(field_type)
+    {
+        bail!("field '{path}': generator `{g}` is not valid for type `{field_type}`");
     }
 
     if *field_type == FieldType::Object {
@@ -835,10 +821,10 @@ fn validate_list_link_content(
         // Basic constraint checks.
         validate_field_constraints(&fpath, field)?;
         validate_locale_generator(&fpath, field.locale.as_ref(), field.generator.as_ref())?;
-        if let (Some(g), Some(ft)) = (&field.generator, &field.field_type) {
-            if !g.valid_for(ft) {
-                bail!("field '{fpath}': generator `{g}` is not valid for type `{ft}`");
-            }
+        if let (Some(g), Some(ft)) = (&field.generator, &field.field_type)
+            && !g.valid_for(ft)
+        {
+            bail!("field '{fpath}': generator `{g}` is not valid for type `{ft}`");
         }
     }
     Ok(())
@@ -849,10 +835,10 @@ fn validate_field_variant(
     choice: &FieldVariant,
     _warnings: &mut Vec<String>,
 ) -> Result<()> {
-    if let Some(ft) = &choice.field_type {
-        if *ft == FieldType::Variant {
-            bail!("field variant '{path}': nested `type: variant` is not supported");
-        }
+    if let Some(ft) = &choice.field_type
+        && *ft == FieldType::Variant
+    {
+        bail!("field variant '{path}': nested `type: variant` is not supported");
     }
 
     if choice.value.is_some() {
@@ -868,20 +854,19 @@ fn validate_field_variant(
         }
     }
 
-    if let Some(r) = &choice.range {
-        if let (Some(lo), Some(hi)) = (r.min, r.max) {
-            if lo > hi {
-                bail!("field variant '{path}': range.min ({lo}) must be ≤ range.max ({hi})");
-            }
-        }
+    if let Some(r) = &choice.range
+        && let (Some(lo), Some(hi)) = (r.min, r.max)
+        && lo > hi
+    {
+        bail!("field variant '{path}': range.min ({lo}) must be ≤ range.max ({hi})");
     }
 
     validate_locale_generator(path, choice.locale.as_ref(), choice.generator.as_ref())?;
 
-    if let (Some(g), Some(ft)) = (&choice.generator, &choice.field_type) {
-        if !g.valid_for(ft) {
-            bail!("field variant '{path}': generator `{g}` is not valid for type `{ft}`");
-        }
+    if let (Some(g), Some(ft)) = (&choice.generator, &choice.field_type)
+        && !g.valid_for(ft)
+    {
+        bail!("field variant '{path}': generator `{g}` is not valid for type `{ft}`");
     }
 
     // Must be able to determine the concrete type at expansion time.
@@ -930,19 +915,13 @@ fn validate_collect_bindings(
         }
 
         // Case 2 — fields inside list-link content blocks.
-        if let Some(content) = &field.content {
-            if content.from.is_some() {
-                for cf in &content.item.fields {
-                    let cf_path = format!("{field_path}[].{}", cf.name);
-                    for binding in cf.collect_bindings() {
-                        validate_single_collect_bind(
-                            dataset_path,
-                            dataset,
-                            all,
-                            &cf_path,
-                            binding,
-                        )?;
-                    }
+        if let Some(content) = &field.content
+            && content.from.is_some()
+        {
+            for cf in &content.item.fields {
+                let cf_path = format!("{field_path}[].{}", cf.name);
+                for binding in cf.collect_bindings() {
+                    validate_single_collect_bind(dataset_path, dataset, all, &cf_path, binding)?;
                 }
             }
         }

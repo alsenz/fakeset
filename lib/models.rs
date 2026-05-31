@@ -191,6 +191,7 @@ pub struct Output {
 /// YAML-level `output:` field — accepts either a plain path string or a full `Output` block.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum OutputSpec {
     Shorthand(String),
     Block(Output),
@@ -712,10 +713,10 @@ pub fn for_each_list_link<'a>(
 ) {
     for field in fields {
         if let Some(content) = &field.content {
-            if let Some(from_ref) = &content.from {
-                if let Some(link) = links.iter().find(|l| &l.reference == from_ref) {
-                    visitor(field, link, &content.item.fields);
-                }
+            if let Some(from_ref) = &content.from
+                && let Some(link) = links.iter().find(|l| &l.reference == from_ref)
+            {
+                visitor(field, link, &content.item.fields);
             }
             for_each_list_link(links, &content.item.fields, visitor);
         }
