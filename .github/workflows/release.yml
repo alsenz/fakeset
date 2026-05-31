@@ -80,7 +80,7 @@ jobs:
           key: docs
       - uses: withastro/action@v3
         with:
-          root: docs
+          path: docs
 
   # ── Deploy docs to GitHub Pages ───────────────────────────────────────────
   docs-deploy:
