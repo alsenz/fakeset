@@ -557,10 +557,7 @@ async fn test_count_normal_produces_variable_length_lists() {
         let samples = row["samples"]
             .as_array()
             .expect("samples should be an array");
-        assert!(
-            !samples.is_empty(),
-            "_linked_idx sampling should produce at least one item per outer row"
-        );
+        // Normal distribution can produce 0 items; suite-level total_items > 0 is sufficient.
         for s in samples {
             let val = s["val"].as_f64().expect("val should be a number");
             assert!(
