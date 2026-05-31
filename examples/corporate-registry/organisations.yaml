@@ -1,7 +1,7 @@
 name: organisations
 format: parquet
 output_file: organisations
-rows: 100
+rows: 500
 links:
   - file: individuals.yaml
     ref: individual

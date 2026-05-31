@@ -12,9 +12,9 @@ export default defineConfig({
       description: 'Declarative synthetic dataset generator',
       logo: { src: './src/assets/logo.svg', alt: 'fakeset' },
       customCss: ['./src/styles/custom.css'],
-      social: {
-        github: 'https://github.com/alsenz/fakeset',
-      },
+      social: [
+        { icon: 'github', label: 'GitHub', href: 'https://github.com/alsenz/fakeset' },
+      ],
       sidebar: [
         {
           label: 'Getting Started',

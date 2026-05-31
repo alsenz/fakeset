@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+echo "==> cargo fmt --check"
+cargo fmt --all --check
+
+echo "==> cargo clippy"
+cargo clippy -- -D warnings
+
+echo "==> cargo test"
+cargo test
+
+echo "==> pytest (statistical regression tests)"
+pytest
+
+# Prefer /snap/bin node over older system-wide installs if it exists.
+export PATH="/snap/bin:$PATH"
+
+# Docs build requires Node >=18.20.8.
+node_ver=$(node --version 2>/dev/null | sed 's/^v//')
+node_major=$(echo "$node_ver" | cut -d. -f1)
+node_minor=$(echo "$node_ver" | cut -d. -f2)
+node_patch=$(echo "$node_ver" | cut -d. -f3)
+
+need_upgrade=false
+if   [ "$node_major" -lt 18 ]; then need_upgrade=true
+elif [ "$node_major" -eq 18 ] && [ "$node_minor" -lt 20 ]; then need_upgrade=true
+elif [ "$node_major" -eq 18 ] && [ "$node_minor" -eq 20 ] && [ "$node_patch" -lt 8 ]; then need_upgrade=true
+fi
+
+if $need_upgrade; then
+    echo ""
+    echo "WARNING: Node v$node_ver is too old for the docs build (need >=18.20.8)."
+    echo "         Skipping docs check — upgrade Node to run it locally."
+    echo "         See: https://nodejs.org/en/download"
+    echo ""
+else
+    echo "==> docs build (astro build) [Node v$node_ver]"
+    cd "$ROOT/docs"
+    pnpm run build
+    cd "$ROOT"
+fi
+
+echo ""
+echo "All pre-push checks passed."

@@ -1,7 +1,7 @@
 name: individuals
 format: parquet
 output_file: individuals
-rows: 1000
+rows: 5000
 data:
   - name: full_name
     type: string
