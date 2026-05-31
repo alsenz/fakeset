@@ -1,7 +1,7 @@
 //! Lower cover segmentation via Bernoulli factoring. `plan_segments` enumerates all
 //! feasible membership subsets for a lower cover group via branch-and-bound DFS,
 //! then applies Iterative Proportional Fitting to restore declared marginal ratios.
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use fake::Fake;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -85,8 +85,10 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
     let mut feasible: HashMap<usize, HashMap<String, FieldConstraints>> = HashMap::new();
     let mut weights: HashMap<usize, f64> = HashMap::new();
     enumerate_segments_dfs(
-        0, 0,
-        HashMap::new(), 1.0,
+        0,
+        0,
+        HashMap::new(),
+        1.0,
         members,
         &conflict_masks,
         &member_constraints,
@@ -96,7 +98,11 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
 
     let surviving_total: f64 = weights.values().copied().sum();
     if surviving_total <= 0.0 {
-        return Ok(vec![Segment { members: vec![], rows: parent_rows, field_constraints: HashMap::new() }]);
+        return Ok(vec![Segment {
+            members: vec![],
+            rows: parent_rows,
+            field_constraints: HashMap::new(),
+        }]);
     }
 
     // IPF over the sparse feasible set to restore declared marginal distributions.
@@ -111,13 +117,18 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
 
     // --- Bernoulli rounding ---
     let total_weight: f64 = weights.values().copied().sum();
-    let segments: Vec<Segment> = feasible.keys()
+    let segments: Vec<Segment> = feasible
+        .keys()
         .filter_map(|&mask| {
             let raw = (weights[&mask] / total_weight) * parent_rows as f64;
             let rows = if raw >= 1.0 {
                 raw.round() as usize
             } else {
-                if (0.0f64..1.0f64).fake::<f64>() < raw { 1 } else { 0 }
+                if (0.0f64..1.0f64).fake::<f64>() < raw {
+                    1
+                } else {
+                    0
+                }
             };
             if rows == 0 {
                 return None;
@@ -135,7 +146,11 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
         .collect();
 
     if segments.is_empty() {
-        return Ok(vec![Segment { members: vec![], rows: parent_rows, field_constraints: HashMap::new() }]);
+        return Ok(vec![Segment {
+            members: vec![],
+            rows: parent_rows,
+            field_constraints: HashMap::new(),
+        }]);
     }
 
     Ok(segments)
@@ -178,18 +193,30 @@ fn enumerate_segments_dfs(
 
     // Branch A: exclude member idx (clone merged — still needed for Branch B)
     enumerate_segments_dfs(
-        idx + 1, mask, merged.clone(),
+        idx + 1,
+        mask,
+        merged.clone(),
         weight * (1.0 - ratio),
-        members, conflict_masks, member_constraints, feasible, weights,
+        members,
+        conflict_masks,
+        member_constraints,
+        feasible,
+        weights,
     )?;
 
     // Branch B: include member idx — prune if any already-included member conflicts
     if (mask & conflict_masks[idx]) == 0 {
         if let Some(new_merged) = try_merge_incremental(merged, &member_constraints[idx]) {
             enumerate_segments_dfs(
-                idx + 1, mask | (1 << idx), new_merged,
+                idx + 1,
+                mask | (1 << idx),
+                new_merged,
                 weight * ratio,
-                members, conflict_masks, member_constraints, feasible, weights,
+                members,
+                conflict_masks,
+                member_constraints,
+                feasible,
+                weights,
             )?;
         }
     }
@@ -240,9 +267,8 @@ pub(crate) fn constraints_conflict(
     a: &HashMap<String, FieldConstraints>,
     b: &HashMap<String, FieldConstraints>,
 ) -> bool {
-    a.iter().any(|(field, fc_a)| {
-        b.get(field).is_some_and(|fc_b| fc_a.merge(fc_b).is_none())
-    })
+    a.iter()
+        .any(|(field, fc_a)| b.get(field).is_some_and(|fc_b| fc_a.merge(fc_b).is_none()))
 }
 
 /// IPF over the sparse feasible set. Iterates only feasible mask keys rather than
@@ -260,11 +286,13 @@ fn ipf_rescale_sparse(
         let mut converged = true;
         for i in 0..n {
             let target = members[i].ratio;
-            let mass_in: f64 = feasible.keys()
+            let mass_in: f64 = feasible
+                .keys()
                 .filter(|&&m| in_subset(m, i))
                 .map(|&m| weights[&m])
                 .sum();
-            let mass_out: f64 = feasible.keys()
+            let mass_out: f64 = feasible
+                .keys()
                 .filter(|&&m| !in_subset(m, i))
                 .map(|&m| weights[&m])
                 .sum();
@@ -278,9 +306,13 @@ fn ipf_rescale_sparse(
                 let scale_out = (1.0 - target) / mass_out;
                 for &m in feasible.keys() {
                     if in_subset(m, i) {
-                        if let Some(w) = weights.get_mut(&m) { *w *= scale_in; }
+                        if let Some(w) = weights.get_mut(&m) {
+                            *w *= scale_in;
+                        }
                     } else {
-                        if let Some(w) = weights.get_mut(&m) { *w *= scale_out; }
+                        if let Some(w) = weights.get_mut(&m) {
+                            *w *= scale_out;
+                        }
                     }
                 }
             }
@@ -295,7 +327,9 @@ fn ipf_rescale_sparse(
 /// via its ref fields. The ref field string has the form `include_ref.field_name`;
 /// we filter by the member's known `include_ref` and return constraints keyed
 /// by the parent field name.
-pub(crate) fn lower_cover_field_constraints(member: &LowerCoverMember) -> HashMap<String, FieldConstraints> {
+pub(crate) fn lower_cover_field_constraints(
+    member: &LowerCoverMember,
+) -> HashMap<String, FieldConstraints> {
     let prefix = format!("{}.", member.reference);
     let mut map = HashMap::new();
     for field in &member.dataset.data {
@@ -314,7 +348,11 @@ mod tests {
     use crate::models::{Field, FieldType, Format, RefsSpec};
     use serde_yaml::Value as YamlValue;
 
-    fn make_member(path: &str, ratio: f64, ref_constraints: Vec<(&str, FieldConstraints)>) -> LowerCoverMember {
+    fn make_member(
+        path: &str,
+        ratio: f64,
+        ref_constraints: Vec<(&str, FieldConstraints)>,
+    ) -> LowerCoverMember {
         let fields = ref_constraints
             .into_iter()
             .map(|(fname, fc)| {
@@ -353,11 +391,18 @@ mod tests {
     }
 
     fn value_str(s: &str) -> FieldConstraints {
-        FieldConstraints { value: Some(YamlValue::String(s.into())), ..Default::default() }
+        FieldConstraints {
+            value: Some(YamlValue::String(s.into())),
+            ..Default::default()
+        }
     }
 
     fn bounds(min: f64, max: f64) -> FieldConstraints {
-        FieldConstraints { min: Some(min), max: Some(max), ..Default::default() }
+        FieldConstraints {
+            min: Some(min),
+            max: Some(max),
+            ..Default::default()
+        }
     }
 
     // --- single lower cover member ---
@@ -378,10 +423,7 @@ mod tests {
 
     #[test]
     fn two_lower_cover_members_four_segments() {
-        let members = vec![
-            make_member("a", 0.5, vec![]),
-            make_member("b", 0.4, vec![]),
-        ];
+        let members = vec![make_member("a", 0.5, vec![]), make_member("b", 0.4, vec![])];
         let segs = plan_segments(100, &members).unwrap();
         // All four subsets survive (no conflicts).
         assert_eq!(segs.len(), 4);
@@ -413,12 +455,21 @@ mod tests {
         ];
         let segs = plan_segments(100, &members).unwrap();
         let joint = segs.iter().find(|s| s.members.len() == 2);
-        assert!(joint.is_none(), "conflicting joint segment should be absent");
+        assert!(
+            joint.is_none(),
+            "conflicting joint segment should be absent"
+        );
         let total: usize = segs.iter().map(|s| s.rows).sum();
         assert_eq!(total, 100);
         // Marginals should match the declared distributions.
-        let a_rows = segs.iter().find(|s| s.members == vec![PathBuf::from("a")]).map_or(0, |s| s.rows);
-        let b_rows = segs.iter().find(|s| s.members == vec![PathBuf::from("b")]).map_or(0, |s| s.rows);
+        let a_rows = segs
+            .iter()
+            .find(|s| s.members == vec![PathBuf::from("a")])
+            .map_or(0, |s| s.rows);
+        let b_rows = segs
+            .iter()
+            .find(|s| s.members == vec![PathBuf::from("b")])
+            .map_or(0, |s| s.rows);
         assert_eq!(a_rows, 50);
         assert_eq!(b_rows, 50);
     }
@@ -456,7 +507,10 @@ mod tests {
         // IPF drives the parent-only {} segment toward 0 but never reaches it in
         // finite rounds, so Bernoulli rounding may produce ±1 on the total.
         let total: usize = segs.iter().map(|s| s.rows).sum();
-        assert!(total >= 99 && total <= 101, "total should be ~100, got {total}");
+        assert!(
+            total >= 99 && total <= 101,
+            "total should be ~100, got {total}"
+        );
     }
 
     // --- no lower cover members ---
@@ -476,19 +530,31 @@ mod tests {
         // 20 members each with a distinct status constant — all pairs conflict.
         // DFS should produce exactly 21 feasible segments: 20 singletons + empty remainder.
         let members: Vec<LowerCoverMember> = (0..20)
-            .map(|i| make_member(&format!("m{i}"), 0.04, vec![("status", value_str(&format!("tier{i}")))]))
+            .map(|i| {
+                make_member(
+                    &format!("m{i}"),
+                    0.04,
+                    vec![("status", value_str(&format!("tier{i}")))],
+                )
+            })
             .collect();
         let segs = plan_segments(1000, &members).unwrap();
         // 21 segments: 20 singletons + empty (which may round to 0 and be dropped when Σd=0.8)
         // At least the 20 singletons must be present.
         let singleton_count = segs.iter().filter(|s| s.members.len() == 1).count();
-        assert_eq!(singleton_count, 20, "expected 20 singleton segments, got {singleton_count}");
+        assert_eq!(
+            singleton_count, 20,
+            "expected 20 singleton segments, got {singleton_count}"
+        );
         let total: usize = segs.iter().map(|s| s.rows).sum();
         assert_eq!(total, 1000);
         // Each singleton should have approximately 40 rows (4% of 1000).
         for seg in segs.iter().filter(|s| s.members.len() == 1) {
-            assert!(seg.rows >= 30 && seg.rows <= 50,
-                "singleton segment has {} rows, expected ~40", seg.rows);
+            assert!(
+                seg.rows >= 30 && seg.rows <= 50,
+                "singleton segment has {} rows, expected ~40",
+                seg.rows
+            );
         }
     }
 
@@ -501,9 +567,15 @@ mod tests {
             .map(|i| make_member(&format!("m{i}"), 0.5, vec![]))
             .collect();
         let result = plan_segments(1000, &members);
-        assert!(result.is_err(), "expected cap error for fully-compatible N=20 group");
+        assert!(
+            result.is_err(),
+            "expected cap error for fully-compatible N=20 group"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("feasible segments"), "error should mention 'feasible segments', got: {msg}");
+        assert!(
+            msg.contains("feasible segments"),
+            "error should mention 'feasible segments', got: {msg}"
+        );
     }
 
     // --- incremental constraint merge: partial compatibility ---
@@ -516,7 +588,7 @@ mod tests {
         // {A,B,C}: infeasible (A and C conflict)
         // {B,C}: n in [60,100] — compatible
         let members = vec![
-            make_member("a", 0.5, vec![("n", bounds(0.0,  50.0))]),
+            make_member("a", 0.5, vec![("n", bounds(0.0, 50.0))]),
             make_member("b", 0.5, vec![("n", bounds(30.0, 100.0))]),
             make_member("c", 0.5, vec![("n", bounds(60.0, 100.0))]),
         ];
@@ -524,14 +596,19 @@ mod tests {
         let has = |ms: &[&str]| {
             let paths: Vec<PathBuf> = ms.iter().map(|s| PathBuf::from(s)).collect();
             segs.iter().any(|s| {
-                let mut sp = s.members.clone(); sp.sort();
-                let mut pp = paths.clone(); pp.sort();
+                let mut sp = s.members.clone();
+                sp.sort();
+                let mut pp = paths.clone();
+                pp.sort();
                 sp == pp
             })
         };
-        assert!(has(&["a", "b"]),  "{{a,b}} should be present");
-        assert!(has(&["b", "c"]),  "{{b,c}} should be present");
-        assert!(!has(&["a", "c"]), "{{a,c}} should be absent (infeasible bounds)");
+        assert!(has(&["a", "b"]), "{{a,b}} should be present");
+        assert!(has(&["b", "c"]), "{{b,c}} should be present");
+        assert!(
+            !has(&["a", "c"]),
+            "{{a,c}} should be absent (infeasible bounds)"
+        );
         assert!(!has(&["a", "b", "c"]), "{{a,b,c}} should be absent");
     }
 }

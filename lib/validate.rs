@@ -1,12 +1,15 @@
 //! Schema validation: structural rules, ref validity, constraint consistency, and
 //! cardinality feasibility checks. Called after loading YAML and before plan building.
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::constraints::validate_field_constraints;
 use crate::expressions::extract_identifiers;
-use crate::models::{resolve_include, split_ref, Corruptions, CountSpec, DataQuality, Field, FieldType, FieldVariant, Generator, Include, Locale, RefBinding, Reducer, Schema, SyntheticDataset};
+use crate::models::{
+    Corruptions, CountSpec, DataQuality, Field, FieldType, FieldVariant, Generator, Include,
+    Locale, Reducer, RefBinding, Schema, SyntheticDataset, resolve_include, split_ref,
+};
 
 /// Validate all loaded datasets, returning any non-fatal warnings.
 /// Hard errors (e.g. `rows` set alongside `ratio`) are returned as `Err`.
@@ -27,17 +30,23 @@ fn validate_dataset(
     // Rule 0: variant distribution consistency.
     if !dataset.variants.is_empty() {
         let fixed_sum: f64 = dataset.variants.iter().filter_map(|v| v.ratio).sum();
-        let n_free = dataset.variants.iter().filter(|v| v.ratio.is_none()).count();
+        let n_free = dataset
+            .variants
+            .iter()
+            .filter(|v| v.ratio.is_none())
+            .count();
         if fixed_sum > 1.0 + 1e-9 {
             bail!(
                 "dataset '{}': variant distributions sum to {:.4} which exceeds 1.0",
-                dataset.name, fixed_sum
+                dataset.name,
+                fixed_sum
             );
         }
         if n_free == 0 && (fixed_sum - 1.0).abs() > 1e-9 {
             bail!(
                 "dataset '{}': all variant distributions are explicit but sum to {:.4}, not 1.0",
-                dataset.name, fixed_sum
+                dataset.name,
+                fixed_sum
             );
         }
         if dataset.variants.len() == 1 {
@@ -49,7 +58,12 @@ fn validate_dataset(
     }
 
     // Rule 1: explicit rows is incompatible with ratio includes.
-    if dataset.rows.is_some() && dataset.include.as_ref().map_or(false, |i| i.ratio.is_some()) {
+    if dataset.rows.is_some()
+        && dataset
+            .include
+            .as_ref()
+            .map_or(false, |i| i.ratio.is_some())
+    {
         bail!(
             "dataset '{}': `rows` cannot be set when `include` specifies a `ratio` \
              — the row count is derived from the ratio and the included \
@@ -73,7 +87,8 @@ fn validate_dataset(
         if resolve_include(path, &link.file).is_none() {
             bail!(
                 "dataset '{}': linked file not found: '{}'",
-                dataset.name, link.file
+                dataset.name,
+                link.file
             );
         }
         if !group_refs.contains(&link.reference) {
@@ -82,7 +97,8 @@ fn validate_dataset(
                 bail!(
                     "dataset '{}': junction link '{}' must not set `cardinality` — \
                      junction links sample exactly one linked-dataset row per junction row",
-                    dataset.name, link.reference
+                    dataset.name,
+                    link.reference
                 );
             }
         }
@@ -91,7 +107,8 @@ fn validate_dataset(
                 bail!(
                     "dataset '{}': link '{}': `reinforcement` must be 0 (without-replacement), \
                      1 (uniform), or > 1 (clumping); got {r}",
-                    dataset.name, link.reference
+                    dataset.name,
+                    link.reference
                 );
             }
         }
@@ -100,14 +117,16 @@ fn validate_dataset(
                 bail!(
                     "dataset '{}': link '{}': `overlap` must be 0 (non-overlapping partitions), \
                      1 (default, unrestricted), or > 1 (preferential popularity); got {ov}",
-                    dataset.name, link.reference
+                    dataset.name,
+                    link.reference
                 );
             }
             if ov > 1.0 && link.reinforcement == Some(0.0) {
                 bail!(
                     "dataset '{}': link '{}': `overlap > 1` and `reinforcement: 0` are \
                      incompatible — power-law weighting requires with-replacement sampling",
-                    dataset.name, link.reference
+                    dataset.name,
+                    link.reference
                 );
             }
         }
@@ -117,7 +136,8 @@ fn validate_dataset(
         if !dataset.links.iter().any(|l| &l.reference == from_ref) {
             bail!(
                 "dataset '{}': `content.from: {}` does not match any entry in `links`",
-                dataset.name, from_ref
+                dataset.name,
+                from_ref
             );
         }
     }
@@ -127,7 +147,8 @@ fn validate_dataset(
         if !seen_from.insert(fr.as_str()) {
             bail!(
                 "dataset '{}': two or more list fields share `content.from: {}` — each link may be referenced by at most one list field",
-                dataset.name, fr
+                dataset.name,
+                fr
             );
         }
     }
@@ -137,7 +158,9 @@ fn validate_dataset(
         if inc.exclude.is_some() && inc.fields.is_empty() {
             bail!(
                 "dataset '{}': {} '{}': `exclude` is only valid when `fields` is also set",
-                dataset.name, kind, inc.reference
+                dataset.name,
+                kind,
+                inc.reference
             );
         }
         Ok(())
@@ -200,7 +223,15 @@ fn validate_dataset(
                 if let Some(link) = dataset.links.iter().find(|l| &l.reference == from_ref) {
                     let content_path = format!("{field_path}[]");
                     validate_project(content, link, &content_path, path, all)?;
-                    validate_list_link_content(&content_path, link, &content.item.fields, path, dataset, all, warnings)?;
+                    validate_list_link_content(
+                        &content_path,
+                        link,
+                        &content.item.fields,
+                        path,
+                        dataset,
+                        all,
+                        warnings,
+                    )?;
                 }
             }
         }
@@ -216,7 +247,10 @@ fn validate_dataset(
     validate_collect_bindings(path, dataset, all)?;
 
     // Rule 7: data quality stanzas are structurally valid.
-    let output_has_quality = dataset.resolved_outputs().iter().any(|o| o.quality.is_some());
+    let output_has_quality = dataset
+        .resolved_outputs()
+        .iter()
+        .any(|o| o.quality.is_some());
     for out in &dataset.resolved_outputs() {
         if let Some(ref q) = out.quality {
             validate_data_quality(&dataset.name, &out.file, q, true)?;
@@ -242,42 +276,86 @@ fn validate_dataset(
     Ok(())
 }
 
-fn validate_data_quality(dataset_name: &str, ctx: &str, q: &DataQuality, is_output_level: bool) -> Result<()> {
+fn validate_data_quality(
+    dataset_name: &str,
+    ctx: &str,
+    q: &DataQuality,
+    is_output_level: bool,
+) -> Result<()> {
     let check_prob = |name: &str, val: f64| -> Result<()> {
         if !(0.0..=1.0).contains(&val) {
-            bail!("dataset '{}': quality field '{}' must be between 0.0 and 1.0, got {}", dataset_name, name, val);
+            bail!(
+                "dataset '{}': quality field '{}' must be between 0.0 and 1.0, got {}",
+                dataset_name,
+                name,
+                val
+            );
         }
         Ok(())
     };
 
-    if let Some(v) = q.nulls        { check_prob("nulls", v)?; }
-    if let Some(v) = q.default_rate { check_prob("default_rate", v)?; }
+    if let Some(v) = q.nulls {
+        check_prob("nulls", v)?;
+    }
+    if let Some(v) = q.default_rate {
+        check_prob("default_rate", v)?;
+    }
 
     if is_output_level {
-        if let Some(v) = q.duplication { check_prob("duplication", v)?; }
-        if let Some(v) = q.missing     { check_prob("missing", v)?; }
+        if let Some(v) = q.duplication {
+            check_prob("duplication", v)?;
+        }
+        if let Some(v) = q.missing {
+            check_prob("missing", v)?;
+        }
         if q.default_values.is_some() {
-            bail!("dataset '{}' output '{}': `quality.default_values` is only valid on a field, not on the output block", dataset_name, ctx);
+            bail!(
+                "dataset '{}' output '{}': `quality.default_values` is only valid on a field, not on the output block",
+                dataset_name,
+                ctx
+            );
         }
         if q.defaults_mode.is_some() {
-            bail!("dataset '{}' output '{}': `quality.defaults_mode` is only valid on a field, not on the output block", dataset_name, ctx);
+            bail!(
+                "dataset '{}' output '{}': `quality.defaults_mode` is only valid on a field, not on the output block",
+                dataset_name,
+                ctx
+            );
         }
     } else {
         if q.duplication.is_some() {
-            bail!("field '{}': `quality.duplication` is only valid on an output block, not on a field", ctx);
+            bail!(
+                "field '{}': `quality.duplication` is only valid on an output block, not on a field",
+                ctx
+            );
         }
         if q.missing.is_some() {
-            bail!("field '{}': `quality.missing` is only valid on an output block, not on a field", ctx);
+            bail!(
+                "field '{}': `quality.missing` is only valid on an output block, not on a field",
+                ctx
+            );
         }
     }
 
     if let Some(ref c) = q.corruptions {
-        if let Some(v) = c.character_deletion  { check_prob("corruptions.character_deletion", v)?; }
-        if let Some(v) = c.character_insertion { check_prob("corruptions.character_insertion", v)?; }
-        if let Some(v) = c.truncation          { check_prob("corruptions.truncation", v)?; }
-        if let Some(v) = c.encoding            { check_prob("corruptions.encoding", v)?; }
-        if let Some(v) = c.noise               { check_prob("corruptions.noise", v)?; }
-        if let Some(v) = c.day_shift           { check_prob("corruptions.day_shift", v)?; }
+        if let Some(v) = c.character_deletion {
+            check_prob("corruptions.character_deletion", v)?;
+        }
+        if let Some(v) = c.character_insertion {
+            check_prob("corruptions.character_insertion", v)?;
+        }
+        if let Some(v) = c.truncation {
+            check_prob("corruptions.truncation", v)?;
+        }
+        if let Some(v) = c.encoding {
+            check_prob("corruptions.encoding", v)?;
+        }
+        if let Some(v) = c.noise {
+            check_prob("corruptions.noise", v)?;
+        }
+        if let Some(v) = c.day_shift {
+            check_prob("corruptions.day_shift", v)?;
+        }
     }
 
     Ok(())
@@ -289,16 +367,34 @@ fn validate_corruption_modes(field_path: &str, c: &Corruptions, ft: &FieldType) 
     let is_temporal = matches!(ft, FieldType::Date | FieldType::DateTime);
 
     if !is_string {
-        if c.character_deletion.is_some()  { bail!("field '{field_path}': `corruptions.character_deletion` is not applicable to {ft} fields"); }
-        if c.character_insertion.is_some() { bail!("field '{field_path}': `corruptions.character_insertion` is not applicable to {ft} fields"); }
-        if c.truncation.is_some()          { bail!("field '{field_path}': `corruptions.truncation` is not applicable to {ft} fields"); }
-        if c.encoding.is_some()            { bail!("field '{field_path}': `corruptions.encoding` is not applicable to {ft} fields"); }
+        if c.character_deletion.is_some() {
+            bail!(
+                "field '{field_path}': `corruptions.character_deletion` is not applicable to {ft} fields"
+            );
+        }
+        if c.character_insertion.is_some() {
+            bail!(
+                "field '{field_path}': `corruptions.character_insertion` is not applicable to {ft} fields"
+            );
+        }
+        if c.truncation.is_some() {
+            bail!(
+                "field '{field_path}': `corruptions.truncation` is not applicable to {ft} fields"
+            );
+        }
+        if c.encoding.is_some() {
+            bail!("field '{field_path}': `corruptions.encoding` is not applicable to {ft} fields");
+        }
     }
     if !is_number {
-        if c.noise.is_some() { bail!("field '{field_path}': `corruptions.noise` is not applicable to {ft} fields"); }
+        if c.noise.is_some() {
+            bail!("field '{field_path}': `corruptions.noise` is not applicable to {ft} fields");
+        }
     }
     if !is_temporal {
-        if c.day_shift.is_some() { bail!("field '{field_path}': `corruptions.day_shift` is not applicable to {ft} fields"); }
+        if c.day_shift.is_some() {
+            bail!("field '{field_path}': `corruptions.day_shift` is not applicable to {ft} fields");
+        }
     }
     Ok(())
 }
@@ -315,9 +411,11 @@ fn validate_date_bounds(path: &str, field: &Field) -> Result<()> {
 
     match ft {
         FieldType::Date => {
-            let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                .map_err(|e| anyhow!("field '{path}': `after`/`before` for date field must be YYYY-MM-DD, got '{s}': {e}"));
-            let after  = field.after.as_deref().map(parse).transpose()?;
+            let parse = |s: &str| {
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| anyhow!("field '{path}': `after`/`before` for date field must be YYYY-MM-DD, got '{s}': {e}"))
+            };
+            let after = field.after.as_deref().map(parse).transpose()?;
             let before = field.before.as_deref().map(parse).transpose()?;
             if let (Some(a), Some(b)) = (after, before) {
                 if a >= b {
@@ -326,9 +424,11 @@ fn validate_date_bounds(path: &str, field: &Field) -> Result<()> {
             }
         }
         FieldType::DateTime => {
-            let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s)
-                .map_err(|e| anyhow!("field '{path}': `after`/`before` for date_time field must be RFC 3339, got '{s}': {e}"));
-            let after  = field.after.as_deref().map(parse).transpose()?;
+            let parse = |s: &str| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| anyhow!("field '{path}': `after`/`before` for date_time field must be RFC 3339, got '{s}': {e}"))
+            };
+            let after = field.after.as_deref().map(parse).transpose()?;
             let before = field.before.as_deref().map(parse).transpose()?;
             if let (Some(a), Some(b)) = (after, before) {
                 if a >= b {
@@ -347,18 +447,24 @@ fn validate_date_bounds(path: &str, field: &Field) -> Result<()> {
 }
 
 fn validate_args(path: &str, field: &Field) -> Result<()> {
-    let Some(ref args) = field.args else { return Ok(()) };
+    let Some(ref args) = field.args else {
+        return Ok(());
+    };
 
     if let Some(ft) = &field.field_type {
         if *ft == FieldType::Boolean {
             // boolean ratio — no generator required
             for key in args.keys() {
                 if key != "ratio" {
-                    bail!("field '{path}': unknown arg '{key}' for boolean field — valid key: `ratio`");
+                    bail!(
+                        "field '{path}': unknown arg '{key}' for boolean field — valid key: `ratio`"
+                    );
                 }
             }
             if let Some(v) = args.get("ratio") {
-                let ratio = v.as_u64().ok_or_else(|| anyhow!("field '{path}': `args.ratio` must be an integer 0–100"))?;
+                let ratio = v.as_u64().ok_or_else(|| {
+                    anyhow!("field '{path}': `args.ratio` must be an integer 0–100")
+                })?;
                 if ratio > 100 {
                     bail!("field '{path}': `args.ratio` must be between 0 and 100, got {ratio}");
                 }
@@ -370,7 +476,9 @@ fn validate_args(path: &str, field: &Field) -> Result<()> {
     // For all other types, args require a generator.
     let g = match &field.generator {
         Some(g) => g,
-        None => bail!("field '{path}': `args` requires a `generator` to be set (or `type: boolean` for `ratio`)"),
+        None => bail!(
+            "field '{path}': `args` requires a `generator` to be set (or `type: boolean` for `ratio`)"
+        ),
     };
 
     let valid_keys = match g.valid_args() {
@@ -389,25 +497,34 @@ fn validate_args(path: &str, field: &Field) -> Result<()> {
 
     // Type-check each known key.
     match g {
-        Generator::Sentence | Generator::Paragraph
-        | Generator::Words | Generator::Sentences | Generator::Paragraphs
+        Generator::Sentence
+        | Generator::Paragraph
+        | Generator::Words
+        | Generator::Sentences
+        | Generator::Paragraphs
         | Generator::Password => {
             for key in ["min", "max"] {
                 if let Some(v) = args.get(key) {
-                    v.as_u64().ok_or_else(|| anyhow!("field '{path}': `args.{key}` must be a non-negative integer"))?;
+                    v.as_u64().ok_or_else(|| {
+                        anyhow!("field '{path}': `args.{key}` must be a non-negative integer")
+                    })?;
                 }
             }
             if let (Some(min_v), Some(max_v)) = (args.get("min"), args.get("max")) {
                 let min = min_v.as_u64().unwrap();
                 let max = max_v.as_u64().unwrap();
                 if min >= max {
-                    bail!("field '{path}': `args.min` ({min}) must be less than `args.max` ({max})");
+                    bail!(
+                        "field '{path}': `args.min` ({min}) must be less than `args.max` ({max})"
+                    );
                 }
             }
         }
         Generator::Geohash => {
             if let Some(v) = args.get("precision") {
-                let p = v.as_u64().ok_or_else(|| anyhow!("field '{path}': `args.precision` must be an integer 1–12"))?;
+                let p = v.as_u64().ok_or_else(|| {
+                    anyhow!("field '{path}': `args.precision` must be an integer 1–12")
+                })?;
                 if !(1..=12).contains(&p) {
                     bail!("field '{path}': `args.precision` must be between 1 and 12, got {p}");
                 }
@@ -428,13 +545,17 @@ fn validate_args(path: &str, field: &Field) -> Result<()> {
     Ok(())
 }
 
-fn validate_locale_generator(path: &str, locale: Option<&Locale>, generator: Option<&Generator>) -> Result<()> {
+fn validate_locale_generator(
+    path: &str,
+    locale: Option<&Locale>,
+    generator: Option<&Generator>,
+) -> Result<()> {
     if locale.is_some() {
         match generator {
             None => bail!("field '{path}': `locale` requires `generator` to be set"),
-            Some(g) if !g.supports_locale() => bail!(
-                "field '{path}': generator `{g}` does not support locale selection"
-            ),
+            Some(g) if !g.supports_locale() => {
+                bail!("field '{path}': generator `{g}` does not support locale selection")
+            }
             Some(_) => {}
         }
     }
@@ -450,7 +571,12 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         if field.simple_ref().is_some() {
             bail!("field '{path}': `expression` cannot be combined with `ref`");
         }
-        if field.generator.is_some() || field.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some()) {
+        if field.generator.is_some()
+            || field
+                .range
+                .as_ref()
+                .is_some_and(|r| r.min.is_some() || r.max.is_some())
+        {
             bail!("field '{path}': `expression` cannot be combined with `generator` or `range`");
         }
         if field.value.is_some() {
@@ -557,9 +683,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
 
     if let Some(g) = &field.generator {
         if !g.valid_for(field_type) {
-            bail!(
-                "field '{path}': generator `{g}` is not valid for type `{field_type}`"
-            );
+            bail!("field '{path}': generator `{g}` is not valid for type `{field_type}`");
         }
     }
 
@@ -604,13 +728,14 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     // `default` value must be type-compatible with the declared field type.
     if let Some(default_val) = &field.default {
         let (compatible, expected) = match field_type {
-            FieldType::Number   => (default_val.is_number(), "a number"),
-            FieldType::String | FieldType::Date | FieldType::DateTime
-                                => (default_val.is_string(), "a string"),
-            FieldType::Boolean  => (default_val.is_bool(), "a boolean"),
-            FieldType::List     => (default_val.is_sequence(), "a sequence (e.g. `default: []`)"),
-            FieldType::Object   => (default_val.is_mapping(), "a mapping"),
-            FieldType::Variant  => (true, ""),
+            FieldType::Number => (default_val.is_number(), "a number"),
+            FieldType::String | FieldType::Date | FieldType::DateTime => {
+                (default_val.is_string(), "a string")
+            }
+            FieldType::Boolean => (default_val.is_bool(), "a boolean"),
+            FieldType::List => (default_val.is_sequence(), "a sequence (e.g. `default: []`)"),
+            FieldType::Object => (default_val.is_mapping(), "a mapping"),
+            FieldType::Variant => (true, ""),
         };
         if !compatible {
             bail!(
@@ -652,8 +777,13 @@ fn validate_list_link_content(
 
         if let Some(ref_str) = field.simple_ref() {
             // Determine scope: linked-scoped (dot matches the link ref) or outer-scoped.
-            let linked_scoped = split_ref(ref_str)
-                .and_then(|(ref_part, _)| if link.reference == ref_part { Some(link) } else { None });
+            let linked_scoped = split_ref(ref_str).and_then(|(ref_part, _)| {
+                if link.reference == ref_part {
+                    Some(link)
+                } else {
+                    None
+                }
+            });
 
             if let Some(inc) = linked_scoped {
                 // Linked-scoped ref — type must not be set (inherited from link target).
@@ -673,7 +803,9 @@ fn validate_list_link_content(
                 if !included.data.iter().any(|f| f.name == target_name) {
                     bail!(
                         "field '{fpath}': ref '{}' — field '{}' does not exist in '{}'",
-                        ref_str, target_name, inc.file
+                        ref_str,
+                        target_name,
+                        inc.file
                     );
                 }
             } else {
@@ -712,7 +844,11 @@ fn validate_list_link_content(
     Ok(())
 }
 
-fn validate_field_variant(path: &str, choice: &FieldVariant, _warnings: &mut Vec<String>) -> Result<()> {
+fn validate_field_variant(
+    path: &str,
+    choice: &FieldVariant,
+    _warnings: &mut Vec<String>,
+) -> Result<()> {
     if let Some(ft) = &choice.field_type {
         if *ft == FieldType::Variant {
             bail!("field variant '{path}': nested `type: variant` is not supported");
@@ -723,7 +859,11 @@ fn validate_field_variant(path: &str, choice: &FieldVariant, _warnings: &mut Vec
         if choice.generator.is_some() {
             bail!("field variant '{path}': `value` and `generator` cannot both be set");
         }
-        if choice.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some()) {
+        if choice
+            .range
+            .as_ref()
+            .is_some_and(|r| r.min.is_some() || r.max.is_some())
+        {
             bail!("field variant '{path}': `value` and `range` cannot both be set");
         }
     }
@@ -746,12 +886,16 @@ fn validate_field_variant(path: &str, choice: &FieldVariant, _warnings: &mut Vec
 
     // Must be able to determine the concrete type at expansion time.
     let can_infer_type = choice.field_type.is_some()
-        || choice.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some())
-        || choice.value.as_ref().is_some_and(|v| v.is_string() || v.is_number() || v.is_bool());
+        || choice
+            .range
+            .as_ref()
+            .is_some_and(|r| r.min.is_some() || r.max.is_some())
+        || choice
+            .value
+            .as_ref()
+            .is_some_and(|v| v.is_string() || v.is_number() || v.is_bool());
     if !can_infer_type {
-        bail!(
-            "field variant '{path}': cannot determine type — set `type`, `value`, or `range`"
-        );
+        bail!("field variant '{path}': cannot determine type — set `type`, `value`, or `range`");
     }
 
     Ok(())
@@ -791,7 +935,13 @@ fn validate_collect_bindings(
                 for cf in &content.item.fields {
                     let cf_path = format!("{field_path}[].{}", cf.name);
                     for binding in cf.collect_bindings() {
-                        validate_single_collect_bind(dataset_path, dataset, all, &cf_path, binding)?;
+                        validate_single_collect_bind(
+                            dataset_path,
+                            dataset,
+                            all,
+                            &cf_path,
+                            binding,
+                        )?;
                     }
                 }
             }
@@ -807,9 +957,10 @@ fn validate_single_collect_bind(
     field_path: &str,
     binding: &RefBinding,
 ) -> Result<()> {
-    let bind = binding.bind.as_deref().ok_or_else(|| {
-        anyhow!("field '{field_path}': collect binding has no `bind` target")
-    })?;
+    let bind = binding
+        .bind
+        .as_deref()
+        .ok_or_else(|| anyhow!("field '{field_path}': collect binding has no `bind` target"))?;
 
     let (linked_ref, linked_field_name) = split_ref(bind).ok_or_else(|| {
         anyhow!(
@@ -863,7 +1014,11 @@ fn validate_single_collect_bind(
                      target field '{linked_field_name}' in '{}' must be `type: list` \
                      (collect accumulates values into a list; got type: {:?})",
                     link.file,
-                    linked_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
+                    linked_field
+                        .field_type
+                        .as_ref()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default()
                 );
             }
         }
@@ -874,7 +1029,11 @@ fn validate_single_collect_bind(
                      target field '{linked_field_name}' in '{}' must be `type: number` \
                      (sum requires a numeric target; got type: {:?})",
                     link.file,
-                    linked_field.field_type.as_ref().map(|t| t.to_string()).unwrap_or_default()
+                    linked_field
+                        .field_type
+                        .as_ref()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default()
                 );
             }
         }
@@ -919,7 +1078,9 @@ fn validate_ref_target(
     let (include_ref, target_field) = split_ref(ref_str).ok_or_else(|| {
         anyhow!(
             "field '{}.{}': ref '{}' must be in the form 'include_ref.field_name'",
-            dataset.name, field_name, ref_str
+            dataset.name,
+            field_name,
+            ref_str
         )
     })?;
 
@@ -931,28 +1092,40 @@ fn validate_ref_target(
         .ok_or_else(|| {
             anyhow!(
                 "field '{}.{}': ref '{}' — no include or link with ref '{}' in this dataset",
-                dataset.name, field_name, ref_str, include_ref
+                dataset.name,
+                field_name,
+                ref_str,
+                include_ref
             )
         })?;
 
     let include_path = resolve_include(path, &include.file).ok_or_else(|| {
         anyhow!(
             "field '{}.{}': ref '{}' — cannot resolve include file '{}'",
-            dataset.name, field_name, ref_str, include.file
+            dataset.name,
+            field_name,
+            ref_str,
+            include.file
         )
     })?;
 
     let included = all.get(&include_path).ok_or_else(|| {
         anyhow!(
             "field '{}.{}': ref '{}' — included dataset not loaded",
-            dataset.name, field_name, ref_str
+            dataset.name,
+            field_name,
+            ref_str
         )
     })?;
 
     if !included.data.iter().any(|f| f.name == target_field) {
         bail!(
             "field '{}.{}': ref '{}' — field '{}' does not exist in '{}'",
-            dataset.name, field_name, ref_str, target_field, include.file
+            dataset.name,
+            field_name,
+            ref_str,
+            target_field,
+            include.file
         );
     }
 
@@ -982,8 +1155,12 @@ fn validate_include_fields(
     all: &HashMap<PathBuf, SyntheticDataset>,
     warnings: &mut Vec<String>,
 ) {
-    let Some(target_path) = resolve_include(path, &include.file) else { return };
-    let Some(target) = all.get(&target_path) else { return };
+    let Some(target_path) = resolve_include(path, &include.file) else {
+        return;
+    };
+    let Some(target) = all.get(&target_path) else {
+        return;
+    };
     let target_names: HashSet<&str> = target.data.iter().map(|f| f.name.as_str()).collect();
     let exclude_set: HashSet<&str> = include
         .exclude
@@ -1030,7 +1207,9 @@ fn validate_project(
     dataset_path: &Path,
     all: &HashMap<PathBuf, SyntheticDataset>,
 ) -> Result<()> {
-    let Some(ref proj) = content.project else { return Ok(()) };
+    let Some(ref proj) = content.project else {
+        return Ok(());
+    };
 
     if !content.item.fields.is_empty() {
         bail!(
@@ -1042,34 +1221,45 @@ fn validate_project(
     let (ref_part, field_part) = split_ref(proj).ok_or_else(|| {
         anyhow!(
             "field '{}': `project: {}` — expected `<link_ref>.<field_name>` format",
-            content_path, proj
+            content_path,
+            proj
         )
     })?;
 
     if ref_part != link.reference {
         bail!(
             "field '{}': `project: {}` — ref part '{}' does not match the link ref '{}'",
-            content_path, proj, ref_part, link.reference
+            content_path,
+            proj,
+            ref_part,
+            link.reference
         );
     }
 
     let inc_path = resolve_include(dataset_path, &link.file).ok_or_else(|| {
         anyhow!(
             "field '{}': `project: {}` — cannot resolve link file '{}'",
-            content_path, proj, link.file
+            content_path,
+            proj,
+            link.file
         )
     })?;
     let linked = all.get(&inc_path).ok_or_else(|| {
         anyhow!(
             "field '{}': `project: {}` — linked dataset '{}' not loaded",
-            content_path, proj, link.file
+            content_path,
+            proj,
+            link.file
         )
     })?;
 
     if !linked.data.iter().any(|f| f.name == field_part) {
         bail!(
             "field '{}': `project: {}` — field '{}' does not exist in '{}'",
-            content_path, proj, field_part, link.file
+            content_path,
+            proj,
+            field_part,
+            link.file
         );
     }
 

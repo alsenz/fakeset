@@ -1,10 +1,10 @@
 //! Per-field fake data generation. `generate_column` dispatches to fake-rs generators
 //! based on field type and generator settings; `sample_count` draws a cardinality value
 //! from a `CountSpec` for list-link witness generation.
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, ListArray, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, ListArray, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::{cast, concat};
@@ -62,20 +62,48 @@ macro_rules! locale_fake {
 macro_rules! locale_fake_join {
     ($loc:expr, $path:path, $arg:expr, $sep:expr) => {
         match $loc {
-            Locale::En   => $path(fake::locales::EN,    $arg).fake::<Vec<String>>().join($sep),
-            Locale::FrFr => $path(fake::locales::FR_FR, $arg).fake::<Vec<String>>().join($sep),
-            Locale::DeDe => $path(fake::locales::DE_DE, $arg).fake::<Vec<String>>().join($sep),
-            Locale::ItIt => $path(fake::locales::IT_IT, $arg).fake::<Vec<String>>().join($sep),
-            Locale::NlNl => $path(fake::locales::NL_NL, $arg).fake::<Vec<String>>().join($sep),
-            Locale::PtBr => $path(fake::locales::PT_BR, $arg).fake::<Vec<String>>().join($sep),
-            Locale::PtPt => $path(fake::locales::PT_PT, $arg).fake::<Vec<String>>().join($sep),
-            Locale::CyGb => $path(fake::locales::CY_GB, $arg).fake::<Vec<String>>().join($sep),
-            Locale::ZhCn => $path(fake::locales::ZH_CN, $arg).fake::<Vec<String>>().join($sep),
-            Locale::ZhTw => $path(fake::locales::ZH_TW, $arg).fake::<Vec<String>>().join($sep),
-            Locale::JaJp => $path(fake::locales::JA_JP, $arg).fake::<Vec<String>>().join($sep),
-            Locale::ArSa => $path(fake::locales::AR_SA, $arg).fake::<Vec<String>>().join($sep),
-            Locale::TrTr => $path(fake::locales::TR_TR, $arg).fake::<Vec<String>>().join($sep),
-            Locale::FaIr => $path(fake::locales::FA_IR, $arg).fake::<Vec<String>>().join($sep),
+            Locale::En => $path(fake::locales::EN, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::FrFr => $path(fake::locales::FR_FR, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::DeDe => $path(fake::locales::DE_DE, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::ItIt => $path(fake::locales::IT_IT, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::NlNl => $path(fake::locales::NL_NL, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::PtBr => $path(fake::locales::PT_BR, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::PtPt => $path(fake::locales::PT_PT, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::CyGb => $path(fake::locales::CY_GB, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::ZhCn => $path(fake::locales::ZH_CN, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::ZhTw => $path(fake::locales::ZH_TW, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::JaJp => $path(fake::locales::JA_JP, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::ArSa => $path(fake::locales::AR_SA, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::TrTr => $path(fake::locales::TR_TR, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
+            Locale::FaIr => $path(fake::locales::FA_IR, $arg)
+                .fake::<Vec<String>>()
+                .join($sep),
         }
     };
 }
@@ -101,10 +129,17 @@ pub fn generate_column(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
     let mut col = generate_column_raw(field, rows, prefix)?;
     if let (Some(precision), Some(FieldType::Number)) = (field.precision, &field.field_type) {
         let factor = 10f64.powi(precision);
-        let arr = col.as_any().downcast_ref::<Float64Array>()
-            .ok_or_else(|| anyhow!("precision: expected Float64 column for number field '{}'", field.name))?;
+        let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+            anyhow!(
+                "precision: expected Float64 column for number field '{}'",
+                field.name
+            )
+        })?;
         col = Arc::new(Float64Array::from(
-            arr.values().iter().map(|&v| (v * factor).round() / factor).collect::<Vec<_>>(),
+            arr.values()
+                .iter()
+                .map(|&v| (v * factor).round() / factor)
+                .collect::<Vec<_>>(),
         ));
     }
     if let Some(ref pcfg) = field.parquet {
@@ -134,22 +169,36 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
 
     let generated: ArrayRef = match ft {
         FieldType::Number => Arc::new(Float64Array::from(
-            (0..n).map(|_| fake_number(g, field.range.as_ref().and_then(|r| r.min), field.range.as_ref().and_then(|r| r.max))).collect::<Vec<_>>(),
+            (0..n)
+                .map(|_| {
+                    fake_number(
+                        g,
+                        field.range.as_ref().and_then(|r| r.min),
+                        field.range.as_ref().and_then(|r| r.max),
+                    )
+                })
+                .collect::<Vec<_>>(),
         )),
         FieldType::Boolean => {
-            let ratio: Option<u8> = field.args.as_ref()
+            let ratio: Option<u8> = field
+                .args
+                .as_ref()
                 .and_then(|a| a.get("ratio"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u8);
             Arc::new(BooleanArray::from(
-                (0..n).map(|_| match ratio {
-                    Some(r) => fake::faker::boolean::en::Boolean(r).fake::<bool>(),
-                    None    => Faker.fake::<bool>(),
-                }).collect::<Vec<_>>(),
+                (0..n)
+                    .map(|_| match ratio {
+                        Some(r) => fake::faker::boolean::en::Boolean(r).fake::<bool>(),
+                        None => Faker.fake::<bool>(),
+                    })
+                    .collect::<Vec<_>>(),
             ))
         }
         FieldType::String => Arc::new(StringArray::from(
-            (0..n).map(|_| fake_string(g, locale, field.args.as_ref())).collect::<Vec<_>>(),
+            (0..n)
+                .map(|_| fake_string(g, locale, field.args.as_ref()))
+                .collect::<Vec<_>>(),
         )),
         FieldType::Date => {
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -164,11 +213,15 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
         }
         FieldType::DateTime => Arc::new(TimestampMicrosecondArray::from(
             (0..n)
-                .map(|_| fake_datetime(field.after.as_deref(), field.before.as_deref()).timestamp_micros())
+                .map(|_| {
+                    fake_datetime(field.after.as_deref(), field.before.as_deref())
+                        .timestamp_micros()
+                })
                 .collect::<Vec<_>>(),
         )),
         FieldType::Object => {
-            let sub_columns: Vec<(Arc<ArrowField>, ArrayRef)> = field.fields
+            let sub_columns: Vec<(Arc<ArrowField>, ArrayRef)> = field
+                .fields
                 .iter()
                 .map(|sub| {
                     let col = generate_column(sub, n, &[])?;
@@ -178,33 +231,34 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
             Arc::new(StructArray::from(sub_columns))
         }
         FieldType::Variant => {
-            bail!("variant field '{}' must be expanded before execution; call expand_field_variants first", field.name)
+            bail!(
+                "variant field '{}' must be expanded before execution; call expand_field_variants first",
+                field.name
+            )
         }
-        FieldType::List => {
-            match field.content.as_deref() {
-                None => {
-                    let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::repeat(0).take(n));
-                    let child = Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef;
-                    let child_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
-                    Arc::new(ListArray::new(child_field, offsets, child, None))
-                }
-                Some(c) if c.from.is_none() => {
-                    let count_spec = field.count.as_ref().cloned().unwrap_or(CountSpec::Fixed(1));
-                    let counts: Vec<usize> = (0..n).map(|_| sample_count(&count_spec)).collect();
-                    let total: usize = counts.iter().sum();
-                    let child_values = generate_column(&c.item, total, &[])?;
-                    let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
-                    let child_field = Arc::new(field_to_arrow(&c.item));
-                    Arc::new(ListArray::new(child_field, offsets, child_values, None))
-                }
-                Some(_) => {
-                    bail!(
-                        "list-link field '{}' must be generated via GenerateWitness / AssembleFromWitness",
-                        field.name
-                    )
-                }
+        FieldType::List => match field.content.as_deref() {
+            None => {
+                let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::repeat(0).take(n));
+                let child = Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef;
+                let child_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
+                Arc::new(ListArray::new(child_field, offsets, child, None))
             }
-        }
+            Some(c) if c.from.is_none() => {
+                let count_spec = field.count.as_ref().cloned().unwrap_or(CountSpec::Fixed(1));
+                let counts: Vec<usize> = (0..n).map(|_| sample_count(&count_spec)).collect();
+                let total: usize = counts.iter().sum();
+                let child_values = generate_column(&c.item, total, &[])?;
+                let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
+                let child_field = Arc::new(field_to_arrow(&c.item));
+                Arc::new(ListArray::new(child_field, offsets, child_values, None))
+            }
+            Some(_) => {
+                bail!(
+                    "list-link field '{}' must be generated via GenerateWitness / AssembleFromWitness",
+                    field.name
+                )
+            }
+        },
     };
 
     prepend_prefix(prefix, generated)
@@ -223,8 +277,8 @@ fn fake_date(after: Option<&str>, before: Option<&str>) -> chrono::NaiveDate {
     match (after, before) {
         (Some(a), Some(b)) => {
             let start = chrono::NaiveDate::parse_from_str(a, "%Y-%m-%d").expect("validated");
-            let end   = chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d").expect("validated");
-            let days  = (end - start).num_days();
+            let end = chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d").expect("validated");
+            let days = (end - start).num_days();
             let offset: i64 = (0i64..=days).fake();
             start + chrono::Duration::days(offset)
         }
@@ -234,7 +288,7 @@ fn fake_date(after: Option<&str>, before: Option<&str>) -> chrono::NaiveDate {
             start + chrono::Duration::days(offset)
         }
         (None, Some(b)) => {
-            let end    = chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d").expect("validated");
+            let end = chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d").expect("validated");
             let offset: i64 = (0i64..=365_000i64).fake();
             end - chrono::Duration::days(offset)
         }
@@ -245,16 +299,24 @@ fn fake_date(after: Option<&str>, before: Option<&str>) -> chrono::NaiveDate {
 fn fake_datetime(after: Option<&str>, before: Option<&str>) -> chrono::DateTime<chrono::Utc> {
     match (after, before) {
         (Some(a), Some(b)) => {
-            let start = chrono::DateTime::parse_from_rfc3339(a).expect("validated").with_timezone(&chrono::Utc);
-            let end   = chrono::DateTime::parse_from_rfc3339(b).expect("validated").with_timezone(&chrono::Utc);
+            let start = chrono::DateTime::parse_from_rfc3339(a)
+                .expect("validated")
+                .with_timezone(&chrono::Utc);
+            let end = chrono::DateTime::parse_from_rfc3339(b)
+                .expect("validated")
+                .with_timezone(&chrono::Utc);
             fake::faker::chrono::en::DateTimeBetween(start, end).fake()
         }
         (Some(a), None) => {
-            let start = chrono::DateTime::parse_from_rfc3339(a).expect("validated").with_timezone(&chrono::Utc);
+            let start = chrono::DateTime::parse_from_rfc3339(a)
+                .expect("validated")
+                .with_timezone(&chrono::Utc);
             fake::faker::chrono::en::DateTimeAfter(start).fake()
         }
         (None, Some(b)) => {
-            let end = chrono::DateTime::parse_from_rfc3339(b).expect("validated").with_timezone(&chrono::Utc);
+            let end = chrono::DateTime::parse_from_rfc3339(b)
+                .expect("validated")
+                .with_timezone(&chrono::Utc);
             fake::faker::chrono::en::DateTimeBefore(end).fake()
         }
         (None, None) => fake::faker::chrono::en::DateTime().fake(),
@@ -275,9 +337,9 @@ fn fake_number(g: Option<&Generator>, min: Option<f64>, max: Option<f64>) -> f64
         Some(Generator::Decimal) => Faker.fake::<f64>(),
         _ => match (min, max) {
             (Some(lo), Some(hi)) => (lo..=hi).fake::<f64>(),
-            (Some(lo), None)     => (lo..=f64::MAX).fake::<f64>(),
-            (None, Some(hi))     => (f64::MIN..=hi).fake::<f64>(),
-            (None, None)         => Faker.fake::<f64>(),
+            (Some(lo), None) => (lo..=f64::MAX).fake::<f64>(),
+            (None, Some(hi)) => (f64::MIN..=hi).fake::<f64>(),
+            (None, None) => Faker.fake::<f64>(),
         },
     }
 }
@@ -318,7 +380,9 @@ fn constant_column(ft: &FieldType, val: &serde_yaml::Value, n: usize) -> Result<
             })?;
             let dt = chrono::DateTime::parse_from_rfc3339(s)
                 .map_err(|e| anyhow!("invalid date_time value '{s}': {e}"))?;
-            Ok(Arc::new(TimestampMicrosecondArray::from(vec![dt.timestamp_micros(); n])))
+            Ok(Arc::new(TimestampMicrosecondArray::from(
+                vec![dt.timestamp_micros(); n],
+            )))
         }
         FieldType::Object | FieldType::List | FieldType::Variant => {
             bail!("constant `value` is not supported for object/list/variant fields")
@@ -332,99 +396,116 @@ fn arg_range(
     default_min: usize,
     default_max: usize,
 ) -> std::ops::Range<usize> {
-    let min = args.and_then(|a| a.get("min")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(default_min);
-    let max = args.and_then(|a| a.get("max")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(default_max);
+    let min = args
+        .and_then(|a| a.get("min"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(default_min);
+    let max = args
+        .and_then(|a| a.get("max"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(default_max);
     min..max
 }
 
-fn fake_string(g: Option<&Generator>, locale: Option<&Locale>, args: Option<&HashMap<String, serde_yaml::Value>>) -> String {
+fn fake_string(
+    g: Option<&Generator>,
+    locale: Option<&Locale>,
+    args: Option<&HashMap<String, serde_yaml::Value>>,
+) -> String {
     let loc = locale.unwrap_or(&Locale::En);
     match g {
         None => Faker.fake::<String>(),
         Some(g) => match g {
             // Locale-aware generators — dispatch via locale_fake! macro.
-            Generator::FirstName     => locale_fake!(loc, fake::faker::name::raw::FirstName),
-            Generator::LastName      => locale_fake!(loc, fake::faker::name::raw::LastName),
-            Generator::Name          => locale_fake!(loc, fake::faker::name::raw::Name),
+            Generator::FirstName => locale_fake!(loc, fake::faker::name::raw::FirstName),
+            Generator::LastName => locale_fake!(loc, fake::faker::name::raw::LastName),
+            Generator::Name => locale_fake!(loc, fake::faker::name::raw::Name),
             Generator::NameWithTitle => locale_fake!(loc, fake::faker::name::raw::NameWithTitle),
-            Generator::Word          => locale_fake!(loc, fake::faker::lorem::raw::Word),
-            Generator::Sentence      => {
+            Generator::Word => locale_fake!(loc, fake::faker::lorem::raw::Word),
+            Generator::Sentence => {
                 let r = arg_range(args, 5, 10);
                 locale_fake!(loc, fake::faker::lorem::raw::Sentence, r)
             }
-            Generator::Paragraph     => {
+            Generator::Paragraph => {
                 let r = arg_range(args, 3, 6);
                 locale_fake!(loc, fake::faker::lorem::raw::Paragraph, r)
             }
-            Generator::Words         => {
+            Generator::Words => {
                 let r = arg_range(args, 3, 8);
                 locale_fake_join!(loc, fake::faker::lorem::raw::Words, r, " ")
             }
-            Generator::Sentences     => {
+            Generator::Sentences => {
                 let r = arg_range(args, 2, 5);
                 locale_fake_join!(loc, fake::faker::lorem::raw::Sentences, r, " ")
             }
-            Generator::Paragraphs    => {
+            Generator::Paragraphs => {
                 let r = arg_range(args, 2, 4);
                 locale_fake_join!(loc, fake::faker::lorem::raw::Paragraphs, r, "\n\n")
             }
-            Generator::CompanyName   => locale_fake!(loc, fake::faker::company::raw::CompanyName),
+            Generator::CompanyName => locale_fake!(loc, fake::faker::company::raw::CompanyName),
             Generator::CompanySuffix => locale_fake!(loc, fake::faker::company::raw::CompanySuffix),
-            Generator::Industry      => locale_fake!(loc, fake::faker::company::raw::Industry),
-            Generator::Profession    => locale_fake!(loc, fake::faker::company::raw::Profession),
-            Generator::Buzzword      => locale_fake!(loc, fake::faker::company::raw::Buzzword),
-            Generator::CityName      => locale_fake!(loc, fake::faker::address::raw::CityName),
-            Generator::CountryName   => locale_fake!(loc, fake::faker::address::raw::CountryName),
-            Generator::StreetName    => locale_fake!(loc, fake::faker::address::raw::StreetName),
-            Generator::ZipCode       => locale_fake!(loc, fake::faker::address::raw::ZipCode),
-            Generator::StateAbbr     => locale_fake!(loc, fake::faker::address::raw::StateAbbr),
-            Generator::PhoneNumber   => locale_fake!(loc, fake::faker::phone_number::raw::PhoneNumber),
-            Generator::LicencePlate  => match loc {
+            Generator::Industry => locale_fake!(loc, fake::faker::company::raw::Industry),
+            Generator::Profession => locale_fake!(loc, fake::faker::company::raw::Profession),
+            Generator::Buzzword => locale_fake!(loc, fake::faker::company::raw::Buzzword),
+            Generator::CityName => locale_fake!(loc, fake::faker::address::raw::CityName),
+            Generator::CountryName => locale_fake!(loc, fake::faker::address::raw::CountryName),
+            Generator::StreetName => locale_fake!(loc, fake::faker::address::raw::StreetName),
+            Generator::ZipCode => locale_fake!(loc, fake::faker::address::raw::ZipCode),
+            Generator::StateAbbr => locale_fake!(loc, fake::faker::address::raw::StateAbbr),
+            Generator::PhoneNumber => {
+                locale_fake!(loc, fake::faker::phone_number::raw::PhoneNumber)
+            }
+            Generator::LicencePlate => match loc {
                 Locale::FrFr => fake::faker::automotive::fr_fr::LicencePlate().fake(),
                 Locale::ItIt => fake::faker::automotive::it_it::LicencePlate().fake(),
                 Locale::NlNl => fake::faker::automotive::nl_nl::LicencePlate().fake(),
-                _            => fake::faker::automotive::fr_fr::LicencePlate().fake(),
+                _ => fake::faker::automotive::fr_fr::LicencePlate().fake(),
             },
             // Locale-agnostic generators — fixed en (or locale-independent) implementation.
-            Generator::Email          => fake::faker::internet::en::FreeEmail().fake(),
-            Generator::Username       => fake::faker::internet::en::Username().fake(),
-            Generator::Password       => {
+            Generator::Email => fake::faker::internet::en::FreeEmail().fake(),
+            Generator::Username => fake::faker::internet::en::Username().fake(),
+            Generator::Password => {
                 let r = arg_range(args, 8, 20);
                 fake::faker::internet::en::Password(r).fake()
             }
-            Generator::IPv4           => fake::faker::internet::en::IPv4().fake(),
-            Generator::IPv6           => fake::faker::internet::en::IPv6().fake(),
-            Generator::MacAddress     => fake::faker::internet::en::MACAddress().fake(),
-            Generator::UserAgent      => fake::faker::internet::en::UserAgent().fake(),
-            Generator::CountryCode    => fake::faker::address::en::CountryCode().fake(),
-            Generator::TimeZone       => fake::faker::address::en::TimeZone().fake(),
+            Generator::IPv4 => fake::faker::internet::en::IPv4().fake(),
+            Generator::IPv6 => fake::faker::internet::en::IPv6().fake(),
+            Generator::MacAddress => fake::faker::internet::en::MACAddress().fake(),
+            Generator::UserAgent => fake::faker::internet::en::UserAgent().fake(),
+            Generator::CountryCode => fake::faker::address::en::CountryCode().fake(),
+            Generator::TimeZone => fake::faker::address::en::TimeZone().fake(),
             Generator::CreditCardNumber => fake::faker::creditcard::en::CreditCardNumber().fake(),
-            Generator::Bic            => fake::faker::finance::en::Bic().fake(),
-            Generator::CurrencyCode   => fake::faker::currency::en::CurrencyCode().fake(),
-            Generator::CurrencyName   => fake::faker::currency::en::CurrencyName().fake(),
+            Generator::Bic => fake::faker::finance::en::Bic().fake(),
+            Generator::CurrencyCode => fake::faker::currency::en::CurrencyCode().fake(),
+            Generator::CurrencyName => fake::faker::currency::en::CurrencyName().fake(),
             Generator::CurrencySymbol => fake::faker::currency::en::CurrencySymbol().fake(),
-            Generator::Latitude       => fake::faker::address::en::Latitude().fake(),
-            Generator::Longitude      => fake::faker::address::en::Longitude().fake(),
-            Generator::Geohash        => {
-                let precision = args.and_then(|a| a.get("precision")).and_then(|v| v.as_u64()).map(|v| v as u8).unwrap_or(6);
+            Generator::Latitude => fake::faker::address::en::Latitude().fake(),
+            Generator::Longitude => fake::faker::address::en::Longitude().fake(),
+            Generator::Geohash => {
+                let precision = args
+                    .and_then(|a| a.get("precision"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u8)
+                    .unwrap_or(6);
                 fake::faker::address::en::Geohash(precision).fake()
             }
             Generator::PositiveDecimal => format!("{:.4}", Faker.fake::<f64>().abs()),
-            Generator::Decimal        => format!("{:.4}", Faker.fake::<f64>()),
+            Generator::Decimal => format!("{:.4}", Faker.fake::<f64>()),
             Generator::NumberWithFormat => {
-                let fmt = args.and_then(|a| a.get("format")).and_then(|v| v.as_str()).unwrap_or("###");
+                let fmt = args
+                    .and_then(|a| a.get("format"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("###");
                 fake::faker::number::en::NumberWithFormat(fmt).fake()
             }
-            Generator::Uuid           => Faker.fake::<uuid::Uuid>().to_string(),
-            Generator::Isin           => fake::faker::finance::en::Isin().fake(),
-            Generator::Isbn           => fake::faker::barcode::en::Isbn().fake(),
-            Generator::Semver         => Faker.fake::<semver::Version>().to_string(),
-            Generator::Date => {
-                fake_date(None, None).format("%Y-%m-%d").to_string()
-            }
-            Generator::DateTime => {
-                fake_datetime(None, None).to_rfc3339()
-            }
+            Generator::Uuid => Faker.fake::<uuid::Uuid>().to_string(),
+            Generator::Isin => fake::faker::finance::en::Isin().fake(),
+            Generator::Isbn => fake::faker::barcode::en::Isbn().fake(),
+            Generator::Semver => Faker.fake::<semver::Version>().to_string(),
+            Generator::Date => fake_date(None, None).format("%Y-%m-%d").to_string(),
+            Generator::DateTime => fake_datetime(None, None).to_rfc3339(),
         },
     }
 }

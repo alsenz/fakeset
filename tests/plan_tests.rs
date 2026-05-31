@@ -1,7 +1,9 @@
 use fakeset::{
-    expand_variants::expand_field_variants, expressions::pull_down_expression_deps,
-    graph::build_dag, load_all_datasets,
-    plan::{build_plan, ExecutionStep},
+    expand_variants::expand_field_variants,
+    expressions::pull_down_expression_deps,
+    graph::build_dag,
+    load_all_datasets,
+    plan::{ExecutionStep, build_plan},
     rewrite::{expand_include_fields, resolve_refs},
     validate::validate,
 };
@@ -48,7 +50,11 @@ fn plan_err_for(fixture: &str) -> anyhow::Error {
 #[test]
 fn flat_dataset_produces_generate_then_write_steps() {
     let steps = plan_for("tests/fixtures/execute/flat");
-    assert_eq!(steps.len(), 2, "expected GenerateDataset + WriteSharedOutput");
+    assert_eq!(
+        steps.len(),
+        2,
+        "expected GenerateDataset + WriteSharedOutput"
+    );
     assert!(
         matches!(&steps[0], ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "person"),
         "expected GenerateDataset for person"
@@ -64,9 +70,9 @@ fn bernoulli_lower_cover_member_absorbed_not_standalone() {
     // single_sibling: source (parent, rows:20) and subset (lower cover member, ratio:0.5).
     // Only source should appear as a step; subset is absorbed into the group.
     let steps = plan_for("tests/fixtures/execute/single_sibling");
-    let has_standalone_subset = steps.iter().any(|s| {
-        matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "subset")
-    });
+    let has_standalone_subset = steps.iter().any(
+        |s| matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "subset"),
+    );
     assert!(
         !has_standalone_subset,
         "subset is a Bernoulli lower cover member and must not appear as a standalone GenerateDataset"
@@ -91,7 +97,10 @@ fn write_shared_output_step_appended_at_end() {
         .iter()
         .filter(|s| matches!(s, ExecutionStep::WriteSharedOutput { .. }))
         .count();
-    assert_eq!(write_count, 1, "exactly one WriteSharedOutput step expected");
+    assert_eq!(
+        write_count, 1,
+        "exactly one WriteSharedOutput step expected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -105,24 +114,28 @@ fn distribution_drives_parent_segment_row_counts() {
     // going to the segment that includes subset.
     let steps = plan_for("tests/fixtures/execute/single_sibling");
     let segments = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateLowerCoverGroup { parent, segments, .. }
-            if parent.name == "source" =>
-        {
-            Some(segments)
-        }
+        ExecutionStep::GenerateLowerCoverGroup {
+            parent, segments, ..
+        } if parent.name == "source" => Some(segments),
         _ => None,
     });
     let segments = segments.expect("GenerateLowerCoverGroup for source not found");
 
     let total: usize = segments.iter().map(|s| s.rows).sum();
-    assert_eq!(total, 20, "total segment rows should equal source's row count");
+    assert_eq!(
+        total, 20,
+        "total segment rows should equal source's row count"
+    );
 
     let member_rows: usize = segments
         .iter()
         .filter(|s| !s.members.is_empty())
         .map(|s| s.rows)
         .sum();
-    assert_eq!(member_rows, 10, "subset's segment should cover 20 × 0.5 = 10 rows");
+    assert_eq!(
+        member_rows, 10,
+        "subset's segment should cover 20 × 0.5 = 10 rows"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -138,9 +151,9 @@ fn ref_field_wired_as_inherited_on_includee() {
     // executor test test_ref_wiring_propagates_column_values.
     let steps = plan_for("tests/fixtures/execute/ref_wiring");
     let lower_cover_group = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateLowerCoverGroup { parent, members, .. } if parent.name == "source" => {
-            Some(members)
-        }
+        ExecutionStep::GenerateLowerCoverGroup {
+            parent, members, ..
+        } if parent.name == "source" => Some(members),
         _ => None,
     });
     let members = lower_cover_group.expect("GenerateLowerCoverGroup step for 'source' not found");
@@ -158,9 +171,9 @@ fn hidden_ref_field_wired_as_inherited() {
     // The actual hidden-field wiring is verified by the executor tests.
     let steps = plan_for("tests/fixtures/execute/expression_pulldown");
     let lower_cover_group = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateLowerCoverGroup { parent, members, .. } if parent.name == "source" => {
-            Some(members)
-        }
+        ExecutionStep::GenerateLowerCoverGroup {
+            parent, members, ..
+        } if parent.name == "source" => Some(members),
         _ => None,
     });
     let members = lower_cover_group.expect("GenerateLowerCoverGroup step for 'source' not found");
@@ -191,7 +204,10 @@ fn list_link_dataset_decomposes_into_witness_and_assemble() {
         ExecutionStep::GenerateLowerCoverGroup { parent, .. } => parent.name == "people",
         _ => false,
     });
-    assert!(people_not_staging, "people has no list-link fields, must have a non-staging generation step");
+    assert!(
+        people_not_staging,
+        "people has no list-link fields, must have a non-staging generation step"
+    );
 
     // events: has list-link field → must have a GenerateStagingNode step (not GenerateDataset)
     assert!(
@@ -254,7 +270,10 @@ fn bernoulli_list_link_parent_produces_staging_lower_cover_group() {
     let flat_pos = steps.iter().position(|s| {
         matches!(s, ExecutionStep::GenerateWitness { list_field_name, .. } if list_field_name == "picks")
     }).unwrap();
-    assert!(group_pos < flat_pos, "GenerateLowerCoverGroup must precede GenerateWitness");
+    assert!(
+        group_pos < flat_pos,
+        "GenerateLowerCoverGroup must precede GenerateWitness"
+    );
 }
 
 #[test]
@@ -262,9 +281,9 @@ fn non_ref_dataset_has_no_inherited_fields() {
     // flat/person has no includes and no includers with ref fields.
     let steps = plan_for("tests/fixtures/execute/flat");
     let inherited = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, inherited, .. } if dataset.name == "person" => {
-            Some(inherited)
-        }
+        ExecutionStep::GenerateDataset {
+            dataset, inherited, ..
+        } if dataset.name == "person" => Some(inherited),
         _ => None,
     });
     assert!(
@@ -286,37 +305,77 @@ fn variant_dataset_produces_n_generate_steps() {
     let variant_steps: Vec<_> = steps.iter().filter(|s| {
         matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name.starts_with("orders__v"))
     }).collect();
-    assert_eq!(variant_steps.len(), 3, "expected 3 variant GenerateDataset steps, got {}", variant_steps.len());
+    assert_eq!(
+        variant_steps.len(),
+        3,
+        "expected 3 variant GenerateDataset steps, got {}",
+        variant_steps.len()
+    );
 
     let write_steps: Vec<_> = steps.iter().filter(|s| {
         matches!(s, ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "orders")
     }).collect();
-    assert_eq!(write_steps.len(), 1, "expected exactly one WriteSharedOutput for 'orders'");
+    assert_eq!(
+        write_steps.len(),
+        1,
+        "expected exactly one WriteSharedOutput for 'orders'"
+    );
 }
 
 #[test]
 fn variant_rows_sum_to_parent_and_respect_distribution() {
     let steps = plan_for("tests/fixtures/execute/variants");
 
-    let total: usize = steps.iter().filter_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name.starts_with("orders__v") => Some(rows),
-        _ => None,
-    }).sum();
-    assert_eq!(total, 100, "variant row counts must sum to parent rows (100)");
+    let total: usize = steps
+        .iter()
+        .filter_map(|s| match s {
+            ExecutionStep::GenerateDataset { dataset, rows, .. }
+                if dataset.name.starts_with("orders__v") =>
+            {
+                Some(rows)
+            }
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        total, 100,
+        "variant row counts must sum to parent rows (100)"
+    );
 
     // v0 = 60%, v1 = 30%, v2 = 10% of 100
-    let v0 = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name == "orders__v0" => Some(*rows),
-        _ => None,
-    }).expect("orders__v0 step not found");
-    let v1 = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name == "orders__v1" => Some(*rows),
-        _ => None,
-    }).expect("orders__v1 step not found");
-    let v2 = steps.iter().find_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name == "orders__v2" => Some(*rows),
-        _ => None,
-    }).expect("orders__v2 step not found");
+    let v0 = steps
+        .iter()
+        .find_map(|s| match s {
+            ExecutionStep::GenerateDataset { dataset, rows, .. }
+                if dataset.name == "orders__v0" =>
+            {
+                Some(*rows)
+            }
+            _ => None,
+        })
+        .expect("orders__v0 step not found");
+    let v1 = steps
+        .iter()
+        .find_map(|s| match s {
+            ExecutionStep::GenerateDataset { dataset, rows, .. }
+                if dataset.name == "orders__v1" =>
+            {
+                Some(*rows)
+            }
+            _ => None,
+        })
+        .expect("orders__v1 step not found");
+    let v2 = steps
+        .iter()
+        .find_map(|s| match s {
+            ExecutionStep::GenerateDataset { dataset, rows, .. }
+                if dataset.name == "orders__v2" =>
+            {
+                Some(*rows)
+            }
+            _ => None,
+        })
+        .expect("orders__v2 step not found");
     assert_eq!(v0, 60);
     assert_eq!(v1, 30);
     assert_eq!(v2, 10);
@@ -332,10 +391,20 @@ fn variant_lower_cover_member_produces_lower_cover_groups_and_shared_outputs() {
     let lower_cover_groups: Vec<_> = steps.iter().filter(|s| {
         matches!(s, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name.starts_with("source__v"))
     }).collect();
-    assert_eq!(lower_cover_groups.len(), 2, "expected 2 GenerateLowerCoverGroup steps for variant parents");
+    assert_eq!(
+        lower_cover_groups.len(),
+        2,
+        "expected 2 GenerateLowerCoverGroup steps for variant parents"
+    );
 
-    let write_count = steps.iter().filter(|s| matches!(s, ExecutionStep::WriteSharedOutput { .. })).count();
-    assert_eq!(write_count, 2, "expected WriteSharedOutput for source and for subset");
+    let write_count = steps
+        .iter()
+        .filter(|s| matches!(s, ExecutionStep::WriteSharedOutput { .. }))
+        .count();
+    assert_eq!(
+        write_count, 2,
+        "expected WriteSharedOutput for source and for subset"
+    );
 }
 
 #[test]
@@ -347,17 +416,33 @@ fn field_variant_expands_to_correct_generate_steps() {
     let variant_steps: Vec<_> = steps.iter().filter(|s| {
         matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name.starts_with("orders__v"))
     }).collect();
-    assert_eq!(variant_steps.len(), 6, "expected 6 variant GenerateDataset steps, got {}", variant_steps.len());
+    assert_eq!(
+        variant_steps.len(),
+        6,
+        "expected 6 variant GenerateDataset steps, got {}",
+        variant_steps.len()
+    );
 
     let write_steps: Vec<_> = steps.iter().filter(|s| {
         matches!(s, ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "orders")
     }).collect();
-    assert_eq!(write_steps.len(), 1, "expected exactly one WriteSharedOutput for 'orders'");
+    assert_eq!(
+        write_steps.len(),
+        1,
+        "expected exactly one WriteSharedOutput for 'orders'"
+    );
 
-    let total_rows: usize = steps.iter().filter_map(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name.starts_with("orders__v") => Some(rows),
-        _ => None,
-    }).sum();
+    let total_rows: usize = steps
+        .iter()
+        .filter_map(|s| match s {
+            ExecutionStep::GenerateDataset { dataset, rows, .. }
+                if dataset.name.starts_with("orders__v") =>
+            {
+                Some(rows)
+            }
+            _ => None,
+        })
+        .sum();
     assert_eq!(total_rows, 120, "variant row counts must sum to 120");
 }
 
@@ -385,13 +470,24 @@ fn list_link_collect_produces_correct_step_sequence() {
     // the key invariant is that file write is deferred to the EmitDataset step
     // following AccumulateToLinked.
     let pool_defers_emit = steps.iter().any(|s| match s {
-        ExecutionStep::GenerateDataset { dataset, defer_emit: true, .. } => dataset.name == "pool",
+        ExecutionStep::GenerateDataset {
+            dataset,
+            defer_emit: true,
+            ..
+        } => dataset.name == "pool",
         ExecutionStep::GenerateStagingNode { dataset, .. } => dataset.name == "pool",
         ExecutionStep::GenerateStagingLowerCoverGroup { parent, .. } => parent.name == "pool",
-        ExecutionStep::GenerateLowerCoverGroup { parent, defer_emit: true, .. } => parent.name == "pool",
+        ExecutionStep::GenerateLowerCoverGroup {
+            parent,
+            defer_emit: true,
+            ..
+        } => parent.name == "pool",
         _ => false,
     });
-    assert!(pool_defers_emit, "pool is a collect target — file write must be deferred");
+    assert!(
+        pool_defers_emit,
+        "pool is a collect target — file write must be deferred"
+    );
 
     // GenerateWitness for 'items' must be present
     assert!(
@@ -405,11 +501,15 @@ fn list_link_collect_produces_correct_step_sequence() {
         ExecutionStep::AccumulateToLinked { source_field, linked_field, .. }
         if source_field == "item" && linked_field == "collected_labels"
     );
-    assert!(collect_step.is_some(), "expected AccumulateToLinked for item → pool.collected_labels");
+    assert!(
+        collect_step.is_some(),
+        "expected AccumulateToLinked for item → pool.collected_labels"
+    );
 
     // EmitDataset for pool must be present
     assert!(
-        find_step!(steps, ExecutionStep::EmitDataset { dataset, .. } if dataset.name == "pool").is_some(),
+        find_step!(steps, ExecutionStep::EmitDataset { dataset, .. } if dataset.name == "pool")
+            .is_some(),
         "expected EmitDataset step for 'pool'"
     );
 
@@ -426,16 +526,28 @@ fn list_link_collect_produces_correct_step_sequence() {
     let collect_pos = steps.iter().position(|s| {
         matches!(s, ExecutionStep::AccumulateToLinked { linked_field, .. } if linked_field == "collected_labels")
     }).expect("AccumulateToLinked not found");
-    let emit_pos = steps.iter().position(|s| {
-        matches!(s, ExecutionStep::EmitDataset { dataset, .. } if dataset.name == "pool")
-    }).expect("EmitDataset[pool] not found");
+    let emit_pos = steps
+        .iter()
+        .position(
+            |s| matches!(s, ExecutionStep::EmitDataset { dataset, .. } if dataset.name == "pool"),
+        )
+        .expect("EmitDataset[pool] not found");
     let assemble_pos = steps.iter().position(|s| {
         matches!(s, ExecutionStep::AssembleFromWitness { dataset, .. } if dataset.name == "outer")
     }).expect("AssembleFromWitness not found");
 
-    assert!(flat_pos < collect_pos, "GenerateWitness must precede AccumulateToLinked");
-    assert!(collect_pos < emit_pos,  "AccumulateToLinked must precede EmitDataset[pool]");
-    assert!(emit_pos < assemble_pos, "EmitDataset[pool] must precede AssembleFromWitness");
+    assert!(
+        flat_pos < collect_pos,
+        "GenerateWitness must precede AccumulateToLinked"
+    );
+    assert!(
+        collect_pos < emit_pos,
+        "AccumulateToLinked must precede EmitDataset[pool]"
+    );
+    assert!(
+        emit_pos < assemble_pos,
+        "EmitDataset[pool] must precede AssembleFromWitness"
+    );
 }
 
 // ---------------------------------------------------------------------------

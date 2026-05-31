@@ -4,7 +4,10 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::models::{resolve_distributions, Field, FieldType, FieldVariant, ParquetConfig, Schema, SyntheticDataset, VariantSchema};
+use crate::models::{
+    Field, FieldType, FieldVariant, ParquetConfig, Schema, SyntheticDataset, VariantSchema,
+    resolve_distributions,
+};
 
 /// Replace all `type: variant` fields in every dataset with global `VariantSchema` entries.
 ///
@@ -88,7 +91,11 @@ fn build_local_combinations(variant_paths: &VariantPaths) -> Vec<VariantSchema> 
 
     combos
         .into_iter()
-        .map(|(dist, data)| VariantSchema { data, ratio: Some(dist), locale: None })
+        .map(|(dist, data)| VariantSchema {
+            data,
+            ratio: Some(dist),
+            locale: None,
+        })
         .collect()
 }
 
@@ -124,7 +131,11 @@ fn cross_product_variants(
 /// Build a Field (possibly nested in Object wrappers) representing one Cartesian
 /// choice for the field at `path`.  `outer_parquet` is the parent field's parquet
 /// config and is used as a fallback when the variant choice has no parquet override.
-fn build_delta_field(path: &[String], variant: &FieldVariant, outer_parquet: Option<&ParquetConfig>) -> Field {
+fn build_delta_field(
+    path: &[String],
+    variant: &FieldVariant,
+    outer_parquet: Option<&ParquetConfig>,
+) -> Field {
     if path.len() == 1 {
         let parquet = variant.parquet.clone().or_else(|| outer_parquet.cloned());
         let field_type = infer_field_type(variant);
@@ -151,9 +162,15 @@ fn build_delta_field(path: &[String], variant: &FieldVariant, outer_parquet: Opt
 /// Infer the concrete `FieldType` for a variant choice that omits `type`.
 /// Priority: explicit type > range present (→ Number) > value type (string/number/bool).
 fn infer_field_type(variant: &FieldVariant) -> Option<FieldType> {
-    variant.field_type.clone()
+    variant
+        .field_type
+        .clone()
         .or_else(|| {
-            if variant.range.as_ref().is_some_and(|r| r.min.is_some() || r.max.is_some()) {
+            if variant
+                .range
+                .as_ref()
+                .is_some_and(|r| r.min.is_some() || r.max.is_some())
+            {
                 Some(FieldType::Number)
             } else {
                 None
@@ -161,10 +178,15 @@ fn infer_field_type(variant: &FieldVariant) -> Option<FieldType> {
         })
         .or_else(|| {
             variant.value.as_ref().and_then(|v| {
-                if v.is_string()  { Some(FieldType::String)  }
-                else if v.is_number() { Some(FieldType::Number) }
-                else if v.is_bool()   { Some(FieldType::Boolean) }
-                else { None }
+                if v.is_string() {
+                    Some(FieldType::String)
+                } else if v.is_number() {
+                    Some(FieldType::Number)
+                } else if v.is_bool() {
+                    Some(FieldType::Boolean)
+                } else {
+                    None
+                }
             })
         })
 }
@@ -212,20 +234,26 @@ fn stub_variant_fields(schema: &mut Schema, variant_paths: &VariantPaths, prefix
         if matches!(field.field_type, Some(FieldType::Variant)) {
             let mut path = prefix.to_vec();
             path.push(field.name.clone());
-            let unified_type = variant_paths
-                .iter()
-                .find(|(p, _, _)| p == &path)
-                .and_then(|(_, choices, _)| {
-                    let types: Vec<_> = choices.iter().filter_map(|v| infer_field_type(v)).collect();
-                    if types.is_empty() {
-                        None
-                    } else if types.windows(2).all(|w| w[0] == w[1]) {
-                        types.into_iter().next()
-                    } else {
-                        None // mixed types — leave untyped
-                    }
-                });
-            *field = Field { name: field.name.clone(), field_type: unified_type, ..Default::default() };
+            let unified_type =
+                variant_paths
+                    .iter()
+                    .find(|(p, _, _)| p == &path)
+                    .and_then(|(_, choices, _)| {
+                        let types: Vec<_> =
+                            choices.iter().filter_map(|v| infer_field_type(v)).collect();
+                        if types.is_empty() {
+                            None
+                        } else if types.windows(2).all(|w| w[0] == w[1]) {
+                            types.into_iter().next()
+                        } else {
+                            None // mixed types — leave untyped
+                        }
+                    });
+            *field = Field {
+                name: field.name.clone(),
+                field_type: unified_type,
+                ..Default::default()
+            };
         } else if matches!(field.field_type, Some(FieldType::Object)) {
             let mut path = prefix.to_vec();
             path.push(field.name.clone());
@@ -278,12 +306,13 @@ mod tests {
 
     #[test]
     fn single_variant_field_produces_n_global_variants() {
-        let ds = bare_ds(vec![
-            make_variant_field("status", vec![
-                string_choice("active",   Some(0.6)),
+        let ds = bare_ds(vec![make_variant_field(
+            "status",
+            vec![
+                string_choice("active", Some(0.6)),
                 string_choice("inactive", Some(0.4)),
-            ]),
-        ]);
+            ],
+        )]);
 
         let mut map = HashMap::new();
         map.insert(PathBuf::from("/a/test.yaml"), ds);
@@ -291,7 +320,11 @@ mod tests {
         let ds = result.values().next().unwrap();
 
         assert_eq!(ds.variants.len(), 2);
-        assert!(ds.data.iter().all(|f| !matches!(f.field_type, Some(FieldType::Variant))));
+        assert!(
+            ds.data
+                .iter()
+                .all(|f| !matches!(f.field_type, Some(FieldType::Variant)))
+        );
 
         let dists: Vec<f64> = ds.variants.iter().map(|v| v.ratio.unwrap()).collect();
         assert!((dists[0] - 0.6).abs() < 1e-9);
@@ -301,15 +334,21 @@ mod tests {
     #[test]
     fn two_variant_fields_produce_cartesian_product() {
         let ds = bare_ds(vec![
-            make_variant_field("status", vec![
-                string_choice("active",   Some(0.6)),
-                string_choice("inactive", Some(0.4)),
-            ]),
-            make_variant_field("tier", vec![
-                string_choice("gold",   Some(0.2)),
-                string_choice("silver", Some(0.3)),
-                string_choice("bronze", Some(0.5)),
-            ]),
+            make_variant_field(
+                "status",
+                vec![
+                    string_choice("active", Some(0.6)),
+                    string_choice("inactive", Some(0.4)),
+                ],
+            ),
+            make_variant_field(
+                "tier",
+                vec![
+                    string_choice("gold", Some(0.2)),
+                    string_choice("silver", Some(0.3)),
+                    string_choice("bronze", Some(0.5)),
+                ],
+            ),
         ]);
 
         let mut map = HashMap::new();
@@ -320,18 +359,34 @@ mod tests {
         assert_eq!(ds.variants.len(), 6, "2 × 3 = 6 combinations");
 
         let sum: f64 = ds.variants.iter().map(|v| v.ratio.unwrap()).sum();
-        assert!((sum - 1.0).abs() < 1e-9, "joint distributions must sum to 1.0; got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "joint distributions must sum to 1.0; got {sum}"
+        );
     }
 
     #[test]
     fn free_distributions_split_remainder_equally() {
-        let ds = bare_ds(vec![
-            make_variant_field("x", vec![
-                FieldVariant { field_type: Some(FieldType::String), ratio: None, ..Default::default() },
-                FieldVariant { field_type: Some(FieldType::String), ratio: None, ..Default::default() },
-                FieldVariant { field_type: Some(FieldType::String), ratio: None, ..Default::default() },
-            ]),
-        ]);
+        let ds = bare_ds(vec![make_variant_field(
+            "x",
+            vec![
+                FieldVariant {
+                    field_type: Some(FieldType::String),
+                    ratio: None,
+                    ..Default::default()
+                },
+                FieldVariant {
+                    field_type: Some(FieldType::String),
+                    ratio: None,
+                    ..Default::default()
+                },
+                FieldVariant {
+                    field_type: Some(FieldType::String),
+                    ratio: None,
+                    ..Default::default()
+                },
+            ],
+        )]);
         let mut map = HashMap::new();
         map.insert(PathBuf::from("/a/test.yaml"), ds);
         let result = expand_field_variants(map).unwrap();
@@ -343,16 +398,22 @@ mod tests {
 
     #[test]
     fn cross_product_with_existing_global_variants() {
-        let mut ds = bare_ds(vec![
-            make_variant_field("status", vec![
-                string_choice("a", Some(0.5)),
-                string_choice("b", Some(0.5)),
-            ]),
-        ]);
+        let mut ds = bare_ds(vec![make_variant_field(
+            "status",
+            vec![string_choice("a", Some(0.5)), string_choice("b", Some(0.5))],
+        )]);
         // Two existing global variants (50/50)
         ds.variants = vec![
-            VariantSchema { data: vec![], ratio: Some(0.5), locale: None },
-            VariantSchema { data: vec![], ratio: Some(0.5), locale: None },
+            VariantSchema {
+                data: vec![],
+                ratio: Some(0.5),
+                locale: None,
+            },
+            VariantSchema {
+                data: vec![],
+                ratio: Some(0.5),
+                locale: None,
+            },
         ];
 
         let mut map = HashMap::new();
@@ -368,10 +429,13 @@ mod tests {
 
     #[test]
     fn nested_object_variant_field_is_collected() {
-        let nested_variant = make_variant_field("priority", vec![
-            string_choice("high", Some(0.3)),
-            string_choice("low",  Some(0.7)),
-        ]);
+        let nested_variant = make_variant_field(
+            "priority",
+            vec![
+                string_choice("high", Some(0.3)),
+                string_choice("low", Some(0.7)),
+            ],
+        );
         let object_field = Field {
             name: "metadata".to_string(),
             field_type: Some(FieldType::Object),
@@ -388,14 +452,21 @@ mod tests {
         assert_eq!(ds.variants.len(), 2);
         // The delta schema should contain a metadata object with a priority sub-field
         let v0 = &ds.variants[0];
-        let meta = v0.data.iter().find(|f| f.name == "metadata").expect("metadata in delta");
+        let meta = v0
+            .data
+            .iter()
+            .find(|f| f.name == "metadata")
+            .expect("metadata in delta");
         assert!(meta.fields.iter().any(|f| f.name == "priority"));
     }
 
     #[test]
     fn range_only_variant_infers_number_type() {
         let choice = FieldVariant {
-            range: Some(Range { min: Some(1.0), max: Some(10.0) }),
+            range: Some(Range {
+                min: Some(1.0),
+                max: Some(10.0),
+            }),
             ratio: Some(1.0),
             ..Default::default()
         };
@@ -417,23 +488,35 @@ mod tests {
     #[test]
     fn outer_parquet_propagates_to_delta_when_inner_absent() {
         use crate::models::{ParquetConfig, ParquetDatatype};
-        let outer_parquet = ParquetConfig { datatype: ParquetDatatype::Int32 };
+        let outer_parquet = ParquetConfig {
+            datatype: ParquetDatatype::Int32,
+        };
         let choice = FieldVariant {
             field_type: Some(FieldType::Number),
-            range: Some(Range { min: Some(0.0), max: Some(100.0) }),
+            range: Some(Range {
+                min: Some(0.0),
+                max: Some(100.0),
+            }),
             ratio: Some(1.0),
             parquet: None,
             ..Default::default()
         };
         let delta = build_delta_field(&["amount".to_string()], &choice, Some(&outer_parquet));
-        assert_eq!(delta.parquet.as_ref().map(|p| &p.datatype), Some(&ParquetDatatype::Int32));
+        assert_eq!(
+            delta.parquet.as_ref().map(|p| &p.datatype),
+            Some(&ParquetDatatype::Int32)
+        );
     }
 
     #[test]
     fn inner_parquet_overrides_outer() {
         use crate::models::{ParquetConfig, ParquetDatatype};
-        let outer_parquet = ParquetConfig { datatype: ParquetDatatype::Int32 };
-        let inner_parquet = ParquetConfig { datatype: ParquetDatatype::Float32 };
+        let outer_parquet = ParquetConfig {
+            datatype: ParquetDatatype::Int32,
+        };
+        let inner_parquet = ParquetConfig {
+            datatype: ParquetDatatype::Float32,
+        };
         let choice = FieldVariant {
             field_type: Some(FieldType::Number),
             ratio: Some(1.0),
@@ -441,6 +524,9 @@ mod tests {
             ..Default::default()
         };
         let delta = build_delta_field(&["x".to_string()], &choice, Some(&outer_parquet));
-        assert_eq!(delta.parquet.as_ref().map(|p| &p.datatype), Some(&ParquetDatatype::Float32));
+        assert_eq!(
+            delta.parquet.as_ref().map(|p| &p.datatype),
+            Some(&ParquetDatatype::Float32)
+        );
     }
 }

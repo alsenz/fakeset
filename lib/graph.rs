@@ -1,19 +1,18 @@
 //! DAG construction and topological sort. `build_dag` encodes the concept semi-lattice
 //! as a petgraph `DiGraph` and topo-sorts it so atoms (most-constrained nodes) are
 //! always visited before their parents.
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use petgraph::algo::toposort;
 use petgraph::graph::DiGraph;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::models::{resolve_include, SyntheticDataset};
+use crate::models::{SyntheticDataset, resolve_include};
 
 #[derive(Debug)]
 pub struct DatasetGraph {
     pub graph: DiGraph<PathBuf, ()>,
 }
-
 
 /// Build the DAG that drives execution order.
 ///
@@ -71,11 +70,7 @@ pub fn build_dag(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<Datase
         // (data provider) before this dataset (data consumer).
         for link in &dataset.links {
             let canonical = resolve_include(path, &link.file).ok_or_else(|| {
-                anyhow!(
-                    "{}: linked file not found: {}",
-                    path.display(),
-                    link.file
-                )
+                anyhow!("{}: linked file not found: {}", path.display(), link.file)
             })?;
             let to = node_indices.get(&canonical).ok_or_else(|| {
                 anyhow!(

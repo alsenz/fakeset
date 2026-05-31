@@ -28,8 +28,14 @@ fn test_list_content_include_orders_provider_before_consumer() {
         }
     }
 
-    let people_pos = order.iter().position(|n| n == "people").expect("'people' not in topo order");
-    let events_pos = order.iter().position(|n| n == "events").expect("'events' not in topo order");
+    let people_pos = order
+        .iter()
+        .position(|n| n == "people")
+        .expect("'people' not in topo order");
+    let events_pos = order
+        .iter()
+        .position(|n| n == "events")
+        .expect("'events' not in topo order");
     assert!(
         people_pos < events_pos,
         "people (list-content provider) must precede events (consumer) in topo order; got: {order:?}"

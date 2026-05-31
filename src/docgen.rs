@@ -154,19 +154,37 @@ fn main() {
         variants: None,
     });
 
-    types.insert("FieldVariant".into(), TypeDoc {
-        description: "One alternative within a type: variant field.".into(),
-        fields: Some(vec![
-            f("type",      "FieldType?",      false, "Type for this variant."),
-            f("generator", "Generator?",      false, "Generator for this variant."),
-            f("locale",    "Locale?",         false, "Locale for this variant."),
-            f("range",     "Range?",          false, "Numeric range for this variant."),
-            f("value",     "any?",            false, "Constant value for this variant."),
-            f("parquet",   "ParquetConfig?",  false, "Type override for this variant. Falls back to parent field parquet."),
-            f("ratio",     "float?",          false, "Fraction allocated to this choice. Unset choices share the remainder equally."),
-        ]),
-        variants: None,
-    });
+    types.insert(
+        "FieldVariant".into(),
+        TypeDoc {
+            description: "One alternative within a type: variant field.".into(),
+            fields: Some(vec![
+                f("type", "FieldType?", false, "Type for this variant."),
+                f(
+                    "generator",
+                    "Generator?",
+                    false,
+                    "Generator for this variant.",
+                ),
+                f("locale", "Locale?", false, "Locale for this variant."),
+                f("range", "Range?", false, "Numeric range for this variant."),
+                f("value", "any?", false, "Constant value for this variant."),
+                f(
+                    "parquet",
+                    "ParquetConfig?",
+                    false,
+                    "Type override for this variant. Falls back to parent field parquet.",
+                ),
+                f(
+                    "ratio",
+                    "float?",
+                    false,
+                    "Fraction allocated to this choice. Unset choices share the remainder equally.",
+                ),
+            ]),
+            variants: None,
+        },
+    );
 
     types.insert("VariantSchema".into(), TypeDoc {
         description: "One concrete variant of a dataset (used in variants:).".into(),
@@ -178,32 +196,62 @@ fn main() {
         variants: None,
     });
 
-    types.insert("CountSpec".into(), TypeDoc {
-        description: "Specifies a count — fixed integer, uniform range, or normal distribution.".into(),
-        fields: None,
-        variants: Some(vec![
-            ev("5",                                  "Fixed count."),
-            ev("{ min: 2, max: 8 }",                "Uniform random integer in [min, max]."),
-            ev("{ mean: 5.0, std_dev: 2.0 }",       "Normal distribution, rounded and clamped ≥ 0."),
-        ]),
-    });
+    types.insert(
+        "CountSpec".into(),
+        TypeDoc {
+            description:
+                "Specifies a count — fixed integer, uniform range, or normal distribution.".into(),
+            fields: None,
+            variants: Some(vec![
+                ev("5", "Fixed count."),
+                ev(
+                    "{ min: 2, max: 8 }",
+                    "Uniform random integer in [min, max].",
+                ),
+                ev(
+                    "{ mean: 5.0, std_dev: 2.0 }",
+                    "Normal distribution, rounded and clamped ≥ 0.",
+                ),
+            ]),
+        },
+    );
 
-    types.insert("Range".into(), TypeDoc {
-        description: "Inclusive numeric bounds for number fields. Either bound may be omitted.".into(),
-        fields: Some(vec![
-            f("min", "float?", false, "Lower bound (inclusive). Omit for unbounded."),
-            f("max", "float?", false, "Upper bound (inclusive). Omit for unbounded."),
-        ]),
-        variants: None,
-    });
+    types.insert(
+        "Range".into(),
+        TypeDoc {
+            description: "Inclusive numeric bounds for number fields. Either bound may be omitted."
+                .into(),
+            fields: Some(vec![
+                f(
+                    "min",
+                    "float?",
+                    false,
+                    "Lower bound (inclusive). Omit for unbounded.",
+                ),
+                f(
+                    "max",
+                    "float?",
+                    false,
+                    "Upper bound (inclusive). Omit for unbounded.",
+                ),
+            ]),
+            variants: None,
+        },
+    );
 
-    types.insert("ParquetConfig".into(), TypeDoc {
-        description: "Override the Arrow/Parquet type for a field.".into(),
-        fields: Some(vec![
-            f("datatype", "ParquetDatatype", true, "Target Arrow datatype."),
-        ]),
-        variants: None,
-    });
+    types.insert(
+        "ParquetConfig".into(),
+        TypeDoc {
+            description: "Override the Arrow/Parquet type for a field.".into(),
+            fields: Some(vec![f(
+                "datatype",
+                "ParquetDatatype",
+                true,
+                "Target Arrow datatype.",
+            )]),
+            variants: None,
+        },
+    );
 
     types.insert("FieldType".into(), TypeDoc {
         description: "Column data type.".into(),
@@ -220,50 +268,59 @@ fn main() {
         ]),
     });
 
-    types.insert("Format".into(), TypeDoc {
-        description: "Output file format.".into(),
-        fields: None,
-        variants: Some(vec![
-            ev("parquet", "Apache Parquet columnar format."),
-            ev("csv",     "Comma-separated values."),
-            ev("json",    "JSON array of objects."),
-            ev("jsonl",   "Newline-delimited JSON (one object per line)."),
-        ]),
-    });
+    types.insert(
+        "Format".into(),
+        TypeDoc {
+            description: "Output file format.".into(),
+            fields: None,
+            variants: Some(vec![
+                ev("parquet", "Apache Parquet columnar format."),
+                ev("csv", "Comma-separated values."),
+                ev("json", "JSON array of objects."),
+                ev("jsonl", "Newline-delimited JSON (one object per line)."),
+            ]),
+        },
+    );
 
-    types.insert("Reducer".into(), TypeDoc {
-        description: "How values are assembled when a ref spans a cardinality boundary.".into(),
-        fields: None,
-        variants: Some(vec![
-            ev("take_one (alias: take_first)", "Take the first value."),
-            ev("sum",     "Sum numeric values."),
-            ev("max",     "Maximum value."),
-            ev("min",     "Minimum value."),
-            ev("collect", "Gather all values as a list."),
-        ]),
-    });
+    types.insert(
+        "Reducer".into(),
+        TypeDoc {
+            description: "How values are assembled when a ref spans a cardinality boundary.".into(),
+            fields: None,
+            variants: Some(vec![
+                ev("take_one (alias: take_first)", "Take the first value."),
+                ev("sum", "Sum numeric values."),
+                ev("max", "Maximum value."),
+                ev("min", "Minimum value."),
+                ev("collect", "Gather all values as a list."),
+            ]),
+        },
+    );
 
-    types.insert("ParquetDatatype".into(), TypeDoc {
-        description: "Valid values for parquet.datatype.".into(),
-        fields: None,
-        variants: Some(vec![
-            ev("int8",         "Arrow Int8."),
-            ev("int16",        "Arrow Int16."),
-            ev("int32",        "Arrow Int32."),
-            ev("int64",        "Arrow Int64."),
-            ev("uint8",        "Arrow UInt8."),
-            ev("uint16",       "Arrow UInt16."),
-            ev("uint32",       "Arrow UInt32."),
-            ev("uint64",       "Arrow UInt64."),
-            ev("float32",      "Arrow Float32."),
-            ev("float64",      "Arrow Float64."),
-            ev("utf8",         "Arrow Utf8 (string)."),
-            ev("boolean",      "Arrow Boolean."),
-            ev("date32",       "Arrow Date32."),
-            ev("timestamp_ms", "Arrow Timestamp (millisecond)."),
-            ev("timestamp_us", "Arrow Timestamp (microsecond)."),
-        ]),
-    });
+    types.insert(
+        "ParquetDatatype".into(),
+        TypeDoc {
+            description: "Valid values for parquet.datatype.".into(),
+            fields: None,
+            variants: Some(vec![
+                ev("int8", "Arrow Int8."),
+                ev("int16", "Arrow Int16."),
+                ev("int32", "Arrow Int32."),
+                ev("int64", "Arrow Int64."),
+                ev("uint8", "Arrow UInt8."),
+                ev("uint16", "Arrow UInt16."),
+                ev("uint32", "Arrow UInt32."),
+                ev("uint64", "Arrow UInt64."),
+                ev("float32", "Arrow Float32."),
+                ev("float64", "Arrow Float64."),
+                ev("utf8", "Arrow Utf8 (string)."),
+                ev("boolean", "Arrow Boolean."),
+                ev("date32", "Arrow Date32."),
+                ev("timestamp_ms", "Arrow Timestamp (millisecond)."),
+                ev("timestamp_us", "Arrow Timestamp (microsecond)."),
+            ]),
+        },
+    );
 
     types.insert("Generator".into(), TypeDoc {
         description: "Specific fake-rs generator. See the Generators & Locales reference for details.".into(),
@@ -320,29 +377,37 @@ fn main() {
         ]),
     });
 
-    types.insert("Locale".into(), TypeDoc {
-        description: "BCP-47-style locale tag. Only valid on generators that support locale selection.".into(),
-        fields: None,
-        variants: Some(vec![
-            ev("en",    "English."),
-            ev("fr_fr", "French (France)."),
-            ev("de_de", "German (Germany)."),
-            ev("it_it", "Italian (Italy)."),
-            ev("nl_nl", "Dutch (Netherlands)."),
-            ev("pt_br", "Portuguese (Brazil)."),
-            ev("pt_pt", "Portuguese (Portugal)."),
-            ev("cy_gb", "Welsh (UK)."),
-            ev("zh_cn", "Chinese (Simplified)."),
-            ev("zh_tw", "Chinese (Traditional)."),
-            ev("ja_jp", "Japanese."),
-            ev("ar_sa", "Arabic (Saudi Arabia)."),
-            ev("tr_tr", "Turkish."),
-            ev("fa_ir", "Persian (Iran)."),
-        ]),
-    });
+    types.insert(
+        "Locale".into(),
+        TypeDoc {
+            description:
+                "BCP-47-style locale tag. Only valid on generators that support locale selection."
+                    .into(),
+            fields: None,
+            variants: Some(vec![
+                ev("en", "English."),
+                ev("fr_fr", "French (France)."),
+                ev("de_de", "German (Germany)."),
+                ev("it_it", "Italian (Italy)."),
+                ev("nl_nl", "Dutch (Netherlands)."),
+                ev("pt_br", "Portuguese (Brazil)."),
+                ev("pt_pt", "Portuguese (Portugal)."),
+                ev("cy_gb", "Welsh (UK)."),
+                ev("zh_cn", "Chinese (Simplified)."),
+                ev("zh_tw", "Chinese (Traditional)."),
+                ev("ja_jp", "Japanese."),
+                ev("ar_sa", "Arabic (Saudi Arabia)."),
+                ev("tr_tr", "Turkish."),
+                ev("fa_ir", "Persian (Iran)."),
+            ]),
+        },
+    );
 
     let doc = SchemaDoc { types };
-    println!("{}", serde_json::to_string_pretty(&doc).expect("JSON serialization failed"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&doc).expect("JSON serialization failed")
+    );
 }
 
 fn f(name: &str, ty: &str, required: bool, description: &str) -> FieldDoc {

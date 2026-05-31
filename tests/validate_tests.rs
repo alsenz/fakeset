@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 #[test]
 fn test_rows_with_distribution_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/rows_with_distribution")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/rows_with_distribution",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
@@ -11,32 +13,47 @@ fn test_rows_with_distribution_errors() {
     assert!(msg.contains("ratio"), "error should mention `ratio`: {msg}");
 }
 
-
 #[test]
 fn test_no_warnings_for_valid_datasets() {
     let paths = vec![PathBuf::from("tests/fixtures/basic")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let warnings = validate(&datasets).expect("should not error");
-    assert!(warnings.is_empty(), "expected no warnings; got: {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings; got: {warnings:?}"
+    );
 }
 
 #[test]
 fn test_fields_on_non_object_field_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/schema_on_non_object")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/schema_on_non_object",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("fields"), "error should mention `fields`: {msg}");
-    assert!(msg.contains("object"), "error should mention `object`: {msg}");
+    assert!(
+        msg.contains("fields"),
+        "error should mention `fields`: {msg}"
+    );
+    assert!(
+        msg.contains("object"),
+        "error should mention `object`: {msg}"
+    );
 }
 
 #[test]
 fn test_content_on_non_list_field_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/content_on_non_list")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/content_on_non_list",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("content"), "error should mention `content`: {msg}");
+    assert!(
+        msg.contains("content"),
+        "error should mention `content`: {msg}"
+    );
     assert!(msg.contains("list"), "error should mention `list`: {msg}");
 }
 
@@ -52,7 +69,9 @@ fn test_ref_with_type_errors() {
 
 #[test]
 fn test_ref_missing_include_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/ref_missing_include")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/ref_missing_include",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
@@ -79,27 +98,43 @@ fn test_valid_generator_passes() {
     let paths = vec![PathBuf::from("tests/fixtures/validation/valid_generator")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let warnings = validate(&datasets).expect("should not error");
-    assert!(warnings.is_empty(), "expected no warnings; got: {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings; got: {warnings:?}"
+    );
 }
 
 #[test]
 fn test_generator_type_mismatch_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/generator_type_mismatch")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/generator_type_mismatch",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("generator"), "error should mention `generator`: {msg}");
-    assert!(msg.contains("first_name"), "error should name the generator: {msg}");
-    assert!(msg.contains("number"), "error should mention the type: {msg}");
+    assert!(
+        msg.contains("generator"),
+        "error should mention `generator`: {msg}"
+    );
+    assert!(
+        msg.contains("first_name"),
+        "error should name the generator: {msg}"
+    );
+    assert!(
+        msg.contains("number"),
+        "error should mention the type: {msg}"
+    );
 }
-
 
 #[test]
 fn test_valid_refs_passes_validation() {
     let paths = vec![PathBuf::from("tests/fixtures/validation/valid_refs")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let warnings = validate(&datasets).expect("should not error");
-    assert!(warnings.is_empty(), "expected no warnings; got: {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings; got: {warnings:?}"
+    );
 }
 
 #[test]
@@ -107,7 +142,10 @@ fn test_valid_min_max_passes() {
     let paths = vec![PathBuf::from("tests/fixtures/validation/valid_min_max")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let warnings = validate(&datasets).expect("should not error");
-    assert!(warnings.is_empty(), "expected no warnings; got: {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings; got: {warnings:?}"
+    );
 }
 
 #[test]
@@ -116,7 +154,10 @@ fn test_min_max_on_non_number_errors() {
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("number"), "error should mention `number`: {msg}");
+    assert!(
+        msg.contains("number"),
+        "error should mention `number`: {msg}"
+    );
 }
 
 #[test]
@@ -134,22 +175,32 @@ fn test_valid_value_passes() {
     let paths = vec![PathBuf::from("tests/fixtures/validation/valid_value")];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let warnings = validate(&datasets).expect("should not error");
-    assert!(warnings.is_empty(), "expected no warnings; got: {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings; got: {warnings:?}"
+    );
 }
 
 #[test]
 fn test_value_with_generator_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/value_with_generator")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/value_with_generator",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
     assert!(msg.contains("value"), "error should mention `value`: {msg}");
-    assert!(msg.contains("generator"), "error should mention `generator`: {msg}");
+    assert!(
+        msg.contains("generator"),
+        "error should mention `generator`: {msg}"
+    );
 }
 
 #[test]
 fn test_value_with_min_max_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/value_with_min_max")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/value_with_min_max",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
@@ -163,62 +214,95 @@ fn test_valid_expression_passes_validation() {
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let datasets = pull_down_expression_deps(&datasets).expect("pull_down should succeed");
     let warnings = validate(&datasets).expect("valid expression should pass validation");
-    assert!(warnings.is_empty(), "expected no warnings; got: {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings; got: {warnings:?}"
+    );
 }
 
 #[test]
 fn test_expression_with_type_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/expression_with_type")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/expression_with_type",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("expression"), "error should mention `expression`: {msg}");
+    assert!(
+        msg.contains("expression"),
+        "error should mention `expression`: {msg}"
+    );
     assert!(msg.contains("type"), "error should mention `type`: {msg}");
 }
 
 #[test]
 fn test_expression_with_ref_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/expression_with_ref")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/expression_with_ref",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("expression"), "error should mention `expression`: {msg}");
+    assert!(
+        msg.contains("expression"),
+        "error should mention `expression`: {msg}"
+    );
     assert!(msg.contains("ref"), "error should mention `ref`: {msg}");
 }
 
 #[test]
 fn test_expression_with_value_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/expression_with_value")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/expression_with_value",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("expression"), "error should mention `expression`: {msg}");
+    assert!(
+        msg.contains("expression"),
+        "error should mention `expression`: {msg}"
+    );
     assert!(msg.contains("value"), "error should mention `value`: {msg}");
 }
 
 #[test]
 fn test_expression_with_generator_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/expression_with_generator")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/expression_with_generator",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("expression"), "error should mention `expression`: {msg}");
-    assert!(msg.contains("generator"), "error should mention `generator`: {msg}");
+    assert!(
+        msg.contains("expression"),
+        "error should mention `expression`: {msg}"
+    );
+    assert!(
+        msg.contains("generator"),
+        "error should mention `generator`: {msg}"
+    );
 }
 
 #[test]
 fn test_expression_with_min_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/expression_with_min")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/expression_with_min",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("expression"), "error should mention `expression`: {msg}");
+    assert!(
+        msg.contains("expression"),
+        "error should mention `expression`: {msg}"
+    );
     assert!(msg.contains("range"), "error should mention `range`: {msg}");
 }
 
 #[test]
 fn test_expression_forward_ref_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/expression_forward_ref")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/expression_forward_ref",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let datasets = pull_down_expression_deps(&datasets).expect("pull_down should succeed");
     let err = validate(&datasets).expect_err("should fail validation");
@@ -235,8 +319,9 @@ fn test_expression_forward_ref_errors() {
 
 #[test]
 fn test_list_link_include_scoped_ref_with_type_errors() {
-    let paths =
-        vec![PathBuf::from("tests/fixtures/validation/list_link_include_scoped_with_type")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/list_link_include_scoped_with_type",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("linked-scoped ref with type: should error");
     let msg = err.to_string();
@@ -249,8 +334,9 @@ fn test_list_link_include_scoped_ref_with_type_errors() {
 
 #[test]
 fn test_list_link_outer_scoped_ref_without_type_errors() {
-    let paths =
-        vec![PathBuf::from("tests/fixtures/validation/list_link_outer_scoped_no_type")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/list_link_outer_scoped_no_type",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("outer-scoped ref without type: should error");
     let msg = err.to_string();
@@ -267,8 +353,7 @@ fn test_list_link_outer_scoped_missing_outer_field_errors() {
         "tests/fixtures/validation/list_link_outer_scoped_missing_field",
     )];
     let datasets = load_all_datasets(&paths).expect("should load");
-    let err =
-        validate(&datasets).expect_err("outer-scoped ref to missing field should error");
+    let err = validate(&datasets).expect_err("outer-scoped ref to missing field should error");
     let msg = err.to_string();
     assert!(
         msg.contains("ghost_field"),
@@ -286,8 +371,7 @@ fn test_list_link_include_scoped_missing_target_field_errors() {
         "tests/fixtures/validation/list_link_include_scoped_missing_field",
     )];
     let datasets = load_all_datasets(&paths).expect("should load");
-    let err =
-        validate(&datasets).expect_err("include-scoped ref to missing field should error");
+    let err = validate(&datasets).expect_err("include-scoped ref to missing field should error");
     let msg = err.to_string();
     assert!(
         msg.contains("nonexistent"),
@@ -301,8 +385,9 @@ fn test_list_link_include_scoped_missing_target_field_errors() {
 
 #[test]
 fn test_list_link_expression_in_content_errors() {
-    let paths =
-        vec![PathBuf::from("tests/fixtures/validation/list_link_expression_in_content")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/list_link_expression_in_content",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("expression inside link content should error");
     let msg = err.to_string();
@@ -326,17 +411,29 @@ fn test_variant_distributions_sum_over_one_errors() {
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("distributions > 1.0 should error");
     let msg = err.to_string();
-    assert!(msg.contains("variant"), "error should mention 'variant': {msg}");
-    assert!(msg.contains("exceeds 1.0") || msg.contains("sum"), "error should mention the sum: {msg}");
+    assert!(
+        msg.contains("variant"),
+        "error should mention 'variant': {msg}"
+    );
+    assert!(
+        msg.contains("exceeds 1.0") || msg.contains("sum"),
+        "error should mention the sum: {msg}"
+    );
 }
 
 #[test]
 fn test_variant_all_set_not_summing_to_one_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/variant_all_set_wrong")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/variant_all_set_wrong",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
-    let err = validate(&datasets).expect_err("fully-specified variants not summing to 1.0 should error");
+    let err =
+        validate(&datasets).expect_err("fully-specified variants not summing to 1.0 should error");
     let msg = err.to_string();
-    assert!(msg.contains("variant"), "error should mention 'variant': {msg}");
+    assert!(
+        msg.contains("variant"),
+        "error should mention 'variant': {msg}"
+    );
 }
 
 #[test]
@@ -352,7 +449,9 @@ fn test_variant_valid_mixed_distributions_passes() {
 
 #[test]
 fn test_field_variant_empty_variants_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/field_variant_empty")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/field_variant_empty",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("empty variants list should error");
     let msg = err.to_string();
@@ -364,7 +463,9 @@ fn test_field_variant_empty_variants_errors() {
 
 #[test]
 fn test_field_variant_bad_distribution_sum_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/field_variant_bad_sum")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/field_variant_bad_sum",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("distributions > 1.0 should error");
     let msg = err.to_string();
@@ -376,9 +477,12 @@ fn test_field_variant_bad_distribution_sum_errors() {
 
 #[test]
 fn test_field_variant_nested_variant_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/field_variant_nested_variant")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/field_variant_nested_variant",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
-    let err = validate(&datasets).expect_err("nested type:variant inside a variant choice should error");
+    let err =
+        validate(&datasets).expect_err("nested type:variant inside a variant choice should error");
     let msg = err.to_string();
     assert!(
         msg.contains("variant"),
@@ -399,11 +503,16 @@ fn test_valid_field_variant_passes() {
 
 #[test]
 fn test_count_on_nested_include_list_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/count_on_nested_include_list")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/count_on_nested_include_list",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("count on nested-include list should error");
     let msg = err.to_string();
-    assert!(msg.contains("cardinality"), "error should mention 'cardinality': {msg}");
+    assert!(
+        msg.contains("cardinality"),
+        "error should mention 'cardinality': {msg}"
+    );
     assert!(msg.contains("count"), "error should mention 'count': {msg}");
 }
 
@@ -417,31 +526,49 @@ fn test_junction_link_errors() {
 
 #[test]
 fn test_junction_link_cardinality_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/junction_link_cardinality")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/junction_link_cardinality",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("junction link with cardinality should error");
     let msg = err.to_string();
-    assert!(msg.contains("junction"), "error should mention 'junction': {msg}");
-    assert!(msg.contains("cardinality"), "error should mention 'cardinality': {msg}");
+    assert!(
+        msg.contains("junction"),
+        "error should mention 'junction': {msg}"
+    );
+    assert!(
+        msg.contains("cardinality"),
+        "error should mention 'cardinality': {msg}"
+    );
 }
 
 #[test]
 fn test_include_reinforcement_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/include_reinforcement")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/include_reinforcement",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("reinforcement on include: should error");
     let msg = err.to_string();
-    assert!(msg.contains("reinforcement"), "error should mention 'reinforcement': {msg}");
+    assert!(
+        msg.contains("reinforcement"),
+        "error should mention 'reinforcement': {msg}"
+    );
     assert!(msg.contains("links"), "error should mention 'links': {msg}");
 }
 
 #[test]
 fn test_link_reinforcement_invalid_value_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/link_reinforcement_invalid")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/link_reinforcement_invalid",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("reinforcement in (0,1) on a link should error");
     let msg = err.to_string();
-    assert!(msg.contains("reinforcement"), "error should mention 'reinforcement': {msg}");
+    assert!(
+        msg.contains("reinforcement"),
+        "error should mention 'reinforcement': {msg}"
+    );
 }
 
 #[test]
@@ -450,37 +577,55 @@ fn test_include_overlap_errors() {
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("overlap on include: should error");
     let msg = err.to_string();
-    assert!(msg.contains("overlap"), "error should mention 'overlap': {msg}");
+    assert!(
+        msg.contains("overlap"),
+        "error should mention 'overlap': {msg}"
+    );
     assert!(msg.contains("links"), "error should mention 'links': {msg}");
 }
 
 #[test]
 fn test_link_overlap_invalid_value_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/link_overlap_invalid")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/link_overlap_invalid",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("overlap in (0,1) on a link should error");
     let msg = err.to_string();
-    assert!(msg.contains("overlap"), "error should mention 'overlap': {msg}");
+    assert!(
+        msg.contains("overlap"),
+        "error should mention 'overlap': {msg}"
+    );
 }
 
 #[test]
 fn test_cardinality_min_zero_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/cardinality_min_zero")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/cardinality_min_zero",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("cardinality min: 0 should error");
     let msg = err.to_string();
-    assert!(msg.contains("cardinality"), "error should mention 'cardinality': {msg}");
+    assert!(
+        msg.contains("cardinality"),
+        "error should mention 'cardinality': {msg}"
+    );
     assert!(msg.contains('0'), "error should show the bad value: {msg}");
 }
 
 #[test]
 fn test_rows_with_include_cardinality_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/rows_with_cardinality")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/rows_with_cardinality",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("rows + include.cardinality should error");
     let msg = err.to_string();
     assert!(msg.contains("rows"), "error should mention 'rows': {msg}");
-    assert!(msg.contains("cardinality"), "error should mention 'cardinality': {msg}");
+    assert!(
+        msg.contains("cardinality"),
+        "error should mention 'cardinality': {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -489,70 +634,123 @@ fn test_rows_with_include_cardinality_errors() {
 
 #[test]
 fn test_collect_bind_not_list_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/collect_bind_not_list")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/collect_bind_not_list",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("collect bind to non-list field should error");
     let msg = err.to_string();
     assert!(msg.contains("list"), "error should mention 'list': {msg}");
-    assert!(msg.contains("collect"), "error should mention 'collect': {msg}");
+    assert!(
+        msg.contains("collect"),
+        "error should mention 'collect': {msg}"
+    );
 }
 
 #[test]
 fn test_collect_bind_no_default_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/collect_bind_no_default")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/collect_bind_no_default",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("collect bind to field without default should error");
     let msg = err.to_string();
-    assert!(msg.contains("default"), "error should mention 'default': {msg}");
-    assert!(msg.contains("collect"), "error should mention 'collect': {msg}");
+    assert!(
+        msg.contains("default"),
+        "error should mention 'default': {msg}"
+    );
+    assert!(
+        msg.contains("collect"),
+        "error should mention 'collect': {msg}"
+    );
 }
 
 #[test]
 fn test_default_type_mismatch_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/default_type_mismatch")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/default_type_mismatch",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("default value with wrong type should error");
     let msg = err.to_string();
-    assert!(msg.contains("default"), "error should mention 'default': {msg}");
-    assert!(msg.contains("number"), "error should mention 'number': {msg}");
+    assert!(
+        msg.contains("default"),
+        "error should mention 'default': {msg}"
+    );
+    assert!(
+        msg.contains("number"),
+        "error should mention 'number': {msg}"
+    );
 }
 
 #[test]
 fn test_include_fields_exclude_without_fields_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/include_fields_exclude_no_fields")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/include_fields_exclude_no_fields",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("exclude without fields should error");
     let msg = err.to_string();
-    assert!(msg.contains("exclude"), "error should mention 'exclude': {msg}");
-    assert!(msg.contains("fields"), "error should mention 'fields': {msg}");
+    assert!(
+        msg.contains("exclude"),
+        "error should mention 'exclude': {msg}"
+    );
+    assert!(
+        msg.contains("fields"),
+        "error should mention 'fields': {msg}"
+    );
 }
 
 #[test]
 fn test_project_with_fields_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/project_with_fields")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/project_with_fields",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("project + fields should error");
     let msg = err.to_string();
-    assert!(msg.contains("project"), "error should mention 'project': {msg}");
-    assert!(msg.contains("fields"), "error should mention 'fields': {msg}");
+    assert!(
+        msg.contains("project"),
+        "error should mention 'project': {msg}"
+    );
+    assert!(
+        msg.contains("fields"),
+        "error should mention 'fields': {msg}"
+    );
 }
 
 #[test]
 fn test_project_ref_mismatch_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/project_ref_mismatch")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/project_ref_mismatch",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("project ref mismatch should error");
     let msg = err.to_string();
-    assert!(msg.contains("project"), "error should mention 'project': {msg}");
-    assert!(msg.contains("wrong_ref"), "error should mention the mismatched ref: {msg}");
+    assert!(
+        msg.contains("project"),
+        "error should mention 'project': {msg}"
+    );
+    assert!(
+        msg.contains("wrong_ref"),
+        "error should mention the mismatched ref: {msg}"
+    );
 }
 
 #[test]
 fn test_project_field_missing_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/project_field_missing")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/project_field_missing",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load");
     let err = validate(&datasets).expect_err("project with missing field should error");
     let msg = err.to_string();
-    assert!(msg.contains("project"), "error should mention 'project': {msg}");
-    assert!(msg.contains("nonexistent_field"), "error should name the missing field: {msg}");
+    assert!(
+        msg.contains("project"),
+        "error should mention 'project': {msg}"
+    );
+    assert!(
+        msg.contains("nonexistent_field"),
+        "error should name the missing field: {msg}"
+    );
 }

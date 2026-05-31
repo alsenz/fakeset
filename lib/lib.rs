@@ -10,12 +10,12 @@ pub mod executor;
 pub mod expand_variants;
 pub mod expressions;
 pub mod generator;
-pub mod schema;
-pub mod segment;
 pub mod graph;
 pub mod models;
 pub mod plan;
 pub mod rewrite;
+pub mod schema;
+pub mod segment;
 pub mod validate;
 
 use anyhow::{Context, Result};
@@ -50,8 +50,8 @@ fn is_yaml(path: &Path) -> bool {
 }
 
 fn load_dataset(path: &Path) -> Result<SyntheticDataset> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_yaml::from_str(&content).with_context(|| format!("parsing {}", path.display()))
 }
 

@@ -23,9 +23,9 @@ pub enum CountSpec {
 /// at execution time when an actual draw is needed.
 pub fn expected_cardinality(spec: &CountSpec) -> f64 {
     match spec {
-        CountSpec::Fixed(n)             => *n as f64,
+        CountSpec::Fixed(n) => *n as f64,
         CountSpec::Uniform { min, max } => (*min + *max) as f64 / 2.0,
-        CountSpec::Normal  { mean, .. } => *mean,
+        CountSpec::Normal { mean, .. } => *mean,
     }
 }
 
@@ -36,8 +36,10 @@ pub fn expected_cardinality(spec: &CountSpec) -> f64 {
 /// all rows are eligible. When `linked_rows == 0`, returns 0 regardless of ratio.
 pub fn eligible_linked_rows(linked_rows: usize, ratio: Option<f64>) -> usize {
     match ratio {
-        Some(r) => ((r * linked_rows as f64).round() as usize).max(1).min(linked_rows),
-        None    => linked_rows,
+        Some(r) => ((r * linked_rows as f64).round() as usize)
+            .max(1)
+            .min(linked_rows),
+        None => linked_rows,
     }
 }
 
@@ -67,10 +69,12 @@ impl std::str::FromStr for Format {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "parquet" => Ok(Format::Parquet),
-            "csv"     => Ok(Format::Csv),
-            "json"    => Ok(Format::Json),
-            "jsonl"   => Ok(Format::Jsonl),
-            _ => Err(format!("unknown format '{s}'; expected one of: parquet, csv, json, jsonl")),
+            "csv" => Ok(Format::Csv),
+            "json" => Ok(Format::Json),
+            "jsonl" => Ok(Format::Jsonl),
+            _ => Err(format!(
+                "unknown format '{s}'; expected one of: parquet, csv, json, jsonl"
+            )),
         }
     }
 }
@@ -94,14 +98,14 @@ pub enum FieldType {
 impl std::fmt::Display for FieldType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FieldType::Number   => write!(f, "number"),
-            FieldType::Boolean  => write!(f, "boolean"),
-            FieldType::String   => write!(f, "string"),
-            FieldType::Object   => write!(f, "object"),
-            FieldType::List     => write!(f, "list"),
-            FieldType::Date     => write!(f, "date"),
+            FieldType::Number => write!(f, "number"),
+            FieldType::Boolean => write!(f, "boolean"),
+            FieldType::String => write!(f, "string"),
+            FieldType::Object => write!(f, "object"),
+            FieldType::List => write!(f, "list"),
+            FieldType::Date => write!(f, "date"),
             FieldType::DateTime => write!(f, "date_time"),
-            FieldType::Variant  => write!(f, "variant"),
+            FieldType::Variant => write!(f, "variant"),
         }
     }
 }
@@ -121,21 +125,36 @@ pub struct ParquetConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub enum ParquetDatatype {
-    #[serde(rename = "int8")]         Int8,
-    #[serde(rename = "int16")]        Int16,
-    #[serde(rename = "int32")]        Int32,
-    #[serde(rename = "int64")]        Int64,
-    #[serde(rename = "uint8")]        UInt8,
-    #[serde(rename = "uint16")]       UInt16,
-    #[serde(rename = "uint32")]       UInt32,
-    #[serde(rename = "uint64")]       UInt64,
-    #[serde(rename = "float32")]      Float32,
-    #[serde(rename = "float64")]      Float64,
-    #[serde(rename = "utf8")]         Utf8,
-    #[serde(rename = "boolean")]      Boolean,
-    #[serde(rename = "date32")]       Date32,
-    #[serde(rename = "timestamp_ms")] TimestampMs,
-    #[serde(rename = "timestamp_us")] TimestampUs,
+    #[serde(rename = "int8")]
+    Int8,
+    #[serde(rename = "int16")]
+    Int16,
+    #[serde(rename = "int32")]
+    Int32,
+    #[serde(rename = "int64")]
+    Int64,
+    #[serde(rename = "uint8")]
+    UInt8,
+    #[serde(rename = "uint16")]
+    UInt16,
+    #[serde(rename = "uint32")]
+    UInt32,
+    #[serde(rename = "uint64")]
+    UInt64,
+    #[serde(rename = "float32")]
+    Float32,
+    #[serde(rename = "float64")]
+    Float64,
+    #[serde(rename = "utf8")]
+    Utf8,
+    #[serde(rename = "boolean")]
+    Boolean,
+    #[serde(rename = "date32")]
+    Date32,
+    #[serde(rename = "timestamp_ms")]
+    TimestampMs,
+    #[serde(rename = "timestamp_us")]
+    TimestampUs,
 }
 
 /// One concrete alternative within a `type: variant` field.
@@ -180,8 +199,11 @@ pub enum OutputSpec {
 impl OutputSpec {
     pub fn into_output(self) -> Output {
         match self {
-            OutputSpec::Shorthand(s) => Output { file: s, quality: None },
-            OutputSpec::Block(o)     => o,
+            OutputSpec::Shorthand(s) => Output {
+                file: s,
+                quality: None,
+            },
+            OutputSpec::Block(o) => o,
         }
     }
 }
@@ -195,15 +217,15 @@ impl OutputSpec {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DataQuality {
     // dataset-level only
-    pub duplication:  Option<f64>,
-    pub missing:      Option<f64>,
+    pub duplication: Option<f64>,
+    pub missing: Option<f64>,
     // all levels
-    pub nulls:        Option<f64>,
+    pub nulls: Option<f64>,
     pub default_rate: Option<f64>,
-    pub corruptions:  Option<Corruptions>,
+    pub corruptions: Option<Corruptions>,
     // field-level only
     pub default_values: Option<Vec<serde_yaml::Value>>,
-    pub defaults_mode:  Option<DefaultsMode>,
+    pub defaults_mode: Option<DefaultsMode>,
 }
 
 /// Whether field-level `default_values` replaces or augments the built-in default set.
@@ -219,22 +241,26 @@ pub enum DefaultsMode {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Corruptions {
     // string modes
-    pub character_deletion:  Option<f64>,
+    pub character_deletion: Option<f64>,
     pub character_insertion: Option<f64>,
-    pub truncation:          Option<f64>,
-    pub encoding:            Option<f64>,
+    pub truncation: Option<f64>,
+    pub encoding: Option<f64>,
     // number modes
-    pub noise:       Option<f64>,
+    pub noise: Option<f64>,
     #[serde(default = "default_noise_scale")]
     pub noise_scale: f64,
     // date / date_time modes
-    pub day_shift:     Option<f64>,
+    pub day_shift: Option<f64>,
     #[serde(default = "default_day_shift_max")]
     pub day_shift_max: i64,
 }
 
-fn default_noise_scale()    -> f64 { 1.0 }
-fn default_day_shift_max()  -> i64 { 30  }
+fn default_noise_scale() -> f64 {
+    1.0
+}
+fn default_day_shift_max() -> i64 {
+    30
+}
 
 /// Selects a specific fake-rs faker to drive value generation.
 /// When absent the field type's default faker is used.
@@ -310,21 +336,51 @@ impl Generator {
     /// Returns true when this generator is compatible with the given field type.
     pub fn valid_for(&self, ft: &FieldType) -> bool {
         match self {
-            Generator::FirstName | Generator::LastName | Generator::Name | Generator::NameWithTitle
-            | Generator::Word | Generator::Sentence | Generator::Paragraph
-            | Generator::Words | Generator::Sentences | Generator::Paragraphs
-            | Generator::CompanyName | Generator::CompanySuffix | Generator::Industry
-            | Generator::Profession | Generator::Buzzword
-            | Generator::Email | Generator::Username | Generator::Password
-            | Generator::IPv4 | Generator::IPv6 | Generator::MacAddress | Generator::UserAgent
-            | Generator::CityName | Generator::CountryName | Generator::CountryCode
-            | Generator::StreetName | Generator::ZipCode | Generator::StateAbbr | Generator::TimeZone
-            | Generator::PhoneNumber | Generator::CreditCardNumber | Generator::Bic
-            | Generator::CurrencyCode | Generator::CurrencyName | Generator::CurrencySymbol
-            | Generator::Geohash | Generator::NumberWithFormat
-            | Generator::Uuid | Generator::Isin | Generator::LicencePlate | Generator::Isbn
+            Generator::FirstName
+            | Generator::LastName
+            | Generator::Name
+            | Generator::NameWithTitle
+            | Generator::Word
+            | Generator::Sentence
+            | Generator::Paragraph
+            | Generator::Words
+            | Generator::Sentences
+            | Generator::Paragraphs
+            | Generator::CompanyName
+            | Generator::CompanySuffix
+            | Generator::Industry
+            | Generator::Profession
+            | Generator::Buzzword
+            | Generator::Email
+            | Generator::Username
+            | Generator::Password
+            | Generator::IPv4
+            | Generator::IPv6
+            | Generator::MacAddress
+            | Generator::UserAgent
+            | Generator::CityName
+            | Generator::CountryName
+            | Generator::CountryCode
+            | Generator::StreetName
+            | Generator::ZipCode
+            | Generator::StateAbbr
+            | Generator::TimeZone
+            | Generator::PhoneNumber
+            | Generator::CreditCardNumber
+            | Generator::Bic
+            | Generator::CurrencyCode
+            | Generator::CurrencyName
+            | Generator::CurrencySymbol
+            | Generator::Geohash
+            | Generator::NumberWithFormat
+            | Generator::Uuid
+            | Generator::Isin
+            | Generator::LicencePlate
+            | Generator::Isbn
             | Generator::Semver => matches!(ft, FieldType::String),
-            Generator::Latitude | Generator::Longitude | Generator::PositiveDecimal
+            Generator::Latitude
+            | Generator::Longitude
+            | Generator::PositiveDecimal
             | Generator::Decimal => matches!(ft, FieldType::Number | FieldType::String),
             Generator::Date => matches!(ft, FieldType::Date | FieldType::String),
             Generator::DateTime => matches!(ft, FieldType::DateTime | FieldType::String),
@@ -334,24 +390,41 @@ impl Generator {
     /// Returns true when this generator produces meaningfully locale-specific output.
     /// Setting `locale` on a generator that returns false here is a validation error.
     pub fn supports_locale(&self) -> bool {
-        matches!(self,
-            Generator::FirstName | Generator::LastName | Generator::Name | Generator::NameWithTitle
-            | Generator::Word | Generator::Sentence | Generator::Paragraph
-            | Generator::Words | Generator::Sentences | Generator::Paragraphs
-            | Generator::CompanyName | Generator::CompanySuffix
-            | Generator::Industry | Generator::Profession | Generator::Buzzword
-            | Generator::CityName | Generator::CountryName | Generator::StreetName
-            | Generator::ZipCode | Generator::StateAbbr
-            | Generator::PhoneNumber
-            | Generator::LicencePlate
+        matches!(
+            self,
+            Generator::FirstName
+                | Generator::LastName
+                | Generator::Name
+                | Generator::NameWithTitle
+                | Generator::Word
+                | Generator::Sentence
+                | Generator::Paragraph
+                | Generator::Words
+                | Generator::Sentences
+                | Generator::Paragraphs
+                | Generator::CompanyName
+                | Generator::CompanySuffix
+                | Generator::Industry
+                | Generator::Profession
+                | Generator::Buzzword
+                | Generator::CityName
+                | Generator::CountryName
+                | Generator::StreetName
+                | Generator::ZipCode
+                | Generator::StateAbbr
+                | Generator::PhoneNumber
+                | Generator::LicencePlate
         )
     }
 
     /// Returns the set of valid `args` keys for this generator, or `None` if it takes no args.
     pub fn valid_args(&self) -> Option<&'static [&'static str]> {
         match self {
-            Generator::Sentence | Generator::Paragraph
-            | Generator::Words | Generator::Sentences | Generator::Paragraphs
+            Generator::Sentence
+            | Generator::Paragraph
+            | Generator::Words
+            | Generator::Sentences
+            | Generator::Paragraphs
             | Generator::Password => Some(&["min", "max"]),
             Generator::Geohash => Some(&["precision"]),
             Generator::NumberWithFormat => Some(&["format"]),
@@ -365,20 +438,39 @@ impl Generator {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Locale {
-    En, FrFr, DeDe, ItIt, NlNl, PtBr, PtPt, CyGb,
-    ZhCn, ZhTw, JaJp, ArSa, TrTr, FaIr,
+    En,
+    FrFr,
+    DeDe,
+    ItIt,
+    NlNl,
+    PtBr,
+    PtPt,
+    CyGb,
+    ZhCn,
+    ZhTw,
+    JaJp,
+    ArSa,
+    TrTr,
+    FaIr,
 }
 
 impl std::fmt::Display for Locale {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Locale::En   => "en",   Locale::FrFr => "fr_fr",
-            Locale::DeDe => "de_de", Locale::ItIt => "it_it",
-            Locale::NlNl => "nl_nl", Locale::PtBr => "pt_br",
-            Locale::PtPt => "pt_pt", Locale::CyGb => "cy_gb",
-            Locale::ZhCn => "zh_cn", Locale::ZhTw => "zh_tw",
-            Locale::JaJp => "ja_jp", Locale::ArSa => "ar_sa",
-            Locale::TrTr => "tr_tr", Locale::FaIr => "fa_ir",
+            Locale::En => "en",
+            Locale::FrFr => "fr_fr",
+            Locale::DeDe => "de_de",
+            Locale::ItIt => "it_it",
+            Locale::NlNl => "nl_nl",
+            Locale::PtBr => "pt_br",
+            Locale::PtPt => "pt_pt",
+            Locale::CyGb => "cy_gb",
+            Locale::ZhCn => "zh_cn",
+            Locale::ZhTw => "zh_tw",
+            Locale::JaJp => "ja_jp",
+            Locale::ArSa => "ar_sa",
+            Locale::TrTr => "tr_tr",
+            Locale::FaIr => "fa_ir",
         };
         write!(f, "{s}")
     }
@@ -506,7 +598,7 @@ pub struct Field {
     /// Locale for fake-rs data. Only valid on generators that support locale selection;
     /// see [`Generator::supports_locale`]. Defaults to `en` when absent.
     pub locale: Option<Locale>,
-        /// Numeric bounds for `number` type fields.
+    /// Numeric bounds for `number` type fields.
     pub range: Option<Range>,
     /// Emit this constant value for every row instead of generating data.
     /// Incompatible with `generator`, `min`, and `max`.
@@ -573,8 +665,8 @@ impl Field {
         match &self.refs {
             Some(RefsSpec::Single(s)) => Some(s.as_str()),
             Some(RefsSpec::Multi(entries)) => entries.iter().find_map(|e| match e {
-                RefEntry::Simple(s)  => Some(s.as_str()),
-                RefEntry::Rich(b)    => b.target.as_deref(),
+                RefEntry::Simple(s) => Some(s.as_str()),
+                RefEntry::Rich(b) => b.target.as_deref(),
             }),
             None => None,
         }
@@ -586,10 +678,13 @@ impl Field {
     /// `min`, and `take_first`.
     pub fn collect_bindings(&self) -> Vec<&RefBinding> {
         match &self.refs {
-            Some(RefsSpec::Multi(entries)) => entries.iter().filter_map(|e| match e {
-                RefEntry::Rich(b) if b.reducer.is_some() => Some(b),
-                _ => None,
-            }).collect(),
+            Some(RefsSpec::Multi(entries)) => entries
+                .iter()
+                .filter_map(|e| match e {
+                    RefEntry::Rich(b) if b.reducer.is_some() => Some(b),
+                    _ => None,
+                })
+                .collect(),
             _ => vec![],
         }
     }
@@ -599,7 +694,11 @@ impl Field {
 pub fn resolve_distributions(dists: &[Option<f64>]) -> Vec<f64> {
     let fixed_sum: f64 = dists.iter().filter_map(|d| *d).sum();
     let n_free = dists.iter().filter(|d| d.is_none()).count();
-    let free_share = if n_free > 0 { (1.0 - fixed_sum) / n_free as f64 } else { 0.0 };
+    let free_share = if n_free > 0 {
+        (1.0 - fixed_sum) / n_free as f64
+    } else {
+        0.0
+    };
     dists.iter().map(|d| d.unwrap_or(free_share)).collect()
 }
 
@@ -766,11 +865,16 @@ impl SyntheticDataset {
     /// - If neither is set, returns an empty vec.
     pub fn resolved_outputs(&self) -> Vec<Output> {
         if !self.outputs.is_empty() {
-            return self.outputs.iter().cloned().map(OutputSpec::into_output).collect();
+            return self
+                .outputs
+                .iter()
+                .cloned()
+                .map(OutputSpec::into_output)
+                .collect();
         }
         match &self.output {
             Some(spec) => vec![spec.clone().into_output()],
-            None       => vec![],
+            None => vec![],
         }
     }
 }

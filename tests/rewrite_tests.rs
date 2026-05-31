@@ -1,6 +1,5 @@
 use fakeset::{
-    expressions::pull_down_expression_deps, load_all_datasets,
-    models::FieldType,
+    expressions::pull_down_expression_deps, load_all_datasets, models::FieldType,
     rewrite::resolve_refs, validate::validate,
 };
 use std::path::PathBuf;
@@ -73,13 +72,18 @@ fn test_resolve_refs_preserves_ref_field_string() {
 #[test]
 fn test_ref_conflicting_generators_errors_at_rewrite() {
     // a.email refs b.email (generator: email) but overrides with generator: company_name — conflict.
-    let paths = vec![PathBuf::from("tests/fixtures/validation/ref_with_generator")];
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/ref_with_generator",
+    )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     validate(&datasets).expect("ref+generator is valid at the validate stage");
 
     let err = resolve_refs(&datasets).expect_err("conflicting generators should error at rewrite");
     let msg = err.to_string();
-    assert!(msg.contains("conflict"), "error should mention conflict: {msg}");
+    assert!(
+        msg.contains("conflict"),
+        "error should mention conflict: {msg}"
+    );
 }
 
 #[test]
@@ -140,8 +144,13 @@ fn test_resolve_refs_for_list_link_content_field() {
     validate(&datasets).expect("should pass validation");
     let resolved = resolve_refs(&datasets).expect("should resolve refs");
 
-    let events = resolved.values().find(|d| d.name == "events").expect("find events");
-    let attendees = events.data.iter()
+    let events = resolved
+        .values()
+        .find(|d| d.name == "events")
+        .expect("find events");
+    let attendees = events
+        .data
+        .iter()
         .find(|f| f.name == "attendees")
         .expect("find attendees field");
 
@@ -150,14 +159,20 @@ fn test_resolve_refs_for_list_link_content_field() {
         other => panic!("attendees should have rich content, got: {other:?}"),
     };
 
-    let name_field = content_fields.iter().find(|f| f.name == "name").expect("find name field");
+    let name_field = content_fields
+        .iter()
+        .find(|f| f.name == "name")
+        .expect("find name field");
     assert_eq!(
         name_field.field_type,
         Some(FieldType::String),
         "include-scoped 'name' should inherit string type from people.full_name"
     );
 
-    let title_field = content_fields.iter().find(|f| f.name == "event_title").expect("find event_title");
+    let title_field = content_fields
+        .iter()
+        .find(|f| f.name == "event_title")
+        .expect("find event_title");
     assert_eq!(
         title_field.field_type,
         Some(FieldType::String),
@@ -175,7 +190,10 @@ fn test_chained_ref_resolves_through_chain() {
 
     let resolved = resolve_refs(&datasets).expect("chained ref should now resolve successfully");
 
-    let c = resolved.values().find(|d| d.name == "c").expect("find dataset c");
+    let c = resolved
+        .values()
+        .find(|d| d.name == "c")
+        .expect("find dataset c");
     let id_field = c.data.iter().find(|f| f.name == "id").expect("find c.id");
     assert_eq!(
         id_field.field_type,

@@ -7,7 +7,12 @@ fn constraints(
     max: Option<f64>,
     value: Option<serde_yaml::Value>,
 ) -> FieldConstraints {
-    FieldConstraints { generator, min, max, value }
+    FieldConstraints {
+        generator,
+        min,
+        max,
+        value,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -36,13 +41,27 @@ fn test_not_satisfiable_inverted_range() {
 
 #[test]
 fn test_not_satisfiable_value_with_min() {
-    assert!(!constraints(None, Some(0.0), None, Some(serde_yaml::Value::Number(42.into()))).satisfiable());
+    assert!(
+        !constraints(
+            None,
+            Some(0.0),
+            None,
+            Some(serde_yaml::Value::Number(42.into()))
+        )
+        .satisfiable()
+    );
 }
 
 #[test]
 fn test_not_satisfiable_value_with_generator() {
     assert!(
-        !constraints(Some(Generator::FirstName), None, None, Some(serde_yaml::Value::String("Alice".into()))).satisfiable()
+        !constraints(
+            Some(Generator::FirstName),
+            None,
+            None,
+            Some(serde_yaml::Value::String("Alice".into()))
+        )
+        .satisfiable()
     );
 }
 
@@ -81,7 +100,10 @@ fn test_merge_one_sided_bounds() {
 fn test_merge_incompatible_bounds() {
     let a = constraints(None, Some(60.0), Some(100.0), None);
     let b = constraints(None, Some(0.0), Some(30.0), None);
-    assert!(a.merge(&b).is_none(), "merged range is empty — should return None");
+    assert!(
+        a.merge(&b).is_none(),
+        "merged range is empty — should return None"
+    );
 }
 
 #[test]
@@ -89,7 +111,10 @@ fn test_merge_one_sided_non_overlapping() {
     // a allows [50, ∞), b allows (-∞, 30] — intersection is empty
     let a = constraints(None, Some(50.0), None, None);
     let b = constraints(None, None, Some(30.0), None);
-    assert!(a.merge(&b).is_none(), "min(50) > max(30) after merge — should return None");
+    assert!(
+        a.merge(&b).is_none(),
+        "min(50) > max(30) after merge — should return None"
+    );
 }
 
 #[test]
@@ -126,7 +151,17 @@ fn test_merge_same_value() {
 
 #[test]
 fn test_merge_conflicting_values() {
-    let a = constraints(None, None, None, Some(serde_yaml::Value::String("active".into())));
-    let b = constraints(None, None, None, Some(serde_yaml::Value::String("inactive".into())));
+    let a = constraints(
+        None,
+        None,
+        None,
+        Some(serde_yaml::Value::String("active".into())),
+    );
+    let b = constraints(
+        None,
+        None,
+        None,
+        Some(serde_yaml::Value::String("inactive".into())),
+    );
     assert!(a.merge(&b).is_none(), "different constant values conflict");
 }

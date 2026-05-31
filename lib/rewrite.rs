@@ -1,13 +1,15 @@
 //! Ref resolution and locale application. `resolve_refs` pushes field types and merged
 //! constraints down the lattice toward child/ref targets; `apply_global_locales` stamps
 //! locale onto locale-aware fields across all datasets.
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::constraints::Merge;
 use crate::constraints::FieldConstraints;
-use crate::models::{resolve_include, split_ref, Field, Include, Locale, RefsSpec, SyntheticDataset};
+use crate::constraints::Merge;
+use crate::models::{
+    Field, Include, Locale, RefsSpec, SyntheticDataset, resolve_include, split_ref,
+};
 
 const MAX_REF_CHAIN_DEPTH: usize = 32;
 
@@ -38,8 +40,13 @@ pub fn expand_include_fields(
                             .flat_map(|v| v.iter())
                             .map(|s| s.as_str())
                             .collect();
-                        let injected =
-                            expand_field_patterns(&inc.fields, &exclude, &target.data, &inc.reference, &existing);
+                        let injected = expand_field_patterns(
+                            &inc.fields,
+                            &exclude,
+                            &target.data,
+                            &inc.reference,
+                            &existing,
+                        );
                         let out = result.get_mut(path).unwrap();
                         let mut new_data = injected;
                         new_data.extend(std::mem::take(&mut out.data));
@@ -52,8 +59,12 @@ pub fn expand_include_fields(
         for link in &dataset.links {
             let out = result.get_mut(path).unwrap();
             for field in &mut out.data {
-                let Some(ref mut content) = field.content else { continue };
-                let Some(ref from_ref) = content.from else { continue };
+                let Some(ref mut content) = field.content else {
+                    continue;
+                };
+                let Some(ref from_ref) = content.from else {
+                    continue;
+                };
                 if *from_ref != link.reference {
                     continue;
                 }
@@ -69,10 +80,18 @@ pub fn expand_include_fields(
                 if link.fields.is_empty() {
                     continue;
                 }
-                let Some(target_path) = resolve_include(path, &link.file) else { continue };
-                let Some(target) = datasets.get(&target_path) else { continue };
-                let existing: HashSet<&str> =
-                    content.item.fields.iter().map(|f| f.name.as_str()).collect();
+                let Some(target_path) = resolve_include(path, &link.file) else {
+                    continue;
+                };
+                let Some(target) = datasets.get(&target_path) else {
+                    continue;
+                };
+                let existing: HashSet<&str> = content
+                    .item
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect();
                 let exclude: HashSet<&str> = link
                     .exclude
                     .iter()
@@ -169,8 +188,13 @@ pub fn resolve_refs(
                         let from_ref = from_ref.clone();
                         if let Some(link) = dataset.links.iter().find(|l| l.reference == from_ref) {
                             let link = link.clone();
-                            let new_content_fields: Vec<Field> = content.item.fields.iter()
-                                .map(|cf| resolve_list_link_content_field(path, datasets, cf, &link))
+                            let new_content_fields: Vec<Field> = content
+                                .item
+                                .fields
+                                .iter()
+                                .map(|cf| {
+                                    resolve_list_link_content_field(path, datasets, cf, &link)
+                                })
                                 .collect::<Result<_>>()?;
                             if let Some(ref mut c) = out.content {
                                 c.item.fields = new_content_fields;
@@ -234,27 +258,32 @@ fn resolve_field(
     let included_ds = all.get(&include_path).ok_or_else(|| {
         anyhow!(
             "field '{}.{}': ref '{}' — included dataset not loaded",
-            dataset.name, field_name, ref_str
+            dataset.name,
+            field_name,
+            ref_str
         )
     })?;
 
-    let target = included_ds.data.iter()
+    let target = included_ds
+        .data
+        .iter()
         .find(|f| f.name == target_name)
         .ok_or_else(|| {
             anyhow!(
                 "field '{}.{}': ref '{}' — target field not found",
-                dataset.name, field_name, ref_str
+                dataset.name,
+                field_name,
+                ref_str
             )
         })?;
 
     // Follow chains: if the target is itself a ref, traverse to the base field for type info.
-    let base = resolve_to_base(target, included_ds, &include_path, all, 0)
-        .with_context(|| {
-            format!(
-                "field '{}.{}': ref '{}' — could not resolve ref chain",
-                dataset.name, field_name, ref_str
-            )
-        })?;
+    let base = resolve_to_base(target, included_ds, &include_path, all, 0).with_context(|| {
+        format!(
+            "field '{}.{}': ref '{}' — could not resolve ref chain",
+            dataset.name, field_name, ref_str
+        )
+    })?;
 
     if base.expression.is_some() {
         bail!(
@@ -267,15 +296,17 @@ fn resolve_field(
     }
 
     // Merge local constraints with those of the BASE (ultimate non-ref) target.
-    let merged = FieldConstraints::from(field).merge(&FieldConstraints::from(base)).ok_or_else(|| {
-        anyhow!(
-            "field '{}.{}': ref '{}' — local constraints conflict with target field '{}'",
-            dataset.name,
-            field_name,
-            ref_str,
-            target_name,
-        )
-    })?;
+    let merged = FieldConstraints::from(field)
+        .merge(&FieldConstraints::from(base))
+        .ok_or_else(|| {
+            anyhow!(
+                "field '{}.{}': ref '{}' — local constraints conflict with target field '{}'",
+                dataset.name,
+                field_name,
+                ref_str,
+                target_name,
+            )
+        })?;
 
     let range = merged.to_range();
     Ok(Field {
@@ -307,18 +338,28 @@ fn resolve_to_base<'a>(
     let Some(ref_str) = field.simple_ref() else {
         return Ok(field);
     };
-    let (inc_ref, field_name) = split_ref(ref_str).ok_or_else(|| {
-        anyhow!("malformed ref '{}' in chain", ref_str)
-    })?;
-    let include = dataset.include.iter()
+    let (inc_ref, field_name) =
+        split_ref(ref_str).ok_or_else(|| anyhow!("malformed ref '{}' in chain", ref_str))?;
+    let include = dataset
+        .include
+        .iter()
         .chain(dataset.links.iter())
         .find(|i| i.reference == inc_ref)
-        .ok_or_else(|| anyhow!("ref '{}' — include or link '{}' not found", ref_str, inc_ref))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "ref '{}' — include or link '{}' not found",
+                ref_str,
+                inc_ref
+            )
+        })?;
     let inc_path = resolve_include(dataset_path, &include.file)
         .ok_or_else(|| anyhow!("cannot resolve include '{}' in chain", include.file))?;
-    let next_ds = all.get(&inc_path)
+    let next_ds = all
+        .get(&inc_path)
         .ok_or_else(|| anyhow!("included dataset '{}' not loaded", include.file))?;
-    let next_field = next_ds.data.iter()
+    let next_field = next_ds
+        .data
+        .iter()
         .find(|f| f.name == field_name)
         .ok_or_else(|| anyhow!("field '{}' not found in '{}'", field_name, include.file))?;
     resolve_to_base(next_field, next_ds, &inc_path, all, depth + 1)
@@ -355,7 +396,8 @@ fn resolve_list_link_content_field(
     let include_path = resolve_include(dataset_path, &include.file).ok_or_else(|| {
         anyhow!(
             "list-link content field '{}': cannot resolve linked file '{}'",
-            field.name, include.file
+            field.name,
+            include.file
         )
     })?;
 
@@ -365,16 +407,21 @@ fn resolve_list_link_content_field(
         .ok_or_else(|| {
             anyhow!(
                 "list-link content field '{}': target field '{}' not found in '{}'",
-                field.name, target_name, include.file
+                field.name,
+                target_name,
+                include.file
             )
         })?;
 
-    let merged = FieldConstraints::from(field).merge(&FieldConstraints::from(target)).ok_or_else(|| {
-        anyhow!(
-            "list-link content field '{}': local constraints conflict with target '{}'",
-            field.name, target_name
-        )
-    })?;
+    let merged = FieldConstraints::from(field)
+        .merge(&FieldConstraints::from(target))
+        .ok_or_else(|| {
+            anyhow!(
+                "list-link content field '{}': local constraints conflict with target '{}'",
+                field.name,
+                target_name
+            )
+        })?;
 
     let range = merged.to_range();
     Ok(Field {
@@ -401,7 +448,9 @@ fn resolve_list_link_content_field(
 /// Call this after `resolve_refs` so that ref-resolved fields are included.
 pub fn apply_global_locales(datasets: &mut HashMap<PathBuf, SyntheticDataset>) {
     for dataset in datasets.values_mut() {
-        let Some(global) = dataset.locale.clone() else { continue };
+        let Some(global) = dataset.locale.clone() else {
+            continue;
+        };
         for field in &mut dataset.data {
             stamp_locale(field, &global);
         }

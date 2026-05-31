@@ -1,11 +1,11 @@
 //! Expression dependency analysis. `pull_down_expression_deps` injects hidden ref fields
 //! into child datasets so expression identifiers declared only in a parent are available
 //! when the child batch is generated.
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::models::{resolve_include, Field, RefsSpec, SyntheticDataset};
+use crate::models::{Field, RefsSpec, SyntheticDataset, resolve_include};
 
 /// Extract all identifier tokens from a SQL expression string.
 /// Returns every word-like token; callers filter against known field names.
@@ -38,11 +38,12 @@ pub fn pull_down_expression_deps(
 
     for (path, dataset) in datasets {
         let mut hidden: Vec<Field> = Vec::new();
-        let mut known: HashSet<String> =
-            dataset.data.iter().map(|f| f.name.clone()).collect();
+        let mut known: HashSet<String> = dataset.data.iter().map(|f| f.name.clone()).collect();
 
         for field in &dataset.data {
-            let Some(ref expr) = field.expression else { continue };
+            let Some(ref expr) = field.expression else {
+                continue;
+            };
 
             for ident in extract_identifiers(expr) {
                 if known.contains(ident) || hidden.iter().any(|f| f.name == ident) {
@@ -100,8 +101,12 @@ fn include_refs_containing(
 ) -> Vec<String> {
     let mut refs = Vec::new();
     for include in dataset.include.iter() {
-        let Some(inc_path) = resolve_include(path, &include.file) else { continue };
-        let Some(inc_ds) = all.get(&inc_path) else { continue };
+        let Some(inc_path) = resolve_include(path, &include.file) else {
+            continue;
+        };
+        let Some(inc_ds) = all.get(&inc_path) else {
+            continue;
+        };
         if inc_ds.data.iter().any(|f| f.name == name) {
             refs.push(include.reference.clone());
         }
@@ -158,7 +163,10 @@ mod tests {
         let tokens = extract_identifiers("CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END");
         assert!(tokens.contains(&"CASE"));
         assert!(tokens.contains(&"WHEN"));
-        assert!(tokens.contains(&"age"), "field reference 'age' should be present");
+        assert!(
+            tokens.contains(&"age"),
+            "field reference 'age' should be present"
+        );
         assert!(tokens.contains(&"THEN"));
         assert!(tokens.contains(&"ELSE"));
         assert!(tokens.contains(&"END"));

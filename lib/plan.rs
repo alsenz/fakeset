@@ -3,16 +3,20 @@
 //! that `executor::execute` interprets in order.
 use anyhow::Result;
 use petgraph::visit::Topo;
+use serde_yaml::Value as YamlValue;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use serde_yaml::Value as YamlValue;
 
 use crate::constraints::FieldConstraints;
-use crate::segment::{plan_segments, LowerCoverMember, Segment};
 use crate::graph::DatasetGraph;
-use crate::models::{eligible_linked_rows, expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref, CountSpec, DataQuality, Field, Format, Include, Locale, Output, Reducer, RefBinding, Schema, SyntheticDataset, VariantSchema};
+use crate::models::{
+    CountSpec, DataQuality, Field, Format, Include, Locale, Output, Reducer, RefBinding, Schema,
+    SyntheticDataset, VariantSchema, eligible_linked_rows, expected_cardinality,
+    for_each_list_link, resolve_distributions, resolve_include, split_ref,
+};
 use crate::rewrite::apply_locale_to_schema;
+use crate::segment::{LowerCoverMember, Segment, plan_segments};
 
 const DEFAULT_ROWS: usize = 100;
 
@@ -117,23 +121,23 @@ pub enum ExecutionStep {
     /// `linked_field` column. Linked rows with no matching source rows receive the linked
     /// field's `default` value.
     AccumulateToLinked {
-        source_path:   PathBuf,
-        source_field:  String,
-        linked_path:   PathBuf,
-        linked_field:  String,
-        group_by:      String,
-        reducer:       Reducer,
+        source_path: PathBuf,
+        source_field: String,
+        linked_path: PathBuf,
+        linked_field: String,
+        group_by: String,
+        reducer: Reducer,
         /// Declared `default:` from the linked field YAML, used as the fallback value for
         /// linked rows that have no matching source rows (scalar reducers only).
         /// For `Collect` the empty-list is built explicitly; this field is ignored.
-        default_val:   serde_yaml::Value,
+        default_val: serde_yaml::Value,
     },
     /// Emit the batch at `path` from `computed` to an output file.
     ///
     /// Used after `AccumulateToLinked` to write the now-updated linked batch. Applies
     /// `filter_hidden_columns` and calls the normal emit path.
     EmitDataset {
-        path:    PathBuf,
+        path: PathBuf,
         dataset: Arc<SyntheticDataset>,
     },
     /// Flush a shared output file: union + shuffle all accumulated batches, apply any
@@ -172,18 +176,21 @@ fn variant_key(path: &Path, i: usize) -> PathBuf {
     internal_path(path, &format!("variant_{i}"))
 }
 
-
 /// Split `parent_rows` into `dists.len()` integer counts that sum exactly to `parent_rows`.
 /// Uses largest-remainder (Hamilton) rounding.
 pub(crate) fn distribute_rows(parent_rows: usize, dists: &[f64]) -> Vec<usize> {
     let raw: Vec<f64> = dists.iter().map(|d| d * parent_rows as f64).collect();
     let mut counts: Vec<usize> = raw.iter().map(|r| r.floor() as usize).collect();
     let remainder = parent_rows - counts.iter().sum::<usize>();
-    let mut fracs: Vec<(usize, f64)> = raw.iter().enumerate()
+    let mut fracs: Vec<(usize, f64)> = raw
+        .iter()
+        .enumerate()
         .map(|(i, r)| (i, r - r.floor()))
         .collect();
     fracs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    for k in 0..remainder { counts[fracs[k].0] += 1; }
+    for k in 0..remainder {
+        counts[fracs[k].0] += 1;
+    }
     counts
 }
 
@@ -244,19 +251,34 @@ fn check_collect_segmentation_restrictions(
 ) -> Result<()> {
     for (path, dataset) in datasets {
         for field in &dataset.data {
-            let Some(content) = &field.content else { continue };
-            let Some(from_ref) = &content.from else { continue };
-            let has_collect = content.item.fields.iter().any(|cf| !cf.collect_bindings().is_empty());
-            if !has_collect { continue; }
-            let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else { continue };
-            let Some(linked_path) = resolve_include(path, &link.file) else { continue };
+            let Some(content) = &field.content else {
+                continue;
+            };
+            let Some(from_ref) = &content.from else {
+                continue;
+            };
+            let has_collect = content
+                .item
+                .fields
+                .iter()
+                .any(|cf| !cf.collect_bindings().is_empty());
+            if !has_collect {
+                continue;
+            }
+            let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else {
+                continue;
+            };
+            let Some(linked_path) = resolve_include(path, &link.file) else {
+                continue;
+            };
             if let Some(members) = lower_cover_groups.get(&linked_path) {
                 if members.iter().any(|m| !m.is_witness_source) {
                     anyhow::bail!(
                         "dataset '{}': list-link collect on field '{}' is not supported \
                          when the linked dataset is jointly segmented with another lower cover member; \
                          use a top-level junction dataset instead",
-                        dataset.name, field.name
+                        dataset.name,
+                        field.name
                     );
                 }
             }
@@ -264,7 +286,6 @@ fn check_collect_segmentation_restrictions(
     }
     Ok(())
 }
-
 
 /// Planning-time feasibility check for list-link cardinality against the eligible
 /// linked-dataset size.
@@ -290,10 +311,18 @@ fn check_cardinality_feasibility(
     for (path, dataset) in datasets {
         // Nested-include (list-link) fields.
         for field in &dataset.data {
-            let Some(content) = &field.content else { continue };
-            let Some(from_ref) = &content.from else { continue };
-            let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else { continue };
-            let Some(linked_path) = resolve_include(path, &link.file) else { continue };
+            let Some(content) = &field.content else {
+                continue;
+            };
+            let Some(from_ref) = &content.from else {
+                continue;
+            };
+            let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else {
+                continue;
+            };
+            let Some(linked_path) = resolve_include(path, &link.file) else {
+                continue;
+            };
             let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
             let n_eligible = eligible_linked_rows(linked_rows, link.ratio);
             // Phase 1: empty linked dataset (all reinforcement modes).
@@ -301,7 +330,9 @@ fn check_cardinality_feasibility(
                 anyhow::bail!(
                     "dataset '{}' field '{}': linked dataset '{}' has 0 eligible rows \
                      (after applying ratio); cannot draw any items",
-                    dataset.name, field.name, link.reference
+                    dataset.name,
+                    field.name,
+                    link.reference
                 );
             }
             // Phase 2: without-replacement infeasibility.
@@ -311,17 +342,20 @@ fn check_cardinality_feasibility(
                     CountSpec::Normal { .. } => anyhow::bail!(
                         "dataset '{}' field '{}': `reinforcement: 0` (without-replacement) \
                          is not compatible with `Normal` cardinality — the count is unbounded",
-                        dataset.name, field.name
+                        dataset.name,
+                        field.name
                     ),
                     CountSpec::Fixed(n) if *n > n_eligible => anyhow::bail!(
                         "dataset '{}' field '{}': `reinforcement: 0` requires cardinality ≤ \
                          eligible linked-dataset size ({n_eligible}), but cardinality is {n}",
-                        dataset.name, field.name
+                        dataset.name,
+                        field.name
                     ),
                     CountSpec::Uniform { min, .. } if *min > n_eligible => anyhow::bail!(
                         "dataset '{}' field '{}': `reinforcement: 0` requires min cardinality ≤ \
                          eligible linked-dataset size ({n_eligible}), but min is {min}",
-                        dataset.name, field.name
+                        dataset.name,
+                        field.name
                     ),
                     _ => {}
                 }
@@ -336,7 +370,8 @@ fn check_cardinality_feasibility(
                             "dataset '{}' field '{}': `overlap: 0` requires at least as many \
                              eligible linked-dataset rows ({n_eligible}) as staging rows \
                              ({n_staging_rows}); increase the linked dataset size or raise `ratio`",
-                            dataset.name, field.name
+                            dataset.name,
+                            field.name
                         );
                     }
                     if link.reinforcement == Some(0.0) {
@@ -345,17 +380,20 @@ fn check_cardinality_feasibility(
                             CountSpec::Normal { .. } => anyhow::bail!(
                                 "dataset '{}' field '{}': `reinforcement: 0` is not compatible \
                                  with `Normal` cardinality — the count is unbounded",
-                                dataset.name, field.name
+                                dataset.name,
+                                field.name
                             ),
                             CountSpec::Fixed(n) if *n > shard_q => anyhow::bail!(
                                 "dataset '{}' field '{}': `overlap: 0, reinforcement: 0` requires \
                                  cardinality ≤ shard size ({shard_q}), but cardinality is {n}",
-                                dataset.name, field.name
+                                dataset.name,
+                                field.name
                             ),
                             CountSpec::Uniform { min, .. } if *min > shard_q => anyhow::bail!(
                                 "dataset '{}' field '{}': `overlap: 0, reinforcement: 0` requires \
                                  min cardinality ≤ shard size ({shard_q}), but min is {min}",
-                                dataset.name, field.name
+                                dataset.name,
+                                field.name
                             ),
                             _ => {}
                         }
@@ -373,12 +411,18 @@ fn check_cardinality_feasibility(
         }
 
         // Junction links.
-        let list_link_refs: HashSet<&str> = dataset.data.iter()
+        let list_link_refs: HashSet<&str> = dataset
+            .data
+            .iter()
             .filter_map(|f| f.content.as_ref()?.from.as_deref())
             .collect();
         for link in &dataset.links {
-            if list_link_refs.contains(link.reference.as_str()) { continue; }
-            let Some(linked_path) = resolve_include(path, &link.file) else { continue };
+            if list_link_refs.contains(link.reference.as_str()) {
+                continue;
+            }
+            let Some(linked_path) = resolve_include(path, &link.file) else {
+                continue;
+            };
             let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
             let n_eligible = eligible_linked_rows(linked_rows, link.ratio);
             // Phase 1: empty linked dataset (all reinforcement modes).
@@ -386,7 +430,8 @@ fn check_cardinality_feasibility(
                 anyhow::bail!(
                     "dataset '{}': link '{}' targets a linked dataset with 0 eligible rows \
                      (after applying ratio); cannot sample any junction rows",
-                    dataset.name, link.reference
+                    dataset.name,
+                    link.reference
                 );
             }
             // Phase 2: without-replacement infeasibility.
@@ -396,7 +441,8 @@ fn check_cardinality_feasibility(
                     anyhow::bail!(
                         "dataset '{}': `reinforcement: 0` on link '{}' requires junction rows \
                          ({junction_rows}) ≤ eligible linked-dataset rows ({n_eligible})",
-                        dataset.name, link.reference
+                        dataset.name,
+                        link.reference
                     );
                 }
             }
@@ -408,7 +454,8 @@ fn check_cardinality_feasibility(
                         "dataset '{}': `overlap: 0` on link '{}' requires at least as many \
                          eligible linked-dataset rows ({n_eligible}) as junction rows \
                          ({junction_rows})",
-                        dataset.name, link.reference
+                        dataset.name,
+                        link.reference
                     );
                 }
             }
@@ -437,7 +484,9 @@ fn scan_collect_targets(datasets: &HashMap<PathBuf, SyntheticDataset>) -> HashSe
                 if content.from.is_some() {
                     for cf in &content.item.fields {
                         for binding in cf.collect_bindings() {
-                            if let Some(linked_path) = resolve_collect_bind_target(path, dataset, binding) {
+                            if let Some(linked_path) =
+                                resolve_collect_bind_target(path, dataset, binding)
+                            {
                                 targets.insert(linked_path);
                             }
                         }
@@ -469,7 +518,8 @@ fn linked_field_default(
     field_name: &str,
     datasets: &HashMap<PathBuf, SyntheticDataset>,
 ) -> YamlValue {
-    datasets.get(linked_path)
+    datasets
+        .get(linked_path)
         .and_then(|ds| ds.data.iter().find(|f| f.name == field_name))
         .and_then(|f| f.default.clone())
         .unwrap_or(YamlValue::Null)
@@ -517,29 +567,40 @@ pub fn build_plan(
         // Note: inherited fields into a variant parent are not wired in v1 — they require
         // a single stable batch to pull columns from; variants produce N separate batches.
         if !dataset.variants.is_empty() {
-            let output_key = dataset.resolved_outputs().into_iter()
-                .next().map(|o| o.file).unwrap_or_else(|| dataset.name.clone());
-            let variant_dists: Vec<Option<f64>> = dataset.variants.iter().map(|v| v.ratio).collect();
+            let output_key = dataset
+                .resolved_outputs()
+                .into_iter()
+                .next()
+                .map(|o| o.file)
+                .unwrap_or_else(|| dataset.name.clone());
+            let variant_dists: Vec<Option<f64>> =
+                dataset.variants.iter().map(|v| v.ratio).collect();
             let dists = resolve_distributions(&variant_dists);
             let row_counts_v = distribute_rows(row_counts[path], &dists);
 
-            for (i, (variant, &variant_rows)) in dataset.variants.iter().zip(row_counts_v.iter()).enumerate() {
+            for (i, (variant, &variant_rows)) in
+                dataset.variants.iter().zip(row_counts_v.iter()).enumerate()
+            {
                 let virtual_path = variant_key(path, i);
-                let concrete = expand_variant_dataset(dataset, variant, i, variant_rows, &output_key);
+                let concrete =
+                    expand_variant_dataset(dataset, variant, i, variant_rows, &output_key);
 
                 if let Some(members) = lower_cover_groups.get(path) {
                     // Each flat lower cover member accumulates rows from N variant groups; ensure it has
                     // an output so WriteSharedOutput fires once for the combined output.
                     // Witness-source members (is_witness_source=true) have no standalone output.
-                    let members_with_output: Vec<LowerCoverMember> = members.iter().map(|m| {
-                        let mut s = m.clone();
-                        if s.dataset.resolved_outputs().is_empty() && !s.is_witness_source {
-                            s.dataset.output = Some(crate::models::OutputSpec::Shorthand(
-                                m.dataset.name.clone(),
-                            ));
-                        }
-                        s
-                    }).collect();
+                    let members_with_output: Vec<LowerCoverMember> = members
+                        .iter()
+                        .map(|m| {
+                            let mut s = m.clone();
+                            if s.dataset.resolved_outputs().is_empty() && !s.is_witness_source {
+                                s.dataset.output = Some(crate::models::OutputSpec::Shorthand(
+                                    m.dataset.name.clone(),
+                                ));
+                            }
+                            s
+                        })
+                        .collect();
                     let segments = plan_segments(variant_rows, &members_with_output)?;
                     for m in &members_with_output {
                         track_shared(&m.dataset, &mut shared_outputs, &mut seen_shared);
@@ -550,14 +611,26 @@ pub fn build_plan(
                     let (s_vpath, s_c) = (vpath.clone(), c.clone());
                     let segs_for_witness = segments.clone();
                     let (s_segs, s_mbrs) = (segments.clone(), members_with_output.clone());
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &row_counts, &segs_for_witness,
+                    push_with_list_link_steps(
+                        &mut steps,
+                        &concrete,
+                        &virtual_path,
+                        false,
+                        datasets,
+                        &row_counts,
+                        &segs_for_witness,
                         || ExecutionStep::GenerateStagingLowerCoverGroup {
-                            parent_path: s_vpath, parent: s_c,
-                            segments: s_segs, members: s_mbrs,
+                            parent_path: s_vpath,
+                            parent: s_c,
+                            segments: s_segs,
+                            members: s_mbrs,
                         },
                         |defer| ExecutionStep::GenerateLowerCoverGroup {
-                            parent_path: vpath, parent: c,
-                            segments, members: members_with_output, defer_emit: defer,
+                            parent_path: vpath,
+                            parent: c,
+                            segments,
+                            members: members_with_output,
+                            defer_emit: defer,
                         },
                     );
                 } else {
@@ -570,14 +643,26 @@ pub fn build_plan(
                         rows: variant_rows,
                         field_constraints: HashMap::new(),
                     }];
-                    push_with_list_link_steps(&mut steps, &concrete, &virtual_path, false, datasets, &row_counts, &single_seg,
+                    push_with_list_link_steps(
+                        &mut steps,
+                        &concrete,
+                        &virtual_path,
+                        false,
+                        datasets,
+                        &row_counts,
+                        &single_seg,
                         || ExecutionStep::GenerateStagingNode {
-                            path: s_vpath, dataset: s_c,
-                            rows: variant_rows, inherited: vec![],
+                            path: s_vpath,
+                            dataset: s_c,
+                            rows: variant_rows,
+                            inherited: vec![],
                         },
                         |_| ExecutionStep::GenerateDataset {
-                            path: vpath, dataset: c,
-                            rows: variant_rows, inherited: vec![], defer_emit: false,
+                            path: vpath,
+                            dataset: c,
+                            rows: variant_rows,
+                            inherited: vec![],
+                            defer_emit: false,
                         },
                     );
                 }
@@ -607,19 +692,33 @@ pub fn build_plan(
             let (s_p, s_d) = (p.clone(), d.clone());
             let segs_for_witness = segments.clone();
             let (s_segs, s_mbrs) = (segments.clone(), mbrs.clone());
-            push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &row_counts, &segs_for_witness,
+            push_with_list_link_steps(
+                &mut steps,
+                dataset,
+                path,
+                is_collect_target,
+                datasets,
+                &row_counts,
+                &segs_for_witness,
                 || ExecutionStep::GenerateStagingLowerCoverGroup {
-                    parent_path: s_p, parent: s_d,
-                    segments: s_segs, members: s_mbrs,
+                    parent_path: s_p,
+                    parent: s_d,
+                    segments: s_segs,
+                    members: s_mbrs,
                 },
                 |defer| ExecutionStep::GenerateLowerCoverGroup {
-                    parent_path: p, parent: d,
-                    segments, members: mbrs, defer_emit: defer,
+                    parent_path: p,
+                    parent: d,
+                    segments,
+                    members: mbrs,
+                    defer_emit: defer,
                 },
             );
             // Junction link members: emit AccumulateToLinked + EmitDataset after the group step.
             for m in members {
-                if m.is_witness_source { continue; }
+                if m.is_witness_source {
+                    continue;
+                }
                 emit_top_level_collect_steps(&m.dataset, &m.path, datasets, &mut steps);
             }
             continue;
@@ -638,19 +737,38 @@ pub fn build_plan(
             rows,
             field_constraints: HashMap::new(),
         }];
-        push_with_list_link_steps(&mut steps, dataset, path, is_collect_target, datasets, &row_counts, &single_seg,
+        push_with_list_link_steps(
+            &mut steps,
+            dataset,
+            path,
+            is_collect_target,
+            datasets,
+            &row_counts,
+            &single_seg,
             || ExecutionStep::GenerateStagingNode {
-                path: s_p, dataset: s_d, rows, inherited: s_inherited,
+                path: s_p,
+                dataset: s_d,
+                rows,
+                inherited: s_inherited,
             },
             |defer| ExecutionStep::GenerateDataset {
-                path: p, dataset: d, rows, inherited, defer_emit: defer,
+                path: p,
+                dataset: d,
+                rows,
+                inherited,
+                defer_emit: defer,
             },
         );
         emit_top_level_collect_steps(dataset, path, datasets, &mut steps);
     }
 
     for (output_file, format, quality, schema) in shared_outputs {
-        steps.push(ExecutionStep::WriteSharedOutput { output_file, format, quality, schema });
+        steps.push(ExecutionStep::WriteSharedOutput {
+            output_file,
+            format,
+            quality,
+            schema,
+        });
     }
 
     // Verify that every GenerateWitness step is preceded by its staging counterpart.
@@ -730,10 +848,18 @@ fn emit_witness_steps(
 ) {
     let mut witness_specs: Vec<(String, Vec<PathBuf>, Option<String>)> = Vec::new();
     for field in &dataset.data {
-        let Some(content) = &field.content else { continue };
-        let Some(ref from_ref) = content.from else { continue };
-        let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else { continue };
-        let Some(linked_path) = resolve_include(path, &link.file) else { continue };
+        let Some(content) = &field.content else {
+            continue;
+        };
+        let Some(ref from_ref) = content.from else {
+            continue;
+        };
+        let Some(link) = dataset.links.iter().find(|l| l.reference == *from_ref) else {
+            continue;
+        };
+        let Some(linked_path) = resolve_include(path, &link.file) else {
+            continue;
+        };
         let cardinality = link.cardinality.clone().unwrap_or(CountSpec::Fixed(1));
         // Compute shard_q for overlap:0 — the eligible linked rows divided evenly among all
         // staging rows. Uses pre-filter count so shard boundaries are cross-segment stable.
@@ -741,7 +867,11 @@ fn emit_witness_steps(
             let n_staging_rows = *row_counts.get(path).unwrap_or(&0);
             let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
             let n_eligible = eligible_linked_rows(linked_rows, link.ratio);
-            if n_staging_rows > 0 { Some(n_eligible / n_staging_rows) } else { None }
+            if n_staging_rows > 0 {
+                Some(n_eligible / n_staging_rows)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -775,18 +905,22 @@ fn emit_witness_steps(
             // written by previous segments' AccumulateToLinked calls.
             for cf in &content.item.fields {
                 for binding in cf.collect_bindings() {
-                    let Some(bind) = binding.bind.as_deref() else { continue };
-                    let Some((_, linked_field)) = split_ref(bind) else { continue };
+                    let Some(bind) = binding.bind.as_deref() else {
+                        continue;
+                    };
+                    let Some((_, linked_field)) = split_ref(bind) else {
+                        continue;
+                    };
                     let lf_name = linked_field.to_string();
                     let def = linked_field_default(&linked_path, &lf_name, all_datasets);
                     steps.push(ExecutionStep::AccumulateToLinked {
-                        source_path:  wkey.clone(),
+                        source_path: wkey.clone(),
                         source_field: cf.name.clone(),
-                        linked_path:  linked_path.clone(),
+                        linked_path: linked_path.clone(),
                         linked_field: lf_name,
-                        group_by:     "_linked_idx".to_string(),
-                        reducer:      binding.reducer.clone().unwrap_or(Reducer::Collect),
-                        default_val:  def,
+                        group_by: "_linked_idx".to_string(),
+                        reducer: binding.reducer.clone().unwrap_or(Reducer::Collect),
+                        default_val: def,
                     });
                 }
             }
@@ -795,17 +929,23 @@ fn emit_witness_steps(
         }
 
         // After all segments: emit EmitDataset once if any content field has collect bindings.
-        let has_collect = content.item.fields.iter().any(|cf| !cf.collect_bindings().is_empty());
+        let has_collect = content
+            .item
+            .fields
+            .iter()
+            .any(|cf| !cf.collect_bindings().is_empty());
         if has_collect {
             if let Some(linked_ds) = all_datasets.get(&linked_path) {
                 steps.push(ExecutionStep::EmitDataset {
-                    path:    linked_path.clone(),
+                    path: linked_path.clone(),
                     dataset: Arc::new(linked_ds.clone()),
                 });
             }
         }
 
-        let project_col = content.project.as_ref()
+        let project_col = content
+            .project
+            .as_ref()
             .and_then(|p| split_ref(p))
             .map(|(_, f)| f.to_string());
         if !field_witness_keys.is_empty() {
@@ -834,7 +974,9 @@ fn emit_top_level_collect_steps(
     all_datasets: &HashMap<PathBuf, SyntheticDataset>,
     steps: &mut Vec<ExecutionStep>,
 ) {
-    let list_link_refs: HashSet<&str> = dataset.data.iter()
+    let list_link_refs: HashSet<&str> = dataset
+        .data
+        .iter()
         .filter_map(|f| f.content.as_ref()?.from.as_deref())
         .collect();
 
@@ -843,21 +985,31 @@ fn emit_top_level_collect_steps(
     let mut seen_linked: HashSet<PathBuf> = HashSet::new();
     for field in &dataset.data {
         for binding in field.collect_bindings() {
-            let Some(bind) = binding.bind.as_deref() else { continue };
-            let Some((linked_ref, linked_field)) = split_ref(bind) else { continue };
-            let Some(link) = dataset.links.iter().find(|l| l.reference == linked_ref) else { continue };
-            if list_link_refs.contains(link.reference.as_str()) { continue; }
-            let Some(linked_path) = resolve_include(path, &link.file) else { continue };
+            let Some(bind) = binding.bind.as_deref() else {
+                continue;
+            };
+            let Some((linked_ref, linked_field)) = split_ref(bind) else {
+                continue;
+            };
+            let Some(link) = dataset.links.iter().find(|l| l.reference == linked_ref) else {
+                continue;
+            };
+            if list_link_refs.contains(link.reference.as_str()) {
+                continue;
+            }
+            let Some(linked_path) = resolve_include(path, &link.file) else {
+                continue;
+            };
             let lf_name = linked_field.to_string();
             let def = linked_field_default(&linked_path, &lf_name, all_datasets);
             steps.push(ExecutionStep::AccumulateToLinked {
-                source_path:  path.to_path_buf(),
+                source_path: path.to_path_buf(),
                 source_field: field.name.clone(),
-                linked_path:  linked_path.clone(),
+                linked_path: linked_path.clone(),
                 linked_field: lf_name,
-                group_by:     "_linked_idx".to_string(),
-                reducer:      binding.reducer.clone().unwrap_or(Reducer::Collect),
-                default_val:  def,
+                group_by: "_linked_idx".to_string(),
+                reducer: binding.reducer.clone().unwrap_or(Reducer::Collect),
+                default_val: def,
             });
             if seen_linked.insert(linked_path.clone()) {
                 if let Some(linked_ds) = all_datasets.get(&linked_path) {
@@ -869,7 +1021,10 @@ fn emit_top_level_collect_steps(
 
     // Pass 2: emit one EmitDataset per linked dataset, after ALL AccumulateToLinked steps for it.
     for (linked_path, linked_ds) in linked_to_emit {
-        steps.push(ExecutionStep::EmitDataset { path: linked_path, dataset: linked_ds });
+        steps.push(ExecutionStep::EmitDataset {
+            path: linked_path,
+            dataset: linked_ds,
+        });
     }
 }
 
@@ -904,13 +1059,19 @@ fn compute_lower_cover_inherited(
             continue;
         }
         for include in child_ds.include.iter() {
-            let Some(resolved) = resolve_include(child_path, &include.file) else { continue };
+            let Some(resolved) = resolve_include(child_path, &include.file) else {
+                continue;
+            };
             if resolved != path {
                 continue;
             }
             for field in &child_ds.data {
-                let Some(ref_str) = field.simple_ref() else { continue };
-                let Some((ref_part, target_col)) = split_ref(ref_str) else { continue };
+                let Some(ref_str) = field.simple_ref() else {
+                    continue;
+                };
+                let Some((ref_part, target_col)) = split_ref(ref_str) else {
+                    continue;
+                };
                 if ref_part != include.reference {
                     continue;
                 }
@@ -934,15 +1095,20 @@ fn build_lower_cover_groups(
         // even a ratio-1.0 child must enter conflict pruning so its field constraints are applied
         // jointly with lower cover constraints rather than silently winning via join order.
         for include in dataset.include.iter() {
-            let Some(parent_path) = resolve_include(outer_path, &include.file) else { continue };
-            groups.entry(parent_path).or_default().push(LowerCoverMember {
-                path: outer_path.clone(),
-                dataset: dataset.clone(),
-                ratio: include.ratio.unwrap_or(1.0),
-                cardinality: include.cardinality.clone(),
-                reference: include.reference.clone(),
-                is_witness_source: false,
-            });
+            let Some(parent_path) = resolve_include(outer_path, &include.file) else {
+                continue;
+            };
+            groups
+                .entry(parent_path)
+                .or_default()
+                .push(LowerCoverMember {
+                    path: outer_path.clone(),
+                    dataset: dataset.clone(),
+                    ratio: include.ratio.unwrap_or(1.0),
+                    cardinality: include.cardinality.clone(),
+                    reference: include.reference.clone(),
+                    is_witness_source: false,
+                });
         }
         // Witness-source members: list-link fields whose content includes another dataset with a
         // ratio. The linked dataset represents the subset eligible for list sampling.
@@ -960,33 +1126,39 @@ fn collect_linked_lower_cover_members(
     dataset: &SyntheticDataset,
     groups: &mut HashMap<PathBuf, Vec<LowerCoverMember>>,
 ) {
-    for_each_list_link(&dataset.links, &dataset.data, &mut |field, link, item_fields| {
-        let Some(inc_path) = resolve_include(outer_path, &link.file) else { return };
-        // Virtual path uniquely identifies this witness-source member within the outer dataset.
-        let member_path = linked_lower_cover_path(outer_path, &field.name);
-        // The member "dataset" carries only the list-content item fields so that
-        // lower_cover_field_constraints can extract ref-based constraints from them.
-        let member_dataset = SyntheticDataset {
-            name: format!("{}__{}_linked", dataset.name, field.name),
-            format: dataset.format.clone(),
-            output: None,
-            outputs: vec![],
-            rows: None,
-            locale: dataset.locale.clone(),
-            include: None,
-            links: vec![],
-            data: item_fields.to_vec(),
-            variants: vec![],
-        };
-        groups.entry(inc_path).or_default().push(LowerCoverMember {
-            path: member_path,
-            dataset: member_dataset,
-            ratio: link.ratio.unwrap_or(1.0),
-            cardinality: None,
-            reference: link.reference.clone(),
-            is_witness_source: true,
-        });
-    });
+    for_each_list_link(
+        &dataset.links,
+        &dataset.data,
+        &mut |field, link, item_fields| {
+            let Some(inc_path) = resolve_include(outer_path, &link.file) else {
+                return;
+            };
+            // Virtual path uniquely identifies this witness-source member within the outer dataset.
+            let member_path = linked_lower_cover_path(outer_path, &field.name);
+            // The member "dataset" carries only the list-content item fields so that
+            // lower_cover_field_constraints can extract ref-based constraints from them.
+            let member_dataset = SyntheticDataset {
+                name: format!("{}__{}_linked", dataset.name, field.name),
+                format: dataset.format.clone(),
+                output: None,
+                outputs: vec![],
+                rows: None,
+                locale: dataset.locale.clone(),
+                include: None,
+                links: vec![],
+                data: item_fields.to_vec(),
+                variants: vec![],
+            };
+            groups.entry(inc_path).or_default().push(LowerCoverMember {
+                path: member_path,
+                dataset: member_dataset,
+                ratio: link.ratio.unwrap_or(1.0),
+                cardinality: None,
+                reference: link.reference.clone(),
+                is_witness_source: true,
+            });
+        },
+    );
 }
 
 fn linked_lower_cover_path(outer_path: &Path, field_name: &str) -> PathBuf {

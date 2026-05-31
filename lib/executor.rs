@@ -14,37 +14,44 @@
 //! | `_slot_idx` | `UInt32` | `execute_lower_cover_group_core` (member batches) | `AssembleFromWitness` (fold into lists) | `strip_slot_idx` before member emit |
 //! | `_staging_refs` | `List<UInt32>` | `execute_witness` | `execute_assemble_from_witness` (fold) | stripped during assembly |
 //! | `_linked_idx` | `UInt32` | `inject_linked_idx` (junction) / `execute_witness` | `execute_accumulate_to_linked` | `strip_linked_idx` before junction emit |
-use anyhow::{anyhow, bail, Context, Result};
-use arrow::array::{Array, ArrayRef, Float64Array, ListArray, StringBuilder, StringArray, StructArray, UInt32Array, new_empty_array};
+use anyhow::{Context, Result, anyhow, bail};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, ListArray, StringArray, StringBuilder, StructArray, UInt32Array,
+    new_empty_array,
+};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{concat, concat_batches, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
-use serde_yaml::Value as YamlValue;
-use datafusion::functions_aggregate::expr_fn::{
-    array_agg,
-    first_value as df_first_value,
-    max as df_max,
-    min as df_min,
-    sum as df_sum,
-};
-use datafusion::prelude::{col, Expr, SessionContext};
 use datafusion::common::Column;
+use datafusion::functions_aggregate::expr_fn::{
+    array_agg, first_value as df_first_value, max as df_max, min as df_min, sum as df_sum,
+};
 use datafusion::logical_expr::JoinType;
+use datafusion::prelude::{Expr, SessionContext, col};
 use fake::Fake;
 use parquet::arrow::ArrowWriter;
+use serde_yaml::Value as YamlValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::constraints::FieldConstraints;
-use crate::generator::{generate_column, sample_count};
-use crate::schema::{field_to_arrow, schema_to_arrow};
 use crate::dq::apply_data_quality;
-use crate::models::{eligible_linked_rows, resolve_distributions, resolve_include, split_ref, CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset};
-use crate::plan::{distribute_rows, merge_variant_fields, ExecutionPlan, ExecutionStep, InheritedField};
-use crate::segment::{constraints_conflict, lower_cover_field_constraints, try_merge_incremental, LowerCoverMember, Segment};
+use crate::generator::{generate_column, sample_count};
+use crate::models::{
+    CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset,
+    eligible_linked_rows, resolve_distributions, resolve_include, split_ref,
+};
+use crate::plan::{
+    ExecutionPlan, ExecutionStep, InheritedField, distribute_rows, merge_variant_fields,
+};
+use crate::schema::{field_to_arrow, schema_to_arrow};
+use crate::segment::{
+    LowerCoverMember, Segment, constraints_conflict, lower_cover_field_constraints,
+    try_merge_incremental,
+};
 
 /// Execute the plan produced by `plan::build_plan`, writing outputs to `output_dir`.
 ///
@@ -68,75 +75,174 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
         match step {
             // --- Push-down phase: generate datasets and staging nodes (scalar fields only
             //     for nodes with list-links), fan rows to lower cover members. ---
-            ExecutionStep::GenerateStagingNode { path, dataset, rows, inherited } => {
+            ExecutionStep::GenerateStagingNode {
+                path,
+                dataset,
+                rows,
+                inherited,
+            } => {
                 execute_dataset_core(
-                    true, false, path, dataset.as_ref(), *rows, inherited,
-                    &mut computed, &mut shared,
-                ).await?;
+                    true,
+                    false,
+                    path,
+                    dataset.as_ref(),
+                    *rows,
+                    inherited,
+                    &mut computed,
+                    &mut shared,
+                )
+                .await?;
             }
-            ExecutionStep::GenerateDataset { path, dataset, rows, inherited, defer_emit } => {
+            ExecutionStep::GenerateDataset {
+                path,
+                dataset,
+                rows,
+                inherited,
+                defer_emit,
+            } => {
                 execute_dataset_core(
-                    false, *defer_emit, path, dataset.as_ref(), *rows, inherited,
-                    &mut computed, &mut shared,
-                ).await?;
+                    false,
+                    *defer_emit,
+                    path,
+                    dataset.as_ref(),
+                    *rows,
+                    inherited,
+                    &mut computed,
+                    &mut shared,
+                )
+                .await?;
             }
-            ExecutionStep::GenerateStagingLowerCoverGroup { parent_path, parent, segments, members } => {
+            ExecutionStep::GenerateStagingLowerCoverGroup {
+                parent_path,
+                parent,
+                segments,
+                members,
+            } => {
                 execute_lower_cover_group_core(
-                    true, false, parent_path, parent.as_ref(), segments, members,
-                    &mut computed, &mut parent_computed, &mut shared,
-                ).await?;
+                    true,
+                    false,
+                    parent_path,
+                    parent.as_ref(),
+                    segments,
+                    members,
+                    &mut computed,
+                    &mut parent_computed,
+                    &mut shared,
+                )
+                .await?;
             }
-            ExecutionStep::GenerateLowerCoverGroup { parent_path, parent, segments, members, defer_emit } => {
+            ExecutionStep::GenerateLowerCoverGroup {
+                parent_path,
+                parent,
+                segments,
+                members,
+                defer_emit,
+            } => {
                 execute_lower_cover_group_core(
-                    false, *defer_emit, parent_path, parent.as_ref(), segments, members,
-                    &mut computed, &mut parent_computed, &mut shared,
-                ).await?;
+                    false,
+                    *defer_emit,
+                    parent_path,
+                    parent.as_ref(),
+                    segments,
+                    members,
+                    &mut computed,
+                    &mut parent_computed,
+                    &mut shared,
+                )
+                .await?;
             }
             ExecutionStep::GenerateWitness {
-                witness_key, staging_path, list_field_name,
-                inner_fields, include, cardinality,
-                linked_path, slot_start, slot_count, segment_constraints, shard_q,
+                witness_key,
+                staging_path,
+                list_field_name,
+                inner_fields,
+                include,
+                cardinality,
+                linked_path,
+                slot_start,
+                slot_count,
+                segment_constraints,
+                shard_q,
             } => {
                 execute_witness(
-                    witness_key, staging_path, list_field_name,
-                    inner_fields, include, cardinality,
-                    linked_path, *slot_start, *slot_count, segment_constraints, *shard_q,
+                    witness_key,
+                    staging_path,
+                    list_field_name,
+                    inner_fields,
+                    include,
+                    cardinality,
+                    linked_path,
+                    *slot_start,
+                    *slot_count,
+                    segment_constraints,
+                    *shard_q,
                     &mut computed,
                 )?;
             }
             // --- Accumulate-up phase: fold witness rows into list columns, propagate
             //     collected values back to linked datasets, emit final output files. ---
-            ExecutionStep::AssembleFromWitness { staging_path, dataset, witness_specs } => {
+            ExecutionStep::AssembleFromWitness {
+                staging_path,
+                dataset,
+                witness_specs,
+            } => {
                 execute_assemble_from_witness(
-                    staging_path, dataset.as_ref(), witness_specs,
-                    &mut computed, &mut shared,
-                ).await?;
+                    staging_path,
+                    dataset.as_ref(),
+                    witness_specs,
+                    &mut computed,
+                    &mut shared,
+                )
+                .await?;
             }
             ExecutionStep::AccumulateToLinked {
-                source_path, source_field, linked_path, linked_field, group_by, reducer, default_val,
+                source_path,
+                source_field,
+                linked_path,
+                linked_field,
+                group_by,
+                reducer,
+                default_val,
             } => {
                 execute_accumulate_to_linked(
-                    source_path, source_field, linked_path, linked_field, group_by, reducer, default_val,
+                    source_path,
+                    source_field,
+                    linked_path,
+                    linked_field,
+                    group_by,
+                    reducer,
+                    default_val,
                     &mut computed,
                     &mut accumulated_fields,
-                ).await?;
+                )
+                .await?;
             }
             ExecutionStep::EmitDataset { path, dataset } => {
                 execute_emit_dataset(path, dataset.as_ref(), &computed, &mut shared).await?;
             }
-            ExecutionStep::WriteSharedOutput { output_file, format, quality, schema } => {
-                let Some((_, batches)) = shared.get(output_file) else { continue };
+            ExecutionStep::WriteSharedOutput {
+                output_file,
+                format,
+                quality,
+                schema,
+            } => {
+                let Some((_, batches)) = shared.get(output_file) else {
+                    continue;
+                };
                 let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 if total_rows > 0 {
                     let combined = union_and_shuffle(batches.clone(), output_file).await?;
                     let final_batch = match quality {
                         Some(q) => apply_data_quality(combined, q, schema)?,
-                        None    => combined,
+                        None => combined,
                     };
                     write_output(&final_batch, output_file, format, output_dir)?;
                 }
             }
-            ExecutionStep::CombineVariantBatches { original_path, variant_paths } => {
+            ExecutionStep::CombineVariantBatches {
+                original_path,
+                variant_paths,
+            } => {
                 let batches: Vec<RecordBatch> = variant_paths
                     .iter()
                     .filter_map(|vp| computed.get(vp))
@@ -168,8 +274,12 @@ fn resolve_inherited_fields(
 ) -> HashMap<String, Vec<ArrayRef>> {
     let mut map: HashMap<String, Vec<ArrayRef>> = HashMap::new();
     for ps in inherited {
-        let Some(batch) = computed.get(&ps.from_path) else { continue };
-        let Ok(col_idx) = batch.schema().index_of(&ps.from_column) else { continue };
+        let Some(batch) = computed.get(&ps.from_path) else {
+            continue;
+        };
+        let Ok(col_idx) = batch.schema().index_of(&ps.from_column) else {
+            continue;
+        };
         map.entry(ps.into_column.clone())
             .or_default()
             .push(batch.column(col_idx).clone());
@@ -209,7 +319,8 @@ async fn execute_dataset_core(
         // The full batch (with _linked_idx) is kept in `computed` for AccumulateToLinked;
         // _linked_idx is stripped before emitting.
         let batch = inject_linked_idx(&batch, path, dataset, computed)?;
-        let output = filter_hidden_columns(strip_sentinel(batch.clone(), "_linked_idx"), &dataset.data)?;
+        let output =
+            filter_hidden_columns(strip_sentinel(batch.clone(), "_linked_idx"), &dataset.data)?;
         computed.insert(path.to_path_buf(), batch);
         if !defer_emit {
             emit_batch(output, dataset, shared)?;
@@ -233,7 +344,8 @@ async fn execute_lower_cover_group_core(
     parent_computed: &mut HashSet<PathBuf>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
-    let witness_source_paths: HashSet<PathBuf> = members.iter()
+    let witness_source_paths: HashSet<PathBuf> = members
+        .iter()
         .filter(|m| m.is_witness_source)
         .map(|m| m.path.clone())
         .collect();
@@ -255,7 +367,10 @@ async fn execute_lower_cover_group_core(
             continue;
         }
 
-        let seg_has_witness_source = seg.members.iter().any(|mp| witness_source_paths.contains(mp));
+        let seg_has_witness_source = seg
+            .members
+            .iter()
+            .any(|mp| witness_source_paths.contains(mp));
 
         if seg.members.is_empty() {
             // Parent-only segment: no child rows to inherit — generate fresh.
@@ -268,7 +383,9 @@ async fn execute_lower_cover_group_core(
         } else {
             // Witness-source members contribute constraints but produce no standalone batches.
             // Separate them from real (flat) members before generating children.
-            let real_member_paths: Vec<&PathBuf> = seg.members.iter()
+            let real_member_paths: Vec<&PathBuf> = seg
+                .members
+                .iter()
                 .filter(|mp| !witness_source_paths.contains(*mp))
                 .collect();
 
@@ -288,13 +405,18 @@ async fn execute_lower_cover_group_core(
                         // parent slot). Generate a fresh canonical batch for assembly and an
                         // expanded batch tagged with _slot_idx so the lattice position is
                         // recorded in computed after all segments are processed.
-                        let canonical = generate_member_batch(
-                            m, seg.rows, &seg.field_constraints,
-                        )?;
+                        let canonical = generate_member_batch(m, seg.rows, &seg.field_constraints)?;
                         let expanded = generate_member_expanded_batch(
-                            m, seg.rows, &seg.field_constraints, card, slot_offset,
+                            m,
+                            seg.rows,
+                            &seg.field_constraints,
+                            card,
+                            slot_offset,
                         )?;
-                        member_buffers.entry(m.path.clone()).or_default().push(expanded);
+                        member_buffers
+                            .entry(m.path.clone())
+                            .or_default()
+                            .push(expanded);
                         child_batches.push((m, canonical));
                     } else {
                         // No cardinality: precomputed row count matches seg.rows.
@@ -303,18 +425,26 @@ async fn execute_lower_cover_group_core(
                     }
                 } else {
                     // Canonical batch: one row per slot, used for parent assembly.
-                    let canonical = generate_member_batch(
-                        m, seg.rows, &seg.field_constraints,
-                    )?;
+                    let canonical = generate_member_batch(m, seg.rows, &seg.field_constraints)?;
                     if let Some(ref card) = m.cardinality {
                         // Expanded batch: M_n rows per slot, tagged with _slot_idx for output.
                         let expanded = generate_member_expanded_batch(
-                            m, seg.rows, &seg.field_constraints, card, slot_offset,
+                            m,
+                            seg.rows,
+                            &seg.field_constraints,
+                            card,
+                            slot_offset,
                         )?;
-                        member_buffers.entry(m.path.clone()).or_default().push(expanded);
+                        member_buffers
+                            .entry(m.path.clone())
+                            .or_default()
+                            .push(expanded);
                         child_batches.push((m, canonical));
                     } else {
-                        member_buffers.entry(m.path.clone()).or_default().push(canonical.clone());
+                        member_buffers
+                            .entry(m.path.clone())
+                            .or_default()
+                            .push(canonical.clone());
                         child_batches.push((m, canonical));
                     }
                 }
@@ -325,8 +455,12 @@ async fn execute_lower_cover_group_core(
                 generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?
             } else {
                 grow_parent_from_children(
-                    &dataset.data, seg.rows, &child_batches, &seg.field_constraints,
-                ).await?
+                    &dataset.data,
+                    seg.rows,
+                    &child_batches,
+                    &seg.field_constraints,
+                )
+                .await?
             };
 
             if is_staging {
@@ -344,12 +478,19 @@ async fn execute_lower_cover_group_core(
     // For non-staging: witness-source rows first, then shuffled remainder.
     let parent_shuffled = if is_staging {
         // Row order determines slot indices used by per-segment GenerateWitness steps.
-        let arrow_schema = ordered_staging_batches.first()
+        let arrow_schema = ordered_staging_batches
+            .first()
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(schema_to_arrow(&dataset.data)));
         concat_batches(&arrow_schema, &ordered_staging_batches)?
     } else if has_witness_sources && !witness_source_parent_batches.is_empty() {
-        combine_witness_source_first(witness_source_parent_batches, non_witness_source_parent_batches, &dataset.data, &dataset.name).await?
+        combine_witness_source_first(
+            witness_source_parent_batches,
+            non_witness_source_parent_batches,
+            &dataset.data,
+            &dataset.name,
+        )
+        .await?
     } else {
         let mut all = witness_source_parent_batches;
         all.extend(non_witness_source_parent_batches);
@@ -396,13 +537,17 @@ async fn execute_lower_cover_group_core(
             member_buffers.remove(&m.path).unwrap_or_default(),
             &m.dataset.data,
             &m.dataset.name,
-        ).await?;
+        )
+        .await?;
         let m_shuffled = evaluate_expressions(m_shuffled, &m.dataset).await?;
         // For junction link members: sample one linked row per row and prepend as _linked_idx.
         // The linked batch must already be in `computed` (DAG link-edge ordering guarantees this).
         let m_shuffled = inject_linked_idx(&m_shuffled, &m.path, &m.dataset, computed)?;
         let m_output = filter_hidden_columns(
-            strip_sentinel(strip_sentinel(m_shuffled.clone(), "_slot_idx"), "_linked_idx"),
+            strip_sentinel(
+                strip_sentinel(m_shuffled.clone(), "_slot_idx"),
+                "_linked_idx",
+            ),
             &m.dataset.data,
         )?;
         computed.insert(m.path.clone(), m_shuffled);
@@ -432,7 +577,6 @@ async fn grow_parent_from_children(
     child_batches: &[(&LowerCoverMember, RecordBatch)],
     field_constraints: &HashMap<String, FieldConstraints>,
 ) -> Result<RecordBatch> {
-
     // Map parent field name → (child alias "c0"/"c1"/…, child column name).
     // or_insert preserves first-child-wins semantics.
     let mut sources: HashMap<String, (String, String)> = HashMap::new();
@@ -440,11 +584,14 @@ async fn grow_parent_from_children(
         let alias = format!("c{ci}");
         let prefix = format!("{}.", m.reference);
         for child_field in &m.dataset.data {
-            if child_batch.schema().index_of(&child_field.name).is_err() { continue; }
+            if child_batch.schema().index_of(&child_field.name).is_err() {
+                continue;
+            }
             // Rule 1: cross-schema ref — child's ref points back to a parent field by name.
             if let Some(ref_str) = child_field.simple_ref() {
                 if let Some(parent_col) = ref_str.strip_prefix(prefix.as_str()) {
-                    sources.entry(parent_col.to_string())
+                    sources
+                        .entry(parent_col.to_string())
                         .or_insert_with(|| (alias.clone(), child_field.name.clone()));
                     continue;
                 }
@@ -452,17 +599,24 @@ async fn grow_parent_from_children(
             // Rule 2: same-name field, not a cross-ref pointing elsewhere.
             // Skip when the parent field has a constant `value`: it belongs in Rule 3
             // (skeleton), which correctly emits the constant regardless of child values.
-            let is_cross_ref = child_field.simple_ref()
+            let is_cross_ref = child_field
+                .simple_ref()
                 .is_some_and(|r| r.starts_with(prefix.as_str()));
-            if !is_cross_ref && parent_schema.iter().any(|pf| pf.name == child_field.name && pf.value.is_none()) {
-                sources.entry(child_field.name.clone())
+            if !is_cross_ref
+                && parent_schema
+                    .iter()
+                    .any(|pf| pf.name == child_field.name && pf.value.is_none())
+            {
+                sources
+                    .entry(child_field.name.clone())
                     .or_insert_with(|| (alias.clone(), child_field.name.clone()));
             }
         }
     }
 
     // Active parent fields (skip expressions and nested-include placeholders).
-    let active: Vec<&Field> = parent_schema.iter()
+    let active: Vec<&Field> = parent_schema
+        .iter()
         .filter(|f| f.expression.is_none() && !f.is_list_link())
         .collect();
 
@@ -471,8 +625,12 @@ async fn grow_parent_from_children(
     let mut skel_fields = vec![ArrowField::new("_row_idx", DataType::UInt32, false)];
     let mut skel_cols: Vec<ArrayRef> = vec![idx];
     for f in &active {
-        if sources.contains_key(f.name.as_str()) { continue; }
-        let effective = field_constraints.get(f.name.as_str()).map(|fc| apply_constraints(f, fc));
+        if sources.contains_key(f.name.as_str()) {
+            continue;
+        }
+        let effective = field_constraints
+            .get(f.name.as_str())
+            .map(|fc| apply_constraints(f, fc));
         skel_cols.push(generate_column(effective.as_ref().unwrap_or(f), n, &[])?);
         skel_fields.push(field_to_arrow(f));
     }
@@ -497,25 +655,29 @@ async fn grow_parent_from_children(
     for ci in 0..child_batches.len() {
         let alias = format!("c{ci}");
         let rhs = ctx.table(&alias).await?;
-        let on_expr = skel_row_idx.clone().eq(
-            Expr::Column(Column::new(Some(alias.as_str()), "_row_idx"))
-        );
+        let on_expr = skel_row_idx
+            .clone()
+            .eq(Expr::Column(Column::new(Some(alias.as_str()), "_row_idx")));
         df = df.join_on(rhs, JoinType::Left, [on_expr])?;
     }
 
     // Project to exactly the active parent fields, qualified by table to preserve case.
-    let select_exprs: Vec<Expr> = active.iter().map(|f| {
-        if let Some((alias, child_col)) = sources.get(f.name.as_str()) {
-            Expr::Column(Column::new(Some(alias.as_str()), child_col.as_str()))
-                .alias(f.name.as_str())
-        } else {
-            Expr::Column(Column::new(Some("skel"), f.name.as_str()))
-                .alias(f.name.as_str())
-        }
-    }).collect();
+    let select_exprs: Vec<Expr> = active
+        .iter()
+        .map(|f| {
+            if let Some((alias, child_col)) = sources.get(f.name.as_str()) {
+                Expr::Column(Column::new(Some(alias.as_str()), child_col.as_str()))
+                    .alias(f.name.as_str())
+            } else {
+                Expr::Column(Column::new(Some("skel"), f.name.as_str())).alias(f.name.as_str())
+            }
+        })
+        .collect();
 
     let batches = df.select(select_exprs)?.collect().await?;
-    let schema = batches.first().map(|b| b.schema())
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(schema_to_arrow(parent_schema)));
     Ok(concat_batches(&schema, &batches)?)
 }
@@ -527,12 +689,18 @@ fn prepend_row_index(batch: &RecordBatch) -> Result<RecordBatch> {
 }
 
 fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<RecordBatch> {
-    let mut fields: Vec<Arc<ArrowField>> =
-        vec![Arc::new(ArrowField::new(name, col.data_type().clone(), false))];
+    let mut fields: Vec<Arc<ArrowField>> = vec![Arc::new(ArrowField::new(
+        name,
+        col.data_type().clone(),
+        false,
+    ))];
     fields.extend(batch.schema().fields().iter().cloned());
     let mut cols: Vec<ArrayRef> = vec![col];
     cols.extend(batch.columns().iter().cloned());
-    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(fields)),
+        cols,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +721,9 @@ fn filter_batch_by_constraints(
 
     let mut mask: Vec<bool> = vec![true; batch.num_rows()];
     for (field_name, fc) in constraints {
-        let Ok(col_idx) = batch.schema().index_of(field_name) else { continue };
+        let Ok(col_idx) = batch.schema().index_of(field_name) else {
+            continue;
+        };
         let col = batch.column(col_idx);
         for row in 0..batch.num_rows() {
             if mask[row] {
@@ -567,7 +737,9 @@ fn filter_batch_by_constraints(
         .collect();
     let indices = UInt32Array::from(surviving.clone());
     let fields: Vec<Arc<ArrowField>> = batch.schema().fields().to_vec();
-    let cols: Vec<ArrayRef> = batch.columns().iter()
+    let cols: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
         .map(|c| take(c.as_ref(), &indices, None))
         .collect::<std::result::Result<_, _>>()?;
     let filtered = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?;
@@ -610,10 +782,14 @@ fn row_satisfies_field_constraints(col: &ArrayRef, row: usize, fc: &FieldConstra
     if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
         let v = arr.value(row);
         if let Some(min) = fc.min {
-            if v < min { return false; }
+            if v < min {
+                return false;
+            }
         }
         if let Some(max) = fc.max {
-            if v > max { return false; }
+            if v > max {
+                return false;
+            }
         }
     }
 
@@ -686,11 +862,14 @@ fn execute_witness(
     computed: &mut HashMap<PathBuf, RecordBatch>,
 ) -> Result<()> {
     if !computed.contains_key(staging_path) {
-        return Err(anyhow!("witness '{list_field_name}': staging batch not yet computed"));
+        return Err(anyhow!(
+            "witness '{list_field_name}': staging batch not yet computed"
+        ));
     }
-    let linked_batch = computed.get(linked_path).ok_or_else(|| {
-        anyhow!("witness '{list_field_name}': linked-slot batch not yet computed")
-    })?.clone();
+    let linked_batch = computed
+        .get(linked_path)
+        .ok_or_else(|| anyhow!("witness '{list_field_name}': linked-slot batch not yet computed"))?
+        .clone();
 
     // --- Phase 1: assign each draw to a staging slot and a linked slot ---
     // Eligible linked rows: apply ratio to determine the eligible prefix.
@@ -715,21 +894,31 @@ fn execute_witness(
             let abs_slot = slot_start + i;
             let shard_start = abs_slot * q;
             let shard_len = q.min(n_eligible_pre_filter.saturating_sub(shard_start));
-            if shard_len == 0 { continue; }
+            if shard_len == 0 {
+                continue;
+            }
             let shard = eligible_linked.slice(shard_start, shard_len);
             let (filtered_shard, surviving_shard) =
                 filter_batch_by_constraints(&shard, segment_constraints)?;
             let n_shard = filtered_shard.num_rows();
-            if n_shard == 0 { continue; }
+            if n_shard == 0 {
+                continue;
+            }
             let m_n = sample_count(cardinality);
-            let m_n = if include.reinforcement == Some(0.0) { m_n.min(n_shard) } else { m_n };
+            let m_n = if include.reinforcement == Some(0.0) {
+                m_n.min(n_shard)
+            } else {
+                m_n
+            };
             let reinf = include.reinforcement.unwrap_or(1.0);
             let local_samples = if include.reinforcement == Some(0.0) {
                 sample_linked_without_replacement(n_shard, m_n)
             } else if reinf > 1.0 {
                 sample_linked_weighted(n_shard, m_n, reinf)
             } else {
-                (0..m_n).map(|_| (0u64..n_shard as u64).fake::<u64>() as u32).collect()
+                (0..m_n)
+                    .map(|_| (0u64..n_shard as u64).fake::<u64>() as u32)
+                    .collect()
             };
             for local_idx in local_samples {
                 let abs_idx = shard_start as u32 + surviving_shard[local_idx as usize];
@@ -740,7 +929,11 @@ fn execute_witness(
         // Identity surviving_indices: slot_assignments are already absolute pre-filter indices.
         let identity: Vec<u32> = (0..n_eligible_pre_filter as u32).collect();
         let total = all_assignments.len();
-        (UInt32Array::from(all_assignments), all_staging, (identity, total))
+        (
+            UInt32Array::from(all_assignments),
+            all_staging,
+            (identity, total),
+        )
     } else {
         // Filter the full eligible set once; segment constraints apply uniformly.
         let (filtered_linked, surviving) =
@@ -749,13 +942,21 @@ fn execute_witness(
         let counts: Vec<usize> = if n_eligible == 0 {
             vec![0; slot_count]
         } else {
-            (0..slot_count).map(|_| {
-                let m_n = sample_count(cardinality);
-                if include.reinforcement == Some(0.0) { m_n.min(n_eligible) } else { m_n }
-            }).collect()
+            (0..slot_count)
+                .map(|_| {
+                    let m_n = sample_count(cardinality);
+                    if include.reinforcement == Some(0.0) {
+                        m_n.min(n_eligible)
+                    } else {
+                        m_n
+                    }
+                })
+                .collect()
         };
         let total: usize = counts.iter().sum();
-        let s_idxs: Vec<u32> = counts.iter().enumerate()
+        let s_idxs: Vec<u32> = counts
+            .iter()
+            .enumerate()
             .flat_map(|(i, &c)| std::iter::repeat((slot_start + i) as u32).take(c))
             .collect();
         // Sampling mode:
@@ -768,9 +969,11 @@ fn execute_witness(
             let r = include.reinforcement;
             let ov = include.overlap;
             if r == Some(0.0) {
-                counts.iter().flat_map(|&m_n| {
-                    sample_linked_without_replacement(n_eligible, m_n)
-                }).collect::<Vec<u32>>().into()
+                counts
+                    .iter()
+                    .flat_map(|&m_n| sample_linked_without_replacement(n_eligible, m_n))
+                    .collect::<Vec<u32>>()
+                    .into()
             } else if let Some(ov_val) = ov.filter(|&v| v > 1.0) {
                 // Power-law initial weights: row j has weight (n_eligible - j)^(overlap - 1).
                 // Row 0 is most popular; relies on union_and_shuffle having randomised the batch.
@@ -778,13 +981,17 @@ fn execute_witness(
                 let initial_weights: Vec<f64> = (0..n_eligible)
                     .map(|j| ((n_eligible - j) as f64).powf(ov_val - 1.0))
                     .collect();
-                counts.iter().flat_map(|&m_n| {
-                    sample_with_polya(initial_weights.clone(), m_n, reinf)
-                }).collect::<Vec<u32>>().into()
+                counts
+                    .iter()
+                    .flat_map(|&m_n| sample_with_polya(initial_weights.clone(), m_n, reinf))
+                    .collect::<Vec<u32>>()
+                    .into()
             } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
-                counts.iter().flat_map(|&m_n| {
-                    sample_linked_weighted(n_eligible, m_n, reinf)
-                }).collect::<Vec<u32>>().into()
+                counts
+                    .iter()
+                    .flat_map(|&m_n| sample_linked_weighted(n_eligible, m_n, reinf))
+                    .collect::<Vec<u32>>()
+                    .into()
             } else {
                 (0..total)
                     .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
@@ -816,9 +1023,15 @@ fn execute_witness(
                 .unwrap_or(false);
             if is_linked_scoped {
                 let (_, target_col) = split_ref(ref_str).unwrap();
-                let idx = eligible_linked.schema().index_of(target_col)
+                let idx = eligible_linked
+                    .schema()
+                    .index_of(target_col)
                     .map_err(|_| anyhow!("column '{target_col}' not found in linked-slot batch"))?;
-                take(eligible_linked.column(idx).as_ref(), &unique_linked_arr, None)?
+                take(
+                    eligible_linked.column(idx).as_ref(),
+                    &unique_linked_arr,
+                    None,
+                )?
             } else {
                 // Outer-scoped: not stored in witness; skip.
                 continue;
@@ -832,10 +1045,16 @@ fn execute_witness(
 
     // --- Phase 4: assemble witness batch ---
     let data_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(arrow_fields)), columns)?;
-    let with_refs = prepend_column(&data_batch, "_staging_refs",
-        Arc::new(staging_refs_array) as ArrayRef)?;
-    let witness_batch = prepend_column(&with_refs, "_linked_idx",
-        Arc::new(UInt32Array::from(unique_linked_idxs)) as ArrayRef)?;
+    let with_refs = prepend_column(
+        &data_batch,
+        "_staging_refs",
+        Arc::new(staging_refs_array) as ArrayRef,
+    )?;
+    let witness_batch = prepend_column(
+        &with_refs,
+        "_linked_idx",
+        Arc::new(UInt32Array::from(unique_linked_idxs)) as ArrayRef,
+    )?;
     computed.insert(witness_key.clone(), witness_batch);
     Ok(())
 }
@@ -848,13 +1067,15 @@ fn execute_witness(
 ///   - `junction`: `_slot_idx` + replicated content columns (no sentinels)
 ///   - `slot_idx_arr`: sorted staging slot indices (one per junction row)
 ///   - `witness_row_arr`: witness row index for each junction row (for outer-scoped lookup)
-fn unnest_staging_refs(
-    witness: &RecordBatch,
-) -> Result<(RecordBatch, UInt32Array, UInt32Array)> {
-    let refs_col_idx = witness.schema().index_of("_staging_refs")
+fn unnest_staging_refs(witness: &RecordBatch) -> Result<(RecordBatch, UInt32Array, UInt32Array)> {
+    let refs_col_idx = witness
+        .schema()
+        .index_of("_staging_refs")
         .map_err(|_| anyhow!("unnest_staging_refs: '_staging_refs' not found in witness"))?;
-    let staging_refs = witness.column(refs_col_idx)
-        .as_any().downcast_ref::<ListArray>()
+    let staging_refs = witness
+        .column(refs_col_idx)
+        .as_any()
+        .downcast_ref::<ListArray>()
         .ok_or_else(|| anyhow!("_staging_refs is not a ListArray"))?;
 
     let total: usize = (0..witness.num_rows())
@@ -865,7 +1086,9 @@ fn unnest_staging_refs(
     let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
     for wr in 0..witness.num_rows() {
         let refs_slice = staging_refs.value(wr);
-        let refs_arr = refs_slice.as_any().downcast_ref::<UInt32Array>()
+        let refs_arr = refs_slice
+            .as_any()
+            .downcast_ref::<UInt32Array>()
             .ok_or_else(|| anyhow!("_staging_refs list element is not UInt32"))?;
         for &slot in refs_arr.values() {
             slot_idxs.push(slot);
@@ -878,17 +1101,30 @@ fn unnest_staging_refs(
     // Sort by slot_idx: required for the offset-based list-fold.
     let sort_order = sort_to_indices(&slot_arr, None, None)?;
     let slot_arr_sorted: UInt32Array = take(&slot_arr, &sort_order, None)?
-        .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap()
+        .clone();
     let witness_row_arr_sorted: UInt32Array = take(&witness_row_arr, &sort_order, None)?
-        .as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap()
+        .clone();
 
     // Strip sentinels; replicate remaining witness columns per slot.
-    let stripped = strip_sentinel(strip_sentinel(witness.clone(), "_linked_idx"), "_staging_refs");
+    let stripped = strip_sentinel(
+        strip_sentinel(witness.clone(), "_linked_idx"),
+        "_staging_refs",
+    );
     let mut fields = vec![ArrowField::new("_slot_idx", DataType::UInt32, false)];
     let mut cols: Vec<ArrayRef> = vec![Arc::new(slot_arr_sorted.clone())];
     for col_idx in 0..stripped.num_columns() {
         fields.push(stripped.schema().field(col_idx).as_ref().clone());
-        cols.push(take(stripped.column(col_idx).as_ref(), &witness_row_arr_sorted, None)?);
+        cols.push(take(
+            stripped.column(col_idx).as_ref(),
+            &witness_row_arr_sorted,
+            None,
+        )?);
     }
     let junction = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?;
     Ok((junction, slot_arr_sorted, witness_row_arr_sorted))
@@ -903,9 +1139,15 @@ async fn execute_assemble_from_witness(
     computed: &mut HashMap<PathBuf, RecordBatch>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
-    let mut batch = computed.get(staging_path).ok_or_else(|| {
-        anyhow!("assemble from witness '{}': staging batch not yet computed", dataset.name)
-    })?.clone();
+    let mut batch = computed
+        .get(staging_path)
+        .ok_or_else(|| {
+            anyhow!(
+                "assemble from witness '{}': staging batch not yet computed",
+                dataset.name
+            )
+        })?
+        .clone();
 
     for (field_name, witness_keys, project_col) in witness_specs {
         // Collect and union all per-segment witness batches for this field.
@@ -914,8 +1156,14 @@ async fn execute_assemble_from_witness(
                 anyhow!("assemble from witness '{}': witness segment for '{field_name}' not computed", dataset.name)
             }))
             .collect::<Result<Vec<_>>>()?;
-        let witness_schema = witness_batches.first()
-            .ok_or_else(|| anyhow!("assemble from witness '{}': no witness batches for '{field_name}'", dataset.name))?
+        let witness_schema = witness_batches
+            .first()
+            .ok_or_else(|| {
+                anyhow!(
+                    "assemble from witness '{}': no witness batches for '{field_name}'",
+                    dataset.name
+                )
+            })?
             .schema();
         let witness = concat_batches(&witness_schema, &witness_batches)?;
 
@@ -927,24 +1175,31 @@ async fn execute_assemble_from_witness(
 
         // Identify outer-scoped fields: defined in the content schema but absent from the
         // witness (because execute_witness skips them). Look them up from the staging batch.
-        let content_field_defs = dataset.data.iter()
+        let content_field_defs = dataset
+            .data
+            .iter()
             .find(|f| &f.name == field_name)
             .and_then(|f| f.content.as_deref())
             .map(|c| c.item.fields.as_slice())
             .unwrap_or(&[]);
         let witness_schema = witness.schema();
-        let stripped_witness_cols: HashSet<&str> = witness_schema.fields().iter()
+        let stripped_witness_cols: HashSet<&str> = witness_schema
+            .fields()
+            .iter()
             .map(|f| f.name().as_str())
             .filter(|&n| n != "_linked_idx" && n != "_staging_refs")
             .collect();
         let staging = batch.clone();
         for cf in content_field_defs {
-            if stripped_witness_cols.contains(cf.name.as_str()) { continue; }
+            if stripped_witness_cols.contains(cf.name.as_str()) {
+                continue;
+            }
             if let Some(ref_str) = cf.simple_ref() {
                 // Bare ref (no qualifier) or qualified ref: resolve the column name in staging.
                 let col_name = split_ref(ref_str).map(|(_, c)| c).unwrap_or(ref_str);
-                let stg_idx = staging.schema().index_of(col_name)
-                    .map_err(|_| anyhow!("outer-scoped column '{col_name}' not found in staging batch"))?;
+                let stg_idx = staging.schema().index_of(col_name).map_err(|_| {
+                    anyhow!("outer-scoped column '{col_name}' not found in staging batch")
+                })?;
                 let col = take(staging.column(stg_idx).as_ref(), &slot_arr_sorted, None)?;
                 let arrow_field = ArrowField::new(cf.name.as_str(), col.data_type().clone(), true);
                 junction = add_column(junction, arrow_field, col)?;
@@ -952,9 +1207,15 @@ async fn execute_assemble_from_witness(
         }
 
         // Slot-grouped list fold: count rows per slot, build offsets, fold into ListArray.
-        let slot_idx_arr = junction.column(junction.schema().index_of("_slot_idx")
-            .map_err(|_| anyhow!("junction missing '_slot_idx'"))?)
-            .as_any().downcast_ref::<UInt32Array>()
+        let slot_idx_arr = junction
+            .column(
+                junction
+                    .schema()
+                    .index_of("_slot_idx")
+                    .map_err(|_| anyhow!("junction missing '_slot_idx'"))?,
+            )
+            .as_any()
+            .downcast_ref::<UInt32Array>()
             .ok_or_else(|| anyhow!("_slot_idx is not UInt32"))?
             .clone();
 
@@ -967,21 +1228,31 @@ async fn execute_assemble_from_witness(
         let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
 
         let list_col: ArrayRef = if let Some(col_name) = project_col {
-            let col_idx = inner.schema().index_of(col_name.as_str())
-                .map_err(|_| anyhow!("project: column '{col_name}' not found in witness for '{field_name}'"))?;
+            let col_idx = inner.schema().index_of(col_name.as_str()).map_err(|_| {
+                anyhow!("project: column '{col_name}' not found in witness for '{field_name}'")
+            })?;
             let col = inner.column(col_idx).clone();
             let item_field = Arc::new(ArrowField::new("item", col.data_type().clone(), true));
             Arc::new(ListArray::new(item_field, offsets, col, None))
         } else {
-            let hidden_item_cols: HashSet<&str> = dataset.data.iter()
+            let hidden_item_cols: HashSet<&str> = dataset
+                .data
+                .iter()
                 .find(|f| &f.name == field_name)
                 .and_then(|f| f.content.as_deref())
-                .map(|c| c.item.fields.iter()
-                    .filter(|f| f.hidden)
-                    .map(|f| f.name.as_str())
-                    .collect())
+                .map(|c| {
+                    c.item
+                        .fields
+                        .iter()
+                        .filter(|f| f.hidden)
+                        .map(|f| f.name.as_str())
+                        .collect()
+                })
                 .unwrap_or_default();
-            let (struct_fields, struct_cols): (Vec<_>, Vec<_>) = inner.schema().fields().iter()
+            let (struct_fields, struct_cols): (Vec<_>, Vec<_>) = inner
+                .schema()
+                .fields()
+                .iter()
                 .zip(inner.columns())
                 .filter(|(f, _)| !hidden_item_cols.contains(f.name().as_str()))
                 .map(|(f, c)| (Arc::new(f.as_ref().clone()), c.clone()))
@@ -995,7 +1266,8 @@ async fn execute_assemble_from_witness(
             Arc::new(ListArray::new(item_field, offsets, child, None))
         };
 
-        let list_arrow_field = ArrowField::new(field_name.as_str(), list_col.data_type().clone(), true);
+        let list_arrow_field =
+            ArrowField::new(field_name.as_str(), list_col.data_type().clone(), true);
         batch = add_column(batch, list_arrow_field, list_col)?;
     }
 
@@ -1024,7 +1296,10 @@ fn yaml_value_to_array(val: &YamlValue, dtype: &DataType, n: usize) -> ArrayRef 
             Arc::new(Float64Array::from(vec![v; n]))
         }
         DataType::Utf8 => {
-            let s = match val { YamlValue::String(s) => s.as_str(), _ => "" };
+            let s = match val {
+                YamlValue::String(s) => s.as_str(),
+                _ => "",
+            };
             Arc::new(StringArray::from(vec![s; n]))
         }
         _ => {
@@ -1055,9 +1330,15 @@ async fn execute_accumulate_to_linked(
     computed: &mut HashMap<PathBuf, RecordBatch>,
     accumulated_fields: &mut HashSet<(PathBuf, String)>,
 ) -> Result<()> {
-    let raw_source = computed.get(source_path).ok_or_else(|| {
-        anyhow!("AccumulateToLinked: source batch '{}' not computed", source_path.display())
-    })?.clone();
+    let raw_source = computed
+        .get(source_path)
+        .ok_or_else(|| {
+            anyhow!(
+                "AccumulateToLinked: source batch '{}' not computed",
+                source_path.display()
+            )
+        })?
+        .clone();
 
     // If the source is a Stage-4 witness batch (has `_staging_refs`), expand it to a flat
     // junction table: one row per (staging-slot, linked-row) draw. This restores the K entries
@@ -1065,8 +1346,10 @@ async fn execute_accumulate_to_linked(
     // linked-row draw with `_staging_refs` encoding the back-references.
     let source_batch = if raw_source.schema().index_of("_staging_refs").is_ok() {
         let refs_col_idx = raw_source.schema().index_of("_staging_refs")?;
-        let staging_refs = raw_source.column(refs_col_idx)
-            .as_any().downcast_ref::<ListArray>()
+        let staging_refs = raw_source
+            .column(refs_col_idx)
+            .as_any()
+            .downcast_ref::<ListArray>()
             .ok_or_else(|| anyhow!("AccumulateToLinked: _staging_refs is not a ListArray"))?;
         let total: usize = (0..raw_source.num_rows())
             .map(|r| staging_refs.value(r).len())
@@ -1074,15 +1357,22 @@ async fn execute_accumulate_to_linked(
         let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
         for wr in 0..raw_source.num_rows() {
             let n = staging_refs.value(wr).len();
-            for _ in 0..n { witness_row_idxs.push(wr as u32); }
+            for _ in 0..n {
+                witness_row_idxs.push(wr as u32);
+            }
         }
         let witness_row_arr = UInt32Array::from(witness_row_idxs);
         // Strip _staging_refs; keep _linked_idx and content columns (replicated per draw).
         let stripped = strip_sentinel(raw_source, "_staging_refs");
-        let fields: Vec<ArrowField> = stripped.schema().fields().iter()
+        let fields: Vec<ArrowField> = stripped
+            .schema()
+            .fields()
+            .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        let cols: Vec<ArrayRef> = stripped.columns().iter()
+        let cols: Vec<ArrayRef> = stripped
+            .columns()
+            .iter()
             .map(|c| take(c.as_ref(), &witness_row_arr, None))
             .collect::<Result<_, _>>()?;
         RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?
@@ -1090,38 +1380,64 @@ async fn execute_accumulate_to_linked(
         raw_source
     };
 
-    let linked_batch = computed.get(linked_path).ok_or_else(|| {
-        anyhow!("AccumulateToLinked: linked batch '{}' not computed", linked_path.display())
-    })?.clone();
+    let linked_batch = computed
+        .get(linked_path)
+        .ok_or_else(|| {
+            anyhow!(
+                "AccumulateToLinked: linked batch '{}' not computed",
+                linked_path.display()
+            )
+        })?
+        .clone();
     let linked_n = linked_batch.num_rows();
 
     // Locate the linked field upfront — needed for scalar reducers to keep existing defaults.
-    let linked_col_idx = linked_batch.schema().index_of(linked_field)
-        .map_err(|_| anyhow!("AccumulateToLinked: field '{}' not found in linked batch", linked_field))?;
+    let linked_col_idx = linked_batch.schema().index_of(linked_field).map_err(|_| {
+        anyhow!(
+            "AccumulateToLinked: field '{}' not found in linked batch",
+            linked_field
+        )
+    })?;
     let existing_linked_col = linked_batch.column(linked_col_idx).clone();
 
     // Build and run the DataFusion aggregate.
     let aggr_expr = match reducer {
-        Reducer::Collect   => array_agg(col(source_field)).alias("__agg"),
-        Reducer::Sum       => df_sum(col(source_field)).alias("__agg"),
-        Reducer::Max       => df_max(col(source_field)).alias("__agg"),
-        Reducer::Min       => df_min(col(source_field)).alias("__agg"),
-        Reducer::TakeOne   => df_first_value(col(source_field), vec![]).alias("__agg"),
+        Reducer::Collect => array_agg(col(source_field)).alias("__agg"),
+        Reducer::Sum => df_sum(col(source_field)).alias("__agg"),
+        Reducer::Max => df_max(col(source_field)).alias("__agg"),
+        Reducer::Min => df_min(col(source_field)).alias("__agg"),
+        Reducer::TakeOne => df_first_value(col(source_field), vec![]).alias("__agg"),
     };
     let ctx = SessionContext::new();
     ctx.register_batch("src", source_batch)?;
-    let agg_batches = ctx.table("src").await?
-        .aggregate(vec![col(group_by)], vec![aggr_expr])?.collect().await?;
-    let agg_schema = agg_batches.first().map(|b| b.schema())
+    let agg_batches = ctx
+        .table("src")
+        .await?
+        .aggregate(vec![col(group_by)], vec![aggr_expr])?
+        .collect()
+        .await?;
+    let agg_schema = agg_batches
+        .first()
+        .map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(ArrowSchema::empty()));
     let agg_batch = concat_batches(&agg_schema, &agg_batches)?;
 
     // Build linked_idx → agg_row index map.
-    let group_col = agg_batch.schema().index_of(group_by)
+    let group_col = agg_batch
+        .schema()
+        .index_of(group_by)
         .ok()
-        .and_then(|i| agg_batch.column(i).as_any().downcast_ref::<UInt32Array>().map(|a| a.values().to_vec()))
+        .and_then(|i| {
+            agg_batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .map(|a| a.values().to_vec())
+        })
         .unwrap_or_default();
-    let agg_values_col = agg_batch.schema().index_of("__agg")
+    let agg_values_col = agg_batch
+        .schema()
+        .index_of("__agg")
         .map(|i| agg_batch.column(i).clone())
         .unwrap_or_else(|_| Arc::new(arrow::array::Int32Array::from(vec![] as Vec<i32>)));
     let mut idx_map: HashMap<u32, usize> = HashMap::new();
@@ -1140,7 +1456,9 @@ async fn execute_accumulate_to_linked(
                 DataType::List(f) => f.data_type().clone(),
                 other => bail!("AccumulateToLinked: expected List from array_agg, got {other:?}"),
             };
-            let agg_list = agg_values_col.as_any().downcast_ref::<ListArray>()
+            let agg_list = agg_values_col
+                .as_any()
+                .downcast_ref::<ListArray>()
                 .ok_or_else(|| anyhow!("AccumulateToLinked: __agg column is not a ListArray"))?;
             // For subsequent calls, carry forward existing accumulated items.
             let existing_list = if !is_first {
@@ -1168,7 +1486,8 @@ async fn execute_accumulate_to_linked(
             let child_array: ArrayRef = if child_slices.is_empty() {
                 new_empty_array(&element_type)
             } else {
-                let refs: Vec<&dyn arrow::array::Array> = child_slices.iter().map(|a| a.as_ref()).collect();
+                let refs: Vec<&dyn arrow::array::Array> =
+                    child_slices.iter().map(|a| a.as_ref()).collect();
                 concat(&refs)?
             };
             let offsets_buf = OffsetBuffer::<i32>::new(ScalarBuffer::from(offsets));
@@ -1184,15 +1503,26 @@ async fn execute_accumulate_to_linked(
             if !is_first && matches!(reducer, Reducer::TakeOne) {
                 existing_linked_col.clone()
             } else if !is_first {
-                accumulate_scalar_cumulative(reducer, &existing_linked_col, &agg_values_col, &idx_map, linked_n)?
+                accumulate_scalar_cumulative(
+                    reducer,
+                    &existing_linked_col,
+                    &agg_values_col,
+                    &idx_map,
+                    linked_n,
+                )?
             } else {
                 let agg_n = agg_batch.num_rows();
-                let take_indices: UInt32Array = (0..linked_n as u32).map(|linked_row| {
-                    idx_map.get(&linked_row)
-                        .map(|&agg_row| agg_row as u32)
-                        .unwrap_or(agg_n as u32 + linked_row)
-                }).collect::<Vec<u32>>().into();
-                let default_col = yaml_value_to_array(default_val, existing_linked_col.data_type(), linked_n);
+                let take_indices: UInt32Array = (0..linked_n as u32)
+                    .map(|linked_row| {
+                        idx_map
+                            .get(&linked_row)
+                            .map(|&agg_row| agg_row as u32)
+                            .unwrap_or(agg_n as u32 + linked_row)
+                    })
+                    .collect::<Vec<u32>>()
+                    .into();
+                let default_col =
+                    yaml_value_to_array(default_val, existing_linked_col.data_type(), linked_n);
                 let combined = concat(&[agg_values_col.as_ref(), default_col.as_ref()])?;
                 take(combined.as_ref(), &take_indices, None)?
             }
@@ -1202,9 +1532,16 @@ async fn execute_accumulate_to_linked(
     // Replace linked_field column in linked_batch.
     let mut fields: Vec<Arc<ArrowField>> = linked_batch.schema().fields().to_vec();
     let mut columns = linked_batch.columns().to_vec();
-    fields[linked_col_idx] = Arc::new(ArrowField::new(linked_field, new_col.data_type().clone(), true));
+    fields[linked_col_idx] = Arc::new(ArrowField::new(
+        linked_field,
+        new_col.data_type().clone(),
+        true,
+    ));
     columns[linked_col_idx] = new_col;
-    computed.insert(linked_path.clone(), RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?);
+    computed.insert(
+        linked_path.clone(),
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?,
+    );
     Ok(())
 }
 
@@ -1224,39 +1561,83 @@ fn accumulate_scalar_cumulative(
 ) -> Result<ArrayRef> {
     match existing_col.data_type() {
         DataType::Float64 => {
-            let existing = existing_col.as_any().downcast_ref::<Float64Array>()
-                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: existing column is not Float64"))?;
-            let agg = agg_values_col.as_any().downcast_ref::<Float64Array>()
-                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: agg column is not Float64"))?;
-            let result: Vec<f64> = (0..linked_n as u32).map(|linked_row| {
-                let ev = if existing.is_null(linked_row as usize) { 0.0 } else { existing.value(linked_row as usize) };
-                if let Some(&agg_row) = idx_map.get(&linked_row) {
-                    let av = if agg.is_null(agg_row) { 0.0 } else { agg.value(agg_row) };
-                    match reducer {
-                        Reducer::Sum => ev + av,
-                        Reducer::Max => f64::max(ev, av),
-                        Reducer::Min => f64::min(ev, av),
-                        _ => ev,
+            let existing = existing_col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    anyhow!("accumulate_scalar_cumulative: existing column is not Float64")
+                })?;
+            let agg = agg_values_col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    anyhow!("accumulate_scalar_cumulative: agg column is not Float64")
+                })?;
+            let result: Vec<f64> = (0..linked_n as u32)
+                .map(|linked_row| {
+                    let ev = if existing.is_null(linked_row as usize) {
+                        0.0
+                    } else {
+                        existing.value(linked_row as usize)
+                    };
+                    if let Some(&agg_row) = idx_map.get(&linked_row) {
+                        let av = if agg.is_null(agg_row) {
+                            0.0
+                        } else {
+                            agg.value(agg_row)
+                        };
+                        match reducer {
+                            Reducer::Sum => ev + av,
+                            Reducer::Max => f64::max(ev, av),
+                            Reducer::Min => f64::min(ev, av),
+                            _ => ev,
+                        }
+                    } else {
+                        ev
                     }
-                } else {
-                    ev
-                }
-            }).collect();
+                })
+                .collect();
             Ok(Arc::new(Float64Array::from(result)))
         }
         DataType::Utf8 => {
-            let existing = existing_col.as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: existing column is not Utf8"))?;
-            let agg = agg_values_col.as_any().downcast_ref::<StringArray>()
+            let existing = existing_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    anyhow!("accumulate_scalar_cumulative: existing column is not Utf8")
+                })?;
+            let agg = agg_values_col
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: agg column is not Utf8"))?;
             let mut builder = StringBuilder::new();
             for linked_row in 0..linked_n as u32 {
-                let ev = if existing.is_null(linked_row as usize) { "" } else { existing.value(linked_row as usize) };
+                let ev = if existing.is_null(linked_row as usize) {
+                    ""
+                } else {
+                    existing.value(linked_row as usize)
+                };
                 if let Some(&agg_row) = idx_map.get(&linked_row) {
-                    let av = if agg.is_null(agg_row) { "" } else { agg.value(agg_row) };
+                    let av = if agg.is_null(agg_row) {
+                        ""
+                    } else {
+                        agg.value(agg_row)
+                    };
                     let chosen = match reducer {
-                        Reducer::Max => if av > ev { av } else { ev },
-                        Reducer::Min => if av < ev { av } else { ev },
+                        Reducer::Max => {
+                            if av > ev {
+                                av
+                            } else {
+                                ev
+                            }
+                        }
+                        Reducer::Min => {
+                            if av < ev {
+                                av
+                            } else {
+                                ev
+                            }
+                        }
                         _ => ev,
                     };
                     builder.append_value(chosen);
@@ -1279,9 +1660,10 @@ async fn execute_emit_dataset(
     computed: &HashMap<PathBuf, RecordBatch>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
-    let batch = computed.get(path).ok_or_else(|| {
-        anyhow!("EmitDataset: batch at '{}' not computed", path.display())
-    })?.clone();
+    let batch = computed
+        .get(path)
+        .ok_or_else(|| anyhow!("EmitDataset: batch at '{}' not computed", path.display()))?
+        .clone();
     let output = filter_hidden_columns(batch, &dataset.data)?;
     emit_batch(output, dataset, shared)
 }
@@ -1319,7 +1701,9 @@ fn generate_expanded_batch(
         slot_batches.push(batch);
     }
 
-    let inner_schema = slot_batches.first().map(|b| b.schema())
+    let inner_schema = slot_batches
+        .first()
+        .map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(schema_to_arrow(fields)));
     let combined = concat_batches(&inner_schema, &slot_batches)?;
     let slot_col: ArrayRef = Arc::new(UInt32Array::from(slot_tags));
@@ -1342,19 +1726,27 @@ fn generate_member_batch(
     }
 
     // Build concrete schemas and extract their parent-ref constraints.
-    let variant_schemas: Vec<_> = m.dataset.variants.iter()
+    let variant_schemas: Vec<_> = m
+        .dataset
+        .variants
+        .iter()
         .map(|v| merge_variant_fields(&m.dataset.data, &v.data))
         .collect();
 
-    let variant_ref_constraints: Vec<HashMap<String, FieldConstraints>> = variant_schemas.iter()
+    let variant_ref_constraints: Vec<HashMap<String, FieldConstraints>> = variant_schemas
+        .iter()
         .map(|schema| {
             let tmp = LowerCoverMember {
                 path: m.path.clone(),
                 dataset: crate::models::SyntheticDataset {
                     name: m.dataset.name.clone(),
                     format: m.dataset.format.clone(),
-                    rows: None, output: None, outputs: vec![],
-                    locale: None, include: None, links: vec![],
+                    rows: None,
+                    output: None,
+                    outputs: vec![],
+                    locale: None,
+                    include: None,
+                    links: vec![],
                     data: schema.clone(),
                     variants: vec![],
                 },
@@ -1379,7 +1771,8 @@ fn generate_member_batch(
     // Distribute rows across surviving variants, normalising their ratios.
     // resolve_distributions fills free (None) shares but does not normalise fixed ratios —
     // we must renormalise explicitly so pruned variants' weight is redistributed correctly.
-    let surviving_option_ratios: Vec<Option<f64>> = surviving.iter()
+    let surviving_option_ratios: Vec<Option<f64>> = surviving
+        .iter()
         .map(|&i| m.dataset.variants[i].ratio)
         .collect();
     let raw_dists = resolve_distributions(&surviving_option_ratios);
@@ -1395,11 +1788,17 @@ fn generate_member_batch(
     let mut sub_batches: Vec<RecordBatch> = Vec::new();
     for (pos, &vi) in surviving.iter().enumerate() {
         let r = row_counts[pos];
-        if r == 0 { continue; }
-        let merged_constraints = try_merge_incremental(
-            seg_constraints.clone(), &variant_ref_constraints[vi],
-        ).unwrap_or_else(|| seg_constraints.clone());
-        sub_batches.push(generate_fresh_batch(&variant_schemas[vi], r, &merged_constraints)?);
+        if r == 0 {
+            continue;
+        }
+        let merged_constraints =
+            try_merge_incremental(seg_constraints.clone(), &variant_ref_constraints[vi])
+                .unwrap_or_else(|| seg_constraints.clone());
+        sub_batches.push(generate_fresh_batch(
+            &variant_schemas[vi],
+            r,
+            &merged_constraints,
+        )?);
     }
 
     if sub_batches.is_empty() {
@@ -1420,7 +1819,13 @@ fn generate_member_expanded_batch(
     slot_offset: usize,
 ) -> Result<RecordBatch> {
     if m.dataset.variants.is_empty() {
-        return generate_expanded_batch(&m.dataset.data, slot_count, seg_constraints, cardinality, slot_offset);
+        return generate_expanded_batch(
+            &m.dataset.data,
+            slot_count,
+            seg_constraints,
+            cardinality,
+            slot_offset,
+        );
     }
 
     let mut slot_tags: Vec<u32> = Vec::new();
@@ -1434,7 +1839,9 @@ fn generate_member_expanded_batch(
         slot_batches.push(batch);
     }
 
-    let inner_schema = slot_batches.first().map(|b| b.schema())
+    let inner_schema = slot_batches
+        .first()
+        .map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(schema_to_arrow(&m.dataset.data)));
     let combined = concat_batches(&inner_schema, &slot_batches)?;
     let slot_col: ArrayRef = Arc::new(UInt32Array::from(slot_tags));
@@ -1449,7 +1856,10 @@ fn generate_member_expanded_batch(
 ///
 /// Panics if `count > linked_n` — callers must enforce the planning-time check.
 fn sample_linked_without_replacement(linked_n: usize, count: usize) -> Vec<u32> {
-    assert!(count <= linked_n, "sample_linked_without_replacement: count {count} > linked_n {linked_n}");
+    assert!(
+        count <= linked_n,
+        "sample_linked_without_replacement: count {count} > linked_n {linked_n}"
+    );
     let mut indices: Vec<u32> = (0..linked_n as u32).collect();
     for i in 0..count {
         let j = (i as u64..linked_n as u64).fake::<u64>() as usize;
@@ -1479,7 +1889,10 @@ fn sample_with_polya(mut weights: Vec<f64>, count: usize, reinforcement: f64) ->
         let mut target = (0.0f64..total).fake::<f64>();
         let mut chosen = 0usize;
         for (i, &w) in weights.iter().enumerate() {
-            if target < w { chosen = i; break; }
+            if target < w {
+                chosen = i;
+                break;
+            }
             target -= w;
         }
         result.push(chosen as u32);
@@ -1489,8 +1902,13 @@ fn sample_with_polya(mut weights: Vec<f64>, count: usize, reinforcement: f64) ->
 }
 
 fn strip_sentinel(batch: RecordBatch, sentinel: &str) -> RecordBatch {
-    let Ok(idx) = batch.schema().index_of(sentinel) else { return batch };
-    let (fields, cols): (Vec<_>, Vec<_>) = batch.schema().fields().iter()
+    let Ok(idx) = batch.schema().index_of(sentinel) else {
+        return batch;
+    };
+    let (fields, cols): (Vec<_>, Vec<_>) = batch
+        .schema()
+        .fields()
+        .iter()
         .zip(batch.columns())
         .enumerate()
         .filter(|(i, _)| *i != idx)
@@ -1513,13 +1931,21 @@ fn inject_linked_idx(
     dataset: &SyntheticDataset,
     computed: &HashMap<PathBuf, RecordBatch>,
 ) -> Result<RecordBatch> {
-    let list_link_refs: HashSet<&str> = dataset.data.iter()
+    let list_link_refs: HashSet<&str> = dataset
+        .data
+        .iter()
         .filter_map(|f| f.content.as_ref()?.from.as_deref())
         .collect();
     for link in &dataset.links {
-        if list_link_refs.contains(link.reference.as_str()) { continue; }
-        let Some(linked_path) = resolve_include(path, &link.file) else { continue };
-        let Some(linked_batch) = computed.get(&linked_path) else { continue };
+        if list_link_refs.contains(link.reference.as_str()) {
+            continue;
+        }
+        let Some(linked_path) = resolve_include(path, &link.file) else {
+            continue;
+        };
+        let Some(linked_batch) = computed.get(&linked_path) else {
+            continue;
+        };
         let n_linked = linked_batch.num_rows();
         let n_eligible = eligible_linked_rows(n_linked, link.ratio);
         let n_rows = batch.num_rows();
@@ -1537,9 +1963,9 @@ fn inject_linked_idx(
             let initial_weights: Vec<f64> = (0..n_eligible)
                 .map(|j| ((n_eligible - j) as f64).powf(ov_val - 1.0))
                 .collect();
-            (0..n_rows).map(|_| {
-                sample_with_polya(initial_weights.clone(), 1, reinf)[0]
-            }).collect()
+            (0..n_rows)
+                .map(|_| sample_with_polya(initial_weights.clone(), 1, reinf)[0])
+                .collect()
         } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
             sample_linked_weighted(n_eligible, n_rows, reinf)
         } else {
@@ -1574,7 +2000,9 @@ fn generate_batch(
         .iter()
         .filter(|f| f.expression.is_none() && !f.is_list_link())
         .map(|f| {
-            let prefix = inherited.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
+            let prefix = inherited
+                .get(&f.name)
+                .map_or(&[] as &[ArrayRef], |v| v.as_slice());
             let effective = overrides.get(&f.name).map(|fc| apply_constraints(f, fc));
             generate_column(effective.as_ref().unwrap_or(f), rows, prefix)
         })
@@ -1585,12 +2013,20 @@ fn generate_batch(
 /// Return a copy of `field` with any non-None constraint from `fc` applied.
 fn apply_constraints(field: &Field, fc: &FieldConstraints) -> Field {
     let mut f = field.clone();
-    if fc.value.is_some()     { f.value     = fc.value.clone(); }
-    if fc.generator.is_some() { f.generator = fc.generator.clone(); }
+    if fc.value.is_some() {
+        f.value = fc.value.clone();
+    }
+    if fc.generator.is_some() {
+        f.generator = fc.generator.clone();
+    }
     if fc.min.is_some() || fc.max.is_some() {
         let r = f.range.get_or_insert(Range::default());
-        if fc.min.is_some() { r.min = fc.min; }
-        if fc.max.is_some() { r.max = fc.max; }
+        if fc.min.is_some() {
+            r.min = fc.min;
+        }
+        if fc.max.is_some() {
+            r.max = fc.max;
+        }
     }
     f
 }
@@ -1599,7 +2035,11 @@ fn apply_constraints(field: &Field, fc: &FieldConstraints) -> Field {
 // Shuffling and emission
 // ---------------------------------------------------------------------------
 
-async fn combine_and_shuffle(batches: Vec<RecordBatch>, schema: &Schema, name: &str) -> Result<RecordBatch> {
+async fn combine_and_shuffle(
+    batches: Vec<RecordBatch>,
+    schema: &Schema,
+    name: &str,
+) -> Result<RecordBatch> {
     if batches.is_empty() {
         return generate_batch(schema, 0, &HashMap::new(), &HashMap::new());
     }
@@ -1609,16 +2049,22 @@ async fn combine_and_shuffle(batches: Vec<RecordBatch>, schema: &Schema, name: &
 /// Concatenate all batches and shuffle via DataFusion `ORDER BY random()`.
 /// Zero-row inputs are returned immediately to avoid DataFusion empty-result issues.
 async fn union_and_shuffle(batches: Vec<RecordBatch>, name: &str) -> Result<RecordBatch> {
-    let arrow_schema = batches.first()
-        .ok_or_else(|| anyhow!("union_and_shuffle: no batches for '{name}'"))?.schema();
+    let arrow_schema = batches
+        .first()
+        .ok_or_else(|| anyhow!("union_and_shuffle: no batches for '{name}'"))?
+        .schema();
     let combined = concat_batches(&arrow_schema, &batches)?;
     if combined.num_rows() == 0 {
         return Ok(combined);
     }
     let ctx = SessionContext::new();
     let df = ctx.read_batch(combined)?;
-    let shuffled = df.sort(vec![datafusion::functions::expr_fn::random().sort(true, true)])?
-        .collect().await?;
+    let shuffled = df
+        .sort(vec![
+            datafusion::functions::expr_fn::random().sort(true, true),
+        ])?
+        .collect()
+        .await?;
     let schema = shuffled.first().map(|b| b.schema()).unwrap_or(arrow_schema);
     Ok(concat_batches(&schema, &shuffled)?)
 }
@@ -1632,10 +2078,14 @@ async fn combine_witness_source_first(
     schema: &Schema,
     name: &str,
 ) -> Result<RecordBatch> {
-    let shuffled_non_witness = combine_and_shuffle(non_witness_source_batches, schema, name).await?;
+    let shuffled_non_witness =
+        combine_and_shuffle(non_witness_source_batches, schema, name).await?;
     let arrow_schema = Arc::new(schema_to_arrow(schema));
     let ws_combined = concat_batches(&arrow_schema, &witness_source_batches)?;
-    Ok(concat_batches(&ws_combined.schema(), &[ws_combined, shuffled_non_witness])?)
+    Ok(concat_batches(
+        &ws_combined.schema(),
+        &[ws_combined, shuffled_non_witness],
+    )?)
 }
 
 fn emit_batch(
@@ -1662,7 +2112,10 @@ fn add_column(batch: RecordBatch, field: ArrowField, col: ArrayRef) -> Result<Re
     fields.push(Arc::new(field));
     let mut columns = batch.columns().to_vec();
     columns.push(col);
-    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(fields)),
+        columns,
+    )?)
 }
 
 /// Evaluate all expression fields against the batch, building a CTE chain in
@@ -1672,7 +2125,9 @@ async fn evaluate_expressions(
     batch: RecordBatch,
     dataset: &SyntheticDataset,
 ) -> Result<RecordBatch> {
-    let expr_fields: Vec<_> = dataset.data.iter()
+    let expr_fields: Vec<_> = dataset
+        .data
+        .iter()
         .filter(|f| f.expression.is_some())
         .collect();
 
@@ -1701,7 +2156,8 @@ async fn evaluate_expressions(
     let df = ctx.sql(&sql).await?;
     let batches = df.collect().await?;
 
-    let schema = batches.first()
+    let schema = batches
+        .first()
         .map(|b| b.schema())
         .ok_or_else(|| anyhow!("expression evaluation returned no rows"))?;
     Ok(concat_batches(&schema, &batches)?)
@@ -1714,7 +2170,8 @@ fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordB
     if !fields.iter().any(|f| f.hidden) {
         return Ok(batch);
     }
-    let hidden: HashSet<&str> = fields.iter()
+    let hidden: HashSet<&str> = fields
+        .iter()
         .filter(|f| f.hidden)
         .map(|f| f.name.as_str())
         .collect();
@@ -1731,15 +2188,16 @@ fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordB
 fn write_output(batch: &RecordBatch, name: &str, format: &Format, output_dir: &Path) -> Result<()> {
     let ext = match format {
         Format::Parquet => "parquet",
-        Format::Csv     => "csv",
-        Format::Json    => "json",
-        Format::Jsonl   => "jsonl",
+        Format::Csv => "csv",
+        Format::Json => "json",
+        Format::Jsonl => "jsonl",
     };
     // If name already ends with the correct extension (e.g. from an explicit `file:` path),
     // use it as-is; otherwise append the extension (legacy `output_file:` name convention).
     let path = if std::path::Path::new(name)
         .extension()
-        .and_then(|e| e.to_str()) == Some(ext)
+        .and_then(|e| e.to_str())
+        == Some(ext)
     {
         output_dir.join(name)
     } else {
