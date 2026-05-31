@@ -1,5 +1,7 @@
 # fakeset
 
+[![CI](https://github.com/alsenz/fakeset/actions/workflows/ci.yml/badge.svg)](https://github.com/alsenz/fakeset/actions/workflows/ci.yml)
+
 A declarative, DAG-structured synthetic dataset generator written in Rust.
 Loosely inspired by [synth](https://github.com/getsynth/synth).
 
