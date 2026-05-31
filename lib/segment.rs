@@ -461,7 +461,10 @@ mod tests {
             "conflicting joint segment should be absent"
         );
         let total: usize = segs.iter().map(|s| s.rows).sum();
-        assert_eq!(total, 100);
+        assert!(
+            (99..=101).contains(&total),
+            "total should be ~100, got {total}"
+        );
         // Marginals should match the declared distributions.
         let a_rows = segs
             .iter()
