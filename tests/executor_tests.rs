@@ -1516,7 +1516,11 @@ async fn test_segmented_list_link_assembles_correctly() {
 
     let source_rows = jsonl_rows(&out, "source");
     // Bernoulli rounding in plan_segments can produce ±1 rows vs the declared count.
-    assert!((9..=11).contains(&source_rows.len()), "source should have ~10 rows; got {}", source_rows.len());
+    assert!(
+        (9..=11).contains(&source_rows.len()),
+        "source should have ~10 rows; got {}",
+        source_rows.len()
+    );
 
     for (i, row) in source_rows.iter().enumerate() {
         let items = row["items"]
