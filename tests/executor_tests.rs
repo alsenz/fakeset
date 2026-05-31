@@ -20,7 +20,7 @@ async fn run(fixture: &str) -> PathBuf {
     let out = std::env::temp_dir().join(format!(
         "fakeset_test_{}_{}",
         fixture.replace(['/', '\\', '.'], "_"),
-        uuid::Uuid::new_v4()
+        Uuid::new_v4()
     ));
 
     let datasets = load_all_datasets(&[fixture_path]).expect("load datasets");
