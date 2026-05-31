@@ -2,7 +2,7 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
-  site: 'https://alsenz.github.io',
+  site: 'https://alsenz.github.io/fakeset',
   base: '/fakeset',
   integrations: [
     starlight({
