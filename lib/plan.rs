@@ -363,8 +363,7 @@ fn check_cardinality_feasibility(
             // Phase 3: overlap:0 shard feasibility.
             if link.overlap == Some(0.0) {
                 let n_staging_rows = *row_counts.get(path).unwrap_or(&0);
-                if n_staging_rows > 0 {
-                    let shard_q = n_eligible / n_staging_rows;
+                if let Some(shard_q) = n_eligible.checked_div(n_staging_rows) {
                     if shard_q == 0 {
                         anyhow::bail!(
                             "dataset '{}' field '{}': `overlap: 0` requires at least as many \
@@ -868,11 +867,7 @@ fn emit_witness_steps(
             let n_staging_rows = *row_counts.get(path).unwrap_or(&0);
             let linked_rows = *row_counts.get(&linked_path).unwrap_or(&0);
             let n_eligible = eligible_linked_rows(linked_rows, link.ratio);
-            if n_staging_rows > 0 {
-                Some(n_eligible / n_staging_rows)
-            } else {
-                None
-            }
+            n_eligible.checked_div(n_staging_rows)
         } else {
             None
         };
