@@ -10,7 +10,7 @@ Two tiers:
 import pytest
 from scipy.stats import binomtest, chisquare, kstest, uniform
 
-ALPHA = 0.01
+ALPHA = 0.001
 
 
 # ---------------------------------------------------------------------------

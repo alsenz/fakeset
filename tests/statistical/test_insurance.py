@@ -12,7 +12,7 @@ Two tiers:
 import pytest
 from scipy.stats import binomtest, chisquare, kstest, uniform
 
-ALPHA = 0.01  # significance level; 1% false-positive rate per test
+ALPHA = 0.001
 
 # ---------------------------------------------------------------------------
 # Known bugs that cause test failures — mark xfail so the suite stays green

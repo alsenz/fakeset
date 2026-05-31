@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Only run on pushes to main — feature branches are covered by CI on the PR.
+pushing_to_main=false
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$remote_ref" = "refs/heads/main" ]; then
+        pushing_to_main=true
+    fi
+done
+if ! $pushing_to_main; then
+    exit 0
+fi
+
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 

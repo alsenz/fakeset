@@ -213,11 +213,11 @@ The suite runs both examples, then checks:
 | Expression results match formula (e.g. `net_payout = claim_amount - deductible`) | Hard invariant |
 | List cardinality within declared `min`/`max` | Hard invariant |
 | Mutually exclusive lower-cover segments partition parent exactly | Hard invariant |
-| Include ratios match declared values (binomial test, α=0.01) | Statistical |
-| Variant distributions match declared ratios (χ² test, α=0.01) | Statistical |
-| Numeric distributions consistent with Uniform[min, max] (KS test, α=0.01) | Statistical |
+| Include ratios match declared values (binomial test, α=0.001) | Statistical |
+| Variant distributions match declared ratios (χ² test, α=0.001) | Statistical |
+| Numeric distributions consistent with Uniform[min, max] (KS test, α=0.001) | Statistical |
 
-Statistical tests use α=0.01 (1% false-positive rate per test) and skip automatically
+Statistical tests use α=0.001 (0.1% false-positive rate per test) and skip automatically
 when the sample is too small for the chosen test.
 
 ## Running

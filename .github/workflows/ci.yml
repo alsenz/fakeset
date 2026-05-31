@@ -50,3 +50,16 @@ jobs:
         run: pip install pytest polars scipy
       - name: Run statistical tests
         run: pytest
+
+  docs:
+    name: Docs Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      - uses: withastro/action@v3
+        with:
+          path: docs
+          node-version: '20'
