@@ -65,6 +65,47 @@ understanding what the executor will generate.
 fakeset definitions/ --print-plan
 ```
 
+### `--scale <FACTOR>`
+
+Multiply all dataset row counts by `FACTOR`.
+
+- **Scale down** (`< 1.0`): produces a proportional sample of the configured data volume.
+  For generated datasets the `rows:` count is multiplied. For import datasets the hash-ring
+  segment is narrowed so only the proportional fraction of the file is used.
+- **Scale up** (`> 1.0`): increases data volume. Only permitted when every import dataset
+  already uses a ring that leaves unused file rows. The maximum allowed scale factor is
+  `(1 − ring.start) / ring_span` for each import; fakeset rejects the run if any import
+  cannot accommodate the requested scale.
+- Datasets whose row count is derived from parents (via `include:`) are not scaled directly —
+  they inherit the adjusted count from their scaled parents automatically.
+
+**Type:** floating-point number
+
+```bash
+# 10% sample
+fakeset definitions/ --scale 0.1
+
+# 50% larger than configured
+fakeset definitions/ --scale 1.5
+```
+
+### `--seed.ring <SEED>`
+
+Seed for the import hash ring. When set, the partitioning of imported files across ring
+slices is fully deterministic — the same seed and schema will always produce the same
+assignment of file rows to ring positions.
+
+When omitted, a random seed is chosen at startup. This means each run partitions the
+imported file differently, which is usually fine for one-off synthetic data generation
+but unsuitable for reproducible benchmarks or regression tests.
+
+**Type:** 64-bit unsigned integer
+
+```bash
+# Reproducible import partitioning
+fakeset definitions/ --seed.ring 42
+```
+
 ## Examples
 
 ```bash

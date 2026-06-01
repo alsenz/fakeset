@@ -143,6 +143,29 @@ Fields also accept:
 - `after:` / `before:` — bounded date/datetime generation (ISO 8601 / RFC 3339)
 - `args: { ... }` — generator-specific parameters: `min`/`max` (word/length count) for `sentence`, `paragraph`, `words`, `sentences`, `paragraphs`, `password`; `precision` for `geohash`; `format` for `number_with_format`; `ratio` (0–100) for `boolean`
 
+### Importing pre-existing data
+
+Use `import:` instead of `rows:` to seed a dataset's rows from an external file (Parquet, CSV, JSON array, or JSONL). fakeset reads the file schema at load time and generates any additional `data:` fields per imported row. Expression fields may reference imported columns via the declared `ref` namespace.
+
+```yaml
+name: stocks
+format: parquet
+import:
+  file: data/tickers.parquet   # relative to schema root
+  ref: tickers                 # namespace for expressions: tickers.symbol
+  fields: ["symbol", "name", "sector"]
+
+data:
+  - name: score
+    type: number
+    range: {min: 0.0, max: 100.0}
+  - name: label
+    type: string
+    expression: "CONCAT(tickers.symbol, ' — ', tickers.sector)"
+```
+
+When an imported dataset has children-by-inclusion, the planner assigns each child a disjoint **hash ring** slice of the file rows proportional to its `ratio`. Use `--seed.ring <N>` for reproducible partitioning.
+
 ## Dependencies
 
 | Crate | Role |

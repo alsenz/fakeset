@@ -1,0 +1,10 @@
+name: stocks
+format: parquet
+output_file: stocks
+import:
+  file: ../tickers.csv
+  ref: tickers
+data:
+  - name: stock_id
+    type: string
+    generator: uuid

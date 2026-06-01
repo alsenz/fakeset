@@ -51,6 +51,15 @@ jobs:
       - name: Run statistical tests
         run: pytest
 
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   docs:
     name: Docs Build
     runs-on: ubuntu-latest

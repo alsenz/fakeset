@@ -1,0 +1,13 @@
+name: nyse
+format: csv
+output_file: nyse
+include:
+  file: stocks.yaml
+  ref: stocks
+  ratio: 0.5
+data:
+  - name: stock_id
+    ref: stocks.stock_id
+  - name: exchange
+    ref: stocks.exchange
+    value: "NYSE"

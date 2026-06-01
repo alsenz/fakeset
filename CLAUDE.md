@@ -47,6 +47,17 @@ integrity, expression formula correctness, list cardinality, lower-cover partiti
 distributions (chi-squared goodness-of-fit), numeric value distributions (KS test vs uniform).
 Tests auto-skip when sample size is too small for the chosen statistic.
 
+### Complexity analysis (for quality audits and simplicity refactors)
+
+When auditing code quality or planning simplicity refactors, use `rust-code-analysis-cli` to get per-function complexity metrics as a starting signal:
+
+```bash
+cargo install rust-code-analysis-cli  # one-time
+rust-code-analysis-cli --metrics -p lib/ -l rust
+```
+
+The functions with historically high cognitive/cyclomatic complexity are `plan_segments` (`segment.rs`), `execute` and `grow_parent_from_children` (`executor.rs`), and `build_plan` (`plan.rs`). Use the output to identify where decomposition would have the highest impact — treat metrics as a guide, not a hard threshold.
+
 ## Documentation site
 
 The docs live in `docs/` and are built with [Astro Starlight](https://starlight.astro.build).
@@ -71,7 +82,7 @@ pnpm run preview    # preview the production build locally
 | `docs/src/content/docs/examples/corporate-registry.mdx` | Corporate-registry example walk-through |
 | `docs/src/content/docs/examples/insurance.mdx` | Insurance example walk-through |
 | `docs/src/content/docs/concepts/semi-lattice.mdx` | Concept semi-lattice model |
-| `docs/src/content/docs/concepts/execution-pipeline.mdx` | 8-stage pipeline, ExecutionStep types, sentinel columns |
+| `docs/src/content/docs/concepts/execution-pipeline.mdx` | 11-stage pipeline, ExecutionStep types, sentinel columns, import specialisation restrictions |
 | `docs/src/content/docs/concepts/bernoulli-factoring.mdx` | Lower cover segmentation algorithm |
 | `docs/src/content/docs/concepts/list-links.mdx` | Staging/witness/assembly pipeline, collect bindings |
 | `docs/src/content/docs/reference/yaml-schema.mdx` | Complete YAML field reference (static MDX) |
@@ -158,14 +169,15 @@ Each run follows this fixed sequence:
 
 ```
 load YAML files
+  → load_import_headers        (read schema + row count from each import: file; prepend tainted fields)
   → build_dag          (petgraph DAG, topo-sort, cycle detection)
   → pull_down_expression_deps  (push hidden ref fields DOWN the lattice: inject expression deps declared only in an included parent)
-  → validate           (structural checks, ref validity, constraint consistency)
+  → validate           (structural checks, ref validity, constraint consistency, import taint checks)
   → expand_field_variants      (variant fields → concrete global variants)
   → expand_include_fields      (materialise `include.fields` wildcard copies as explicit ref fields)
   → resolve_refs       (push field types and merged constraints DOWN the lattice to child/ref targets)
   → apply_global_locales       (stamp locale onto locale-aware fields)
-  → build_plan         (resolve row counts, lower cover groups, inherited-field wiring, collect targets → ExecutionPlan)
+  → build_plan         (resolve row counts, lower cover groups, ring assignment, inherited-field wiring, collect targets → ExecutionPlan)
   → execute            (generate atoms leaf-first; accumulate values UP the lattice; write output files)
 ```
 
@@ -186,18 +198,19 @@ load YAML files
 | Module | Responsibility |
 |--------|---------------|
 | `lib.rs` | Public API: `load_all_datasets`, YAML discovery |
-| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `Schema`, …). Also `resolve_distributions`, `eligible_linked_rows`, the list-link visitor, and lattice-traversal helpers |
+| `models.rs` | All data types (`SyntheticDataset`, `Field`, `Include`, `ImportSpec`, `RingBounds`, `Schema`, …). Also `resolve_distributions`, `eligible_linked_rows`, the list-link visitor, and lattice-traversal helpers |
 | `graph.rs` | `build_dag` — petgraph DAG construction and topo-sort |
-| `validate.rs` | Schema validation: structural rules, ref checks, expression ordering |
+| `import.rs` | `load_import_headers` (schema + row-count header pass), `load_import_index` (full file load + hash array), `filter_ring` (ring-bounds row filter), `imported_column_names` |
+| `validate.rs` | Schema validation: structural rules, ref checks, expression ordering, import taint checks (`check_import_taint`) |
 | `expand_variants.rs` | Expand `type: variant` fields into concrete global `variants:` entries; stubs the original field with an inferred concrete type so downstream ref resolution can still find it |
 | `expressions.rs` | `pull_down_expression_deps`, identifier extraction for validation |
 | `rewrite.rs` | `resolve_refs` (ref chain resolution, constraint merging), `expand_include_fields` (wildcard field copying), `apply_global_locales`, `apply_locale_to_schema` |
 | `constraints.rs` | `FieldConstraints`, `Satisfiable`, `Merge`, `validate_field_constraints` |
-| `segment.rs` | `plan_segments` — Bernoulli weights, conflict pruning, IPF, rounding. `LowerCoverMember` and `Segment` types. |
-| `plan.rs` | `build_plan` — row counts, lower cover groups, inherited-field wiring, collect targets → `ExecutionPlan` / `ExecutionStep` |
+| `segment.rs` | `plan_segments` — Bernoulli weights, conflict pruning, IPF, rounding. `LowerCoverMember` and `Segment` types. `assign_ring_slices` — tiles parent ring across segments proportionally. |
+| `plan.rs` | `build_plan` — row counts, lower cover groups, ring assignment, inherited-field wiring, collect targets → `ExecutionPlan` / `ExecutionStep` |
 | `schema.rs` | `schema_to_arrow`, `field_to_arrow`, `parquet_datatype_to_arrow` — Arrow schema conversion |
 | `generator.rs` | `generate_column`, `sample_count` — per-field fake data generation via fake-rs; handles `type: object` by recursively generating sub-fields into a `StructArray`. `fake_date`/`fake_datetime` handle `after`/`before` bounds; `fake_string` threads `args` to range-bearing generators (`Sentence`, `Paragraph`, `Password`, `Words`, `Sentences`, `Paragraphs`, `Geohash`, `NumberWithFormat`); `locale_fake_join!` macro handles generators that return `Vec<String>`. |
-| `executor.rs` | `execute` — interprets the plan; staging node generation, witness generation, assembly, `grow_parent_from_children`, `AccumulateToLinked`. All DataFusion and Arrow batch operations. |
+| `executor.rs` | `execute` — interprets the plan; staging node generation, witness generation, assembly, `grow_parent_from_children`, `AccumulateToLinked`. Import branch: loads `ImportIndex` on first access, applies ring filter, appends synthetic fields. All DataFusion and Arrow batch operations. |
 
 ## DataFusion usage
 
@@ -234,6 +247,8 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 
 **BUG-REF (first-child-wins) — overlap segment ref integrity** — In overlap segments where two lower-cover members both appear, `grow_parent_from_children` inherits shared fields (e.g. `contract_id`) from whichever child is first in `child_batches` (HashMap iteration order). The other child's rows were generated with different values for that field and will not match the parent. Affects `claims.contract_id` / `claims.customer_id` in the `{premiums ∩ claims}` overlap segment (~34% of contract rows). Non-deterministic. Documented by `_BUG_REF` xfail markers in `tests/statistical/test_insurance.py`.
 
+**Generator-plus-value constraint should specialise, not conflict** — A child field with `ref: parent.field, value: "constant"` currently errors in `resolve_refs` if the parent field declares a `generator:`. The intended semantics are that `value:` is a specialisation overriding the generator, but the constraint merge treats them as conflicting. Workaround: omit `generator:` from any parent field that children will specialise with a constant `value:`. See `rewrite.rs::resolve_refs` / `constraints.rs::Merge` for the fix location.
+
 ## Feature specs
 
 Full design specs and implementation plans live in `specs/`:
@@ -244,13 +259,15 @@ Full design specs and implementation plans live in `specs/`:
 | `specs/done/MULT-2a.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-2.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-3.md` | **Complete** — implemented and merged |
-| `specs/done/REFRAME-1.md` | **Complete** — all stages implemented and merged |
+| `specs/done/REFRAME-1.md` | **Partially complete** — planning stages correct; segment atom generation in executor not implemented per spec (see SEG-ATOM-1) |
 | `specs/VAR-1.md` | **Planned** — Phase 1 (validation gate); Phase 2 (`type: any` encoding) pending design sign-off |
 | `specs/done/DQ-1.md` | **Complete** — post-write DQ layer implemented: nulls, defaults, corruptions (char deletion/insertion/truncation/encoding, noise, day shift), duplication, row deletion; field-level overrides; multiple output files per dataset |
 | *(no spec file)* ARGS-1 | **Complete** — `args` map on `Field` for generator-specific parameters; `after`/`before` top-level date bounds (parallel to `range`); new generators `words`, `sentences`, `paragraphs`, `geohash`, `number_with_format`; boolean `ratio` via `args` |
 | `specs/done/SEG-1.md` | **Complete** — branch-and-bound DFS replaces dense 2^N weight pass; N-based cap removed; `MAX_FEASIBLE_SEGMENTS` K-based cap; O(K·N) memory |
 | `specs/done/VAR-2.md` | **Complete** — two-level variant factoring; `generate_member_batch` applies Level 2 variant sub-distribution in the lower cover segment loop; BUG-VAR resolved |
+| `specs/done/IMPORT.md` | **Complete** — `import:` stanza on `SyntheticDataset`; hash-ring partitioning (`assign_ring_slices`); `load_import_headers` / `load_import_index` / `filter_ring`; import taint validation; `--seed.ring` CLI flag |
 | `specs/VAR-SPECIALIZE.md` | **Future** — child specialisation of parent variant fields; Level 2 IPF upgrade; needs design sign-off on YAML syntax and `FieldConstraints` set-value encoding; depends on VAR-2 |
+| `specs/SEG-ATOM-1.md` | **Planned** — correct segment atom generation per REFRAME. Unified shared-ref atom batch per segment with column source priority (import → precomputed → fresh); non-ref columns generated per-member via the variant-aware path. Replaces `grow_parent_from_children` / `resolve_inherited_source_columns` / `generate_segment_member_batches` / `generate_member_expanded_batch`; refactors `generate_member_batch` to non-ref-only. Root-cause fix for BUG-REF; removes `_BUG_REF` xfail markers |
 
 ## Planned next steps
 
@@ -262,6 +279,5 @@ Full design specs and implementation plans live in `specs/`:
 - **SERDE-YAML** — migrate off deprecated `serde_yaml = "0.9.34+deprecated"` to `serde_yaml_neo` (direct API-compatible fork); find-and-replace crate name in `Cargo.toml` and all `use serde_yaml::` imports
 - **REL** — model relationships induced by nested lists
 - **REPO** — allow definitions to be imported and included from remote GitHub repositories
-- **IMPORT** — allow imports from pre-existing files and database connections
 - **CNV-1** — field and excluded (field) wildcards on includes to default-define fields from includes as refs
 - **VAR-SPECIALIZE** — see `specs/VAR-SPECIALIZE.md`

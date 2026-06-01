@@ -1,0 +1,13 @@
+name: finance
+format: parquet
+output_file: finance
+include:
+  file: stocks.yaml
+  ref: stocks
+  ratio: 0.4
+data:
+  - name: stock_id
+    ref: stocks.stock_id
+  - name: bucket
+    type: string
+    value: "finance"

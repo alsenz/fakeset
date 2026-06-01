@@ -40,9 +40,10 @@ use std::sync::Arc;
 use crate::constraints::FieldConstraints;
 use crate::dq::apply_data_quality;
 use crate::generator::{generate_column, sample_count};
+use crate::import::{ImportIndex, filter_ring, load_import_index, resolve_import_path};
 use crate::models::{
-    CountSpec, Field, Format, Include, Range, Reducer, Schema, SyntheticDataset,
-    eligible_linked_rows, resolve_distributions, resolve_include, split_ref,
+    CountSpec, Field, Format, Include, Range, Reducer, RingBounds, Schema, SeedConfig,
+    SyntheticDataset, eligible_linked_rows, resolve_distributions, resolve_include, split_ref,
 };
 use crate::plan::{
     ExecutionPlan, ExecutionStep, InheritedField, distribute_rows, merge_variant_fields,
@@ -58,9 +59,15 @@ use crate::segment::{
 /// Each step is interpreted in order with no branching on dataset shape:
 /// row counts, lower cover segments, and inherited field wiring are all pre-resolved
 /// in the plan.
-pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
+pub async fn execute(
+    plan: &ExecutionPlan,
+    output_dir: &Path,
+    seed_config: &SeedConfig,
+) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
+    // Cache of fully-loaded import files, shared across all steps.
+    let mut import_cache: HashMap<PathBuf, Arc<ImportIndex>> = HashMap::new();
     let mut computed: HashMap<PathBuf, RecordBatch> = HashMap::new();
     // Tracks datasets that were generated *as a parent* in their own GenerateLowerCoverGroup step.
     // Only these are eligible for reuse when they appear as a lower cover member in a later step.
@@ -88,6 +95,8 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                     dataset.as_ref(),
                     *rows,
                     inherited,
+                    seed_config,
+                    &mut import_cache,
                     &mut computed,
                     &mut shared,
                 )
@@ -107,6 +116,8 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                     dataset.as_ref(),
                     *rows,
                     inherited,
+                    seed_config,
+                    &mut import_cache,
                     &mut computed,
                     &mut shared,
                 )
@@ -125,6 +136,8 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                     parent.as_ref(),
                     segments,
                     members,
+                    seed_config,
+                    &mut import_cache,
                     &mut computed,
                     &mut parent_computed,
                     &mut shared,
@@ -145,6 +158,8 @@ pub async fn execute(plan: &ExecutionPlan, output_dir: &Path) -> Result<()> {
                     parent.as_ref(),
                     segments,
                     members,
+                    seed_config,
+                    &mut import_cache,
                     &mut computed,
                     &mut parent_computed,
                     &mut shared,
@@ -291,6 +306,94 @@ fn resolve_inherited_fields(
 // Lower cover group execution
 // ---------------------------------------------------------------------------
 
+/// Accumulates per-segment batches across the lower cover group loop, tracking the
+/// state needed for final parent-batch assembly and member emission.
+///
+/// The witness-source / non-witness-source split preserves the n_eligible_slots boundary
+/// invariant: witness-source rows must precede non-witness-source rows in the assembled
+/// parent batch so `GenerateWitness` correctly identifies the eligible linked-dataset slots.
+struct SegmentBatchAccumulator {
+    /// Parent-batch rows from segments containing at least one witness-source member.
+    /// Placed first in the final batch to satisfy the n_eligible_slots boundary invariant.
+    witness_source_parent_batches: Vec<RecordBatch>,
+    non_witness_source_parent_batches: Vec<RecordBatch>,
+    /// For staging nodes: parent rows in segment-declaration order (determines slot indices).
+    ordered_staging_batches: Vec<RecordBatch>,
+    /// Expanded or canonical member batches keyed by member path, for later emission.
+    member_buffers: HashMap<PathBuf, Vec<RecordBatch>>,
+    /// Running slot offset across segments; advanced by each segment's row count.
+    slot_offset: usize,
+}
+
+impl SegmentBatchAccumulator {
+    fn new() -> Self {
+        Self {
+            witness_source_parent_batches: Vec::new(),
+            non_witness_source_parent_batches: Vec::new(),
+            ordered_staging_batches: Vec::new(),
+            member_buffers: HashMap::new(),
+            slot_offset: 0,
+        }
+    }
+
+    fn push_parent_batch(
+        &mut self,
+        batch: RecordBatch,
+        is_staging: bool,
+        seg_has_witness_source: bool,
+    ) {
+        if is_staging {
+            self.ordered_staging_batches.push(batch);
+        } else if seg_has_witness_source {
+            self.witness_source_parent_batches.push(batch);
+        } else {
+            self.non_witness_source_parent_batches.push(batch);
+        }
+    }
+
+    fn push_member_batch(&mut self, path: PathBuf, batch: RecordBatch) {
+        self.member_buffers.entry(path).or_default().push(batch);
+    }
+
+    fn advance_slot_offset(&mut self, n_rows: usize) {
+        self.slot_offset += n_rows;
+    }
+
+    /// Combine all accumulated segment batches into the final parent batch and return
+    /// member buffers for subsequent member emission.
+    async fn finalise(
+        self,
+        is_staging: bool,
+        has_witness_sources: bool,
+        schema: &Schema,
+        name: &str,
+    ) -> Result<(RecordBatch, HashMap<PathBuf, Vec<RecordBatch>>)> {
+        let parent_batch = if is_staging {
+            // Row order determines slot indices — concatenate in declaration order, no shuffle.
+            let arrow_schema = self
+                .ordered_staging_batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| Arc::new(schema_to_arrow(schema)));
+            concat_batches(&arrow_schema, &self.ordered_staging_batches)?
+        } else if has_witness_sources && !self.witness_source_parent_batches.is_empty() {
+            // Witness-source rows first (unshuffled), then shuffled remainder.
+            combine_witness_source_first(
+                self.witness_source_parent_batches,
+                self.non_witness_source_parent_batches,
+                schema,
+                name,
+            )
+            .await?
+        } else {
+            let mut all = self.witness_source_parent_batches;
+            all.extend(self.non_witness_source_parent_batches);
+            combine_and_shuffle(all, schema, name).await?
+        };
+        Ok((parent_batch, self.member_buffers))
+    }
+}
+
 /// Shared core for `GenerateStagingNode` (`is_staging=true`) and `GenerateDataset`
 /// (`is_staging=false`). When staging, stores the scalar batch in `computed` with no
 /// expression evaluation or emit. When not staging, evaluates expressions, handles
@@ -304,11 +407,23 @@ async fn execute_dataset_core(
     dataset: &SyntheticDataset,
     rows: usize,
     inherited: &[InheritedField],
+    seed_config: &SeedConfig,
+    import_cache: &mut HashMap<PathBuf, Arc<ImportIndex>>,
     computed: &mut HashMap<PathBuf, RecordBatch>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
 ) -> Result<()> {
     let inherited_map = resolve_inherited_fields(inherited, computed);
-    let batch = generate_with_inherited(&dataset.data, rows, &inherited_map)?;
+    let batch = if let Some(spec) = &dataset.import {
+        let ring = spec
+            .ring
+            .clone()
+            .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+        let idx = get_or_load_import(path, spec, seed_config.ring, import_cache)?;
+        let import_batch = filter_ring(&idx, &ring)?;
+        generate_batch_with_import(&dataset.data, &inherited_map, &HashMap::new(), &import_batch)?
+    } else {
+        generate_with_inherited(&dataset.data, rows, &inherited_map)?
+    };
     if is_staging {
         // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
         // expressions, and emits.
@@ -342,6 +457,8 @@ async fn execute_lower_cover_group_core(
     dataset: &SyntheticDataset,
     segments: &[Segment],
     members: &[LowerCoverMember],
+    seed_config: &SeedConfig,
+    import_cache: &mut HashMap<PathBuf, Arc<ImportIndex>>,
     computed: &mut HashMap<PathBuf, RecordBatch>,
     parent_computed: &mut HashSet<PathBuf>,
     shared: &mut HashMap<String, (Format, Vec<RecordBatch>)>,
@@ -353,34 +470,42 @@ async fn execute_lower_cover_group_core(
         .collect();
     let has_witness_sources = !witness_source_paths.is_empty();
 
-    // witness_source_parent_batches: rows from segments that contain at least one witness-source member.
-    // These are placed before the shuffled non-witness-source rows so that GenerateWitness's
-    // n_eligible_slots boundary correctly identifies linked-member rows.
-    let mut witness_source_parent_batches: Vec<RecordBatch> = Vec::new();
-    let mut non_witness_source_parent_batches: Vec<RecordBatch> = Vec::new();
-    // For staging nodes: collect batches in segment declaration order (no shuffle).
-    // Row order determines slot indices used by per-segment GenerateWitness.
-    let mut ordered_staging_batches: Vec<RecordBatch> = Vec::new();
-    let mut member_buffers: HashMap<PathBuf, Vec<RecordBatch>> = HashMap::new();
-    let mut slot_offset: usize = 0;
+    let mut acc = SegmentBatchAccumulator::new();
 
     for seg in segments {
         if seg.rows == 0 {
             continue;
         }
 
+        // For imported parents, load this segment's ring slice now so we know the
+        // actual row count (hash distribution may differ slightly from seg.rows).
+        let (n_rows, opt_import_batch) = if let Some(spec) = &dataset.import {
+            let ring = seg
+                .ring
+                .clone()
+                .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+            let idx = get_or_load_import(path, spec, seed_config.ring, import_cache)?;
+            let ib = filter_ring(&idx, &ring)?;
+            if ib.num_rows() == 0 {
+                acc.advance_slot_offset(seg.rows);
+                continue; // ring slice is ⊥ — skip segment
+            }
+            (ib.num_rows(), Some(ib))
+        } else {
+            (seg.rows, None)
+        };
+
         let seg_has_witness_source = seg
             .members
             .iter()
             .any(|mp| witness_source_paths.contains(mp));
 
-        if seg.members.is_empty() {
-            // Parent-only segment: no child rows to inherit — generate fresh.
-            let parent_seg = generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?;
-            if is_staging {
-                ordered_staging_batches.push(parent_seg);
+        let parent_seg = if seg.members.is_empty() {
+            // Parent-only segment: no child rows to inherit.
+            if let Some(ref ib) = opt_import_batch {
+                generate_batch_with_import(&dataset.data, &HashMap::new(), &seg.field_constraints, ib)?
             } else {
-                non_witness_source_parent_batches.push(parent_seg);
+                generate_fresh_batch(&dataset.data, n_rows, &seg.field_constraints)?
             }
         } else {
             // Witness-source members contribute constraints but produce no standalone batches.
@@ -393,111 +518,53 @@ async fn execute_lower_cover_group_core(
 
             // Children are preceding: generate each real member first, then grow the
             // parent outward from those already-solved rows (UNION ALL semantics).
-            //
-            // If a member was itself a parent with its own lower cover group, it is already
-            // in `computed` — use that batch directly rather than regenerating it, and
-            // suppress re-emission below.
             let mut child_batches: Vec<(&LowerCoverMember, RecordBatch)> = Vec::new();
             for member_path in &real_member_paths {
                 let m = members.iter().find(|m| &m.path == *member_path).unwrap();
-                if parent_computed.contains(&m.path) {
-                    if let Some(ref card) = m.cardinality {
-                        // The precomputed batch has total_member_rows rows, but
-                        // grow_parent_from_children expects seg.rows canonical rows (one per
-                        // parent slot). Generate a fresh canonical batch for assembly and an
-                        // expanded batch tagged with _slot_idx so the lattice position is
-                        // recorded in computed after all segments are processed.
-                        let canonical = generate_member_batch(m, seg.rows, &seg.field_constraints)?;
-                        let expanded = generate_member_expanded_batch(
-                            m,
-                            seg.rows,
-                            &seg.field_constraints,
-                            card,
-                            slot_offset,
-                        )?;
-                        member_buffers
-                            .entry(m.path.clone())
-                            .or_default()
-                            .push(expanded);
-                        child_batches.push((m, canonical));
-                    } else {
-                        // No cardinality: precomputed row count matches seg.rows.
-                        let precomputed = computed[&m.path].clone();
-                        child_batches.push((m, precomputed));
-                    }
-                } else {
-                    // Canonical batch: one row per slot, used for parent assembly.
-                    let canonical = generate_member_batch(m, seg.rows, &seg.field_constraints)?;
-                    if let Some(ref card) = m.cardinality {
-                        // Expanded batch: M_n rows per slot, tagged with _slot_idx for output.
-                        let expanded = generate_member_expanded_batch(
-                            m,
-                            seg.rows,
-                            &seg.field_constraints,
-                            card,
-                            slot_offset,
-                        )?;
-                        member_buffers
-                            .entry(m.path.clone())
-                            .or_default()
-                            .push(expanded);
-                        child_batches.push((m, canonical));
-                    } else {
-                        member_buffers
-                            .entry(m.path.clone())
-                            .or_default()
-                            .push(canonical.clone());
-                        child_batches.push((m, canonical));
-                    }
+                // If the member was itself a parent in a prior step it is already in `computed`.
+                let precomputed = parent_computed
+                    .contains(&m.path)
+                    .then(|| computed.get(&m.path))
+                    .flatten();
+                let (canonical, buffer_batch) = generate_segment_member_batches(
+                    m,
+                    n_rows,
+                    &seg.field_constraints,
+                    acc.slot_offset,
+                    precomputed,
+                )?;
+                if let Some(buf) = buffer_batch {
+                    acc.push_member_batch(m.path.clone(), buf);
                 }
+                child_batches.push((m, canonical));
             }
 
-            let parent_seg = if child_batches.is_empty() {
+            if child_batches.is_empty() {
                 // Witness-source-only segment: all members are witness sources; no real children.
-                generate_fresh_batch(&dataset.data, seg.rows, &seg.field_constraints)?
+                if let Some(ref ib) = opt_import_batch {
+                    generate_batch_with_import(&dataset.data, &HashMap::new(), &seg.field_constraints, ib)?
+                } else {
+                    generate_fresh_batch(&dataset.data, n_rows, &seg.field_constraints)?
+                }
             } else {
                 grow_parent_from_children(
                     &dataset.data,
-                    seg.rows,
+                    n_rows,
                     &child_batches,
                     &seg.field_constraints,
+                    opt_import_batch.as_ref(),
                 )
                 .await?
-            };
-
-            if is_staging {
-                ordered_staging_batches.push(parent_seg);
-            } else if seg_has_witness_source {
-                witness_source_parent_batches.push(parent_seg);
-            } else {
-                non_witness_source_parent_batches.push(parent_seg);
             }
-        }
-        slot_offset += seg.rows;
+        };
+
+        acc.push_parent_batch(parent_seg, is_staging, seg_has_witness_source);
+        acc.advance_slot_offset(n_rows);
     }
 
-    // For staging nodes: concatenate in segment declaration order (no shuffle).
-    // For non-staging: witness-source rows first, then shuffled remainder.
-    let parent_shuffled = if is_staging {
-        // Row order determines slot indices used by per-segment GenerateWitness steps.
-        let arrow_schema = ordered_staging_batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| Arc::new(schema_to_arrow(&dataset.data)));
-        concat_batches(&arrow_schema, &ordered_staging_batches)?
-    } else if has_witness_sources && !witness_source_parent_batches.is_empty() {
-        combine_witness_source_first(
-            witness_source_parent_batches,
-            non_witness_source_parent_batches,
-            &dataset.data,
-            &dataset.name,
-        )
-        .await?
-    } else {
-        let mut all = witness_source_parent_batches;
-        all.extend(non_witness_source_parent_batches);
-        combine_and_shuffle(all, &dataset.data, &dataset.name).await?
-    };
+    let (parent_shuffled, mut member_buffers) = acc
+        .finalise(is_staging, has_witness_sources, &dataset.data, &dataset.name)
+        .await?;
 
     if is_staging {
         // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
@@ -559,28 +626,19 @@ async fn execute_lower_cover_group_core(
     Ok(())
 }
 
-/// Accumulate-up step for include relationships: inherit child column values into parent rows.
+/// Resolve which child batch provides each parent field (inherited-field wiring).
 ///
-/// In semi-lattice terms, this is the upward propagation step — child (more-constrained)
-/// values flow into the parent (less-constrained) batch so they are never re-generated.
+/// Returns a map from parent-field-name → (child-alias "c0"/"c1"/…, child-column-name)
+/// for fields satisfied by:
+/// - Rule 1: child's `ref:` points back to a parent field by name (cross-schema ref)
+/// - Rule 2: child has a same-name field with no cross-ref pointing elsewhere
 ///
-/// Expressed as a DataFusion JOIN: a skeleton batch (fresh-generated rule-3 columns +
-/// `_row_idx`) is LEFT-JOINed with each child batch (also prepended with `_row_idx`).
-/// The SELECT clause names exactly which source each parent field comes from.
-///
-/// Per parent field, first match across children wins:
-/// 1. Child has `ref: <include_ref>.<parent_field>` → child column aliased to parent name.
-/// 2. Child has a field of the same name as the parent field (no cross-schema ref) →
-///    child column taken directly.
-/// 3. Neither → generated fresh into the skeleton and pulled from there.
-async fn grow_parent_from_children(
+/// Fields absent from the result fall through to Rule 3: generated fresh into the skeleton.
+/// `or_insert_with` preserves first-child-wins order — consistent with atoms preceding parents.
+fn resolve_inherited_source_columns(
     parent_schema: &Schema,
-    n: usize,
     child_batches: &[(&LowerCoverMember, RecordBatch)],
-    field_constraints: &HashMap<String, FieldConstraints>,
-) -> Result<RecordBatch> {
-    // Map parent field name → (child alias "c0"/"c1"/…, child column name).
-    // or_insert preserves first-child-wins semantics.
+) -> HashMap<String, (String, String)> {
     let mut sources: HashMap<String, (String, String)> = HashMap::new();
     for (ci, (m, child_batch)) in child_batches.iter().enumerate() {
         let alias = format!("c{ci}");
@@ -615,6 +673,31 @@ async fn grow_parent_from_children(
             }
         }
     }
+    sources
+}
+
+/// Accumulate-up step for include relationships: inherit child column values into parent rows.
+///
+/// In semi-lattice terms, this is the upward propagation step — child (more-constrained)
+/// values flow into the parent (less-constrained) batch so they are never re-generated.
+///
+/// Expressed as a DataFusion JOIN: a skeleton batch (fresh-generated Rule-3 columns +
+/// `_row_idx`) is LEFT-JOINed with each child batch (also prepended with `_row_idx`).
+/// The SELECT clause names exactly which source each parent field comes from.
+///
+/// Per parent field, first match across children wins (see `resolve_inherited_source_columns`):
+/// 1. Child has `ref: <include_ref>.<parent_field>` → child column aliased to parent name.
+/// 2. Child has a field of the same name as the parent field (no cross-schema ref) →
+///    child column taken directly.
+/// 3. Neither → generated fresh into the skeleton and pulled from there.
+async fn grow_parent_from_children(
+    parent_schema: &Schema,
+    n: usize,
+    child_batches: &[(&LowerCoverMember, RecordBatch)],
+    field_constraints: &HashMap<String, FieldConstraints>,
+    import_batch: Option<&RecordBatch>,
+) -> Result<RecordBatch> {
+    let sources = resolve_inherited_source_columns(parent_schema, child_batches);
 
     // Active parent fields (skip expressions and nested-include placeholders).
     let active: Vec<&Field> = parent_schema
@@ -628,6 +711,17 @@ async fn grow_parent_from_children(
     let mut skel_cols: Vec<ArrayRef> = vec![idx];
     for f in &active {
         if sources.contains_key(f.name.as_str()) {
+            continue;
+        }
+        // Tainted fields come from the import batch rather than being generated fresh.
+        if let Some(col) = f
+            .imported_taint
+            .then_some(import_batch)
+            .flatten()
+            .and_then(|ib| ib.schema().index_of(&f.name).ok().map(|i| ib.column(i).clone()))
+        {
+            skel_cols.push(col);
+            skel_fields.push(field_to_arrow(f));
             continue;
         }
         let effective = field_constraints
@@ -708,6 +802,146 @@ fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<Reco
 // ---------------------------------------------------------------------------
 // Witness generation
 // ---------------------------------------------------------------------------
+
+/// Draw strategy for `overlap: 0` — each staging slot owns an exclusive index-contiguous
+/// shard of the eligible linked pool. `shard_q` rows per shard, pre-computed by the planner.
+///
+/// Returns `(slot_assignments, staging_idxs, surviving_indices)` where `surviving_indices`
+/// is the identity map (slot_assignments are already absolute pre-filter indices).
+fn draw_exclusive_shards(
+    slot_start: usize,
+    slot_count: usize,
+    eligible_linked: &RecordBatch,
+    n_eligible_pre_filter: usize,
+    shard_q: usize,
+    cardinality: &CountSpec,
+    segment_constraints: &HashMap<String, FieldConstraints>,
+    include: &Include,
+) -> Result<(UInt32Array, Vec<u32>, Vec<u32>)> {
+    let mut all_assignments: Vec<u32> = Vec::new();
+    let mut all_staging: Vec<u32> = Vec::new();
+    for i in 0..slot_count {
+        let abs_slot = slot_start + i;
+        let shard_start = abs_slot * shard_q;
+        let shard_len = shard_q.min(n_eligible_pre_filter.saturating_sub(shard_start));
+        if shard_len == 0 {
+            continue;
+        }
+        let shard = eligible_linked.slice(shard_start, shard_len);
+        let (filtered_shard, surviving_shard) =
+            filter_batch_by_constraints(&shard, segment_constraints)?;
+        let n_shard = filtered_shard.num_rows();
+        if n_shard == 0 {
+            continue;
+        }
+        let m_n = sample_count(cardinality);
+        let m_n = if include.reinforcement == Some(0.0) {
+            m_n.min(n_shard)
+        } else {
+            m_n
+        };
+        let reinf = include.reinforcement.unwrap_or(1.0);
+        let local_samples = if include.reinforcement == Some(0.0) {
+            sample_linked_without_replacement(n_shard, m_n)
+        } else if reinf > 1.0 {
+            sample_linked_weighted(n_shard, m_n, reinf)
+        } else {
+            (0..m_n)
+                .map(|_| (0u64..n_shard as u64).fake::<u64>() as u32)
+                .collect()
+        };
+        for local_idx in local_samples {
+            let abs_idx = shard_start as u32 + surviving_shard[local_idx as usize];
+            all_assignments.push(abs_idx);
+            all_staging.push(abs_slot as u32);
+        }
+    }
+    // Identity surviving_indices: assignments are already absolute pre-filter indices.
+    let identity: Vec<u32> = (0..n_eligible_pre_filter as u32).collect();
+    Ok((UInt32Array::from(all_assignments), all_staging, identity))
+}
+
+/// Draw strategy for the default overlap mode (absent or ≥ 1) — all staging slots share
+/// one pre-filtered eligible pool. Sub-modes:
+/// - `reinforcement: 0`  → Fisher-Yates without-replacement per slot
+/// - `overlap > 1`       → power-law initial weights + optional Pólya urn
+/// - default             → uniform with-replacement
+///
+/// The caller is responsible for filtering `eligible_linked` to `filtered_linked` and
+/// supplying the corresponding `surviving` index map before calling this function.
+///
+/// Returns `(slot_assignments, staging_idxs, surviving_indices)`.
+fn draw_shared_pool(
+    slot_start: usize,
+    slot_count: usize,
+    filtered_linked: &RecordBatch,
+    surviving: Vec<u32>,
+    cardinality: &CountSpec,
+    include: &Include,
+) -> (UInt32Array, Vec<u32>, Vec<u32>) {
+    let n_eligible = filtered_linked.num_rows();
+    let counts: Vec<usize> = if n_eligible == 0 {
+        vec![0; slot_count]
+    } else {
+        (0..slot_count)
+            .map(|_| {
+                let m_n = sample_count(cardinality);
+                if include.reinforcement == Some(0.0) {
+                    m_n.min(n_eligible)
+                } else {
+                    m_n
+                }
+            })
+            .collect()
+    };
+    let total: usize = counts.iter().sum();
+    let s_idxs: Vec<u32> = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &c)| std::iter::repeat_n((slot_start + i) as u32, c))
+        .collect();
+    // Sampling mode:
+    //   reinforcement:0               → Fisher-Yates without-replacement per slot
+    //   overlap>1 (with/without reinf) → power-law initial weights + optional Pólya urn
+    //   default                       → uniform with-replacement
+    let s_assignments: UInt32Array = if n_eligible == 0 {
+        UInt32Array::from(Vec::<u32>::new())
+    } else {
+        let r = include.reinforcement;
+        let ov = include.overlap;
+        if r == Some(0.0) {
+            counts
+                .iter()
+                .flat_map(|&m_n| sample_linked_without_replacement(n_eligible, m_n))
+                .collect::<Vec<u32>>()
+                .into()
+        } else if let Some(ov_val) = ov.filter(|&v| v > 1.0) {
+            // Power-law initial weights: row j has weight (n_eligible - j)^(overlap - 1).
+            // Row 0 is most popular; relies on union_and_shuffle having randomised the batch.
+            let reinf = r.unwrap_or(1.0);
+            let initial_weights: Vec<f64> = (0..n_eligible)
+                .map(|j| ((n_eligible - j) as f64).powf(ov_val - 1.0))
+                .collect();
+            counts
+                .iter()
+                .flat_map(|&m_n| sample_with_polya(initial_weights.clone(), m_n, reinf))
+                .collect::<Vec<u32>>()
+                .into()
+        } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
+            counts
+                .iter()
+                .flat_map(|&m_n| sample_linked_weighted(n_eligible, m_n, reinf))
+                .collect::<Vec<u32>>()
+                .into()
+        } else {
+            (0..total)
+                .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
+                .collect::<Vec<u32>>()
+                .into()
+        }
+    };
+    (s_assignments, s_idxs, surviving)
+}
 
 /// Filter a batch to rows where every constrained field satisfies its `FieldConstraints`.
 /// Returns `(filtered_batch, surviving_row_indices)` — the surviving indices are positions
@@ -881,132 +1115,39 @@ fn execute_witness(
     let n_eligible_pre_filter = eligible_linked_rows(linked_batch.num_rows(), include.ratio);
     let eligible_linked = linked_batch.slice(0, n_eligible_pre_filter);
 
-    // Two sampling paths depending on overlap mode:
+    // Two sampling strategies depending on overlap mode:
     //
     // overlap:0 — each staging slot draws from an exclusive shard of the pre-filter eligible
-    //   pool. Shards are index-contiguous; shard_q rows each. The surviving_indices passed to
-    //   build_witness_dedup are identity (slot_assignments are already absolute pre-filter
-    //   indices), so Phase 2 and 3 are unchanged.
+    //   pool (`draw_exclusive_shards`). Shards are index-contiguous; surviving_indices is the
+    //   identity map so Phases 2–4 are unchanged.
     //
-    // default (overlap absent/1) or overlap>1 — filter the full eligible set once, then sample
-    //   all slots against that filtered view. For overlap>1, initial weights are power-law
-    //   (lower-indexed rows are progressively more probable across all slots).
+    // default (overlap absent/≥1) — filter the full eligible set once, then all staging
+    //   slots draw against that shared filtered view (`draw_shared_pool`). Sub-modes for
+    //   reinforcement and power-law overlap are handled inside the function.
     let (slot_assignments, staging_idxs, surviving_indices) = if include.overlap == Some(0.0) {
-        let q = shard_q.unwrap_or(0);
-        let mut all_assignments: Vec<u32> = Vec::new();
-        let mut all_staging: Vec<u32> = Vec::new();
-        for i in 0..slot_count {
-            let abs_slot = slot_start + i;
-            let shard_start = abs_slot * q;
-            let shard_len = q.min(n_eligible_pre_filter.saturating_sub(shard_start));
-            if shard_len == 0 {
-                continue;
-            }
-            let shard = eligible_linked.slice(shard_start, shard_len);
-            let (filtered_shard, surviving_shard) =
-                filter_batch_by_constraints(&shard, segment_constraints)?;
-            let n_shard = filtered_shard.num_rows();
-            if n_shard == 0 {
-                continue;
-            }
-            let m_n = sample_count(cardinality);
-            let m_n = if include.reinforcement == Some(0.0) {
-                m_n.min(n_shard)
-            } else {
-                m_n
-            };
-            let reinf = include.reinforcement.unwrap_or(1.0);
-            let local_samples = if include.reinforcement == Some(0.0) {
-                sample_linked_without_replacement(n_shard, m_n)
-            } else if reinf > 1.0 {
-                sample_linked_weighted(n_shard, m_n, reinf)
-            } else {
-                (0..m_n)
-                    .map(|_| (0u64..n_shard as u64).fake::<u64>() as u32)
-                    .collect()
-            };
-            for local_idx in local_samples {
-                let abs_idx = shard_start as u32 + surviving_shard[local_idx as usize];
-                all_assignments.push(abs_idx);
-                all_staging.push(abs_slot as u32);
-            }
-        }
-        // Identity surviving_indices: slot_assignments are already absolute pre-filter indices.
-        let identity: Vec<u32> = (0..n_eligible_pre_filter as u32).collect();
-        let total = all_assignments.len();
-        (
-            UInt32Array::from(all_assignments),
-            all_staging,
-            (identity, total),
-        )
+        draw_exclusive_shards(
+            slot_start,
+            slot_count,
+            &eligible_linked,
+            n_eligible_pre_filter,
+            shard_q.unwrap_or(0),
+            cardinality,
+            segment_constraints,
+            include,
+        )?
     } else {
-        // Filter the full eligible set once; segment constraints apply uniformly.
         let (filtered_linked, surviving) =
             filter_batch_by_constraints(&eligible_linked, segment_constraints)?;
-        let n_eligible = filtered_linked.num_rows();
-        let counts: Vec<usize> = if n_eligible == 0 {
-            vec![0; slot_count]
-        } else {
-            (0..slot_count)
-                .map(|_| {
-                    let m_n = sample_count(cardinality);
-                    if include.reinforcement == Some(0.0) {
-                        m_n.min(n_eligible)
-                    } else {
-                        m_n
-                    }
-                })
-                .collect()
-        };
-        let total: usize = counts.iter().sum();
-        let s_idxs: Vec<u32> = counts
-            .iter()
-            .enumerate()
-            .flat_map(|(i, &c)| std::iter::repeat_n((slot_start + i) as u32, c))
-            .collect();
-        // Sampling mode:
-        //   reinforcement:0               → Fisher-Yates without-replacement per slot
-        //   overlap>1 (with/without reinf) → power-law initial weights + optional Pólya urn
-        //   default                       → uniform with-replacement
-        let s_assignments: UInt32Array = if n_eligible == 0 {
-            UInt32Array::from(Vec::<u32>::new())
-        } else {
-            let r = include.reinforcement;
-            let ov = include.overlap;
-            if r == Some(0.0) {
-                counts
-                    .iter()
-                    .flat_map(|&m_n| sample_linked_without_replacement(n_eligible, m_n))
-                    .collect::<Vec<u32>>()
-                    .into()
-            } else if let Some(ov_val) = ov.filter(|&v| v > 1.0) {
-                // Power-law initial weights: row j has weight (n_eligible - j)^(overlap - 1).
-                // Row 0 is most popular; relies on union_and_shuffle having randomised the batch.
-                let reinf = r.unwrap_or(1.0);
-                let initial_weights: Vec<f64> = (0..n_eligible)
-                    .map(|j| ((n_eligible - j) as f64).powf(ov_val - 1.0))
-                    .collect();
-                counts
-                    .iter()
-                    .flat_map(|&m_n| sample_with_polya(initial_weights.clone(), m_n, reinf))
-                    .collect::<Vec<u32>>()
-                    .into()
-            } else if let Some(reinf) = r.filter(|&v| v > 1.0) {
-                counts
-                    .iter()
-                    .flat_map(|&m_n| sample_linked_weighted(n_eligible, m_n, reinf))
-                    .collect::<Vec<u32>>()
-                    .into()
-            } else {
-                (0..total)
-                    .map(|_| (0u64..n_eligible as u64).fake::<u64>() as u32)
-                    .collect::<Vec<u32>>()
-                    .into()
-            }
-        };
-        (s_assignments, s_idxs, (surviving, total))
+        draw_shared_pool(
+            slot_start,
+            slot_count,
+            &filtered_linked,
+            surviving,
+            cardinality,
+            include,
+        )
     };
-    let (surviving_indices, total) = surviving_indices;
+    let total = slot_assignments.len();
 
     // --- Phase 2: deduplicate draws by linked row ---
     let (unique_linked_idxs, staging_refs_array) =
@@ -1686,6 +1827,56 @@ fn generate_fresh_batch(
     generate_batch(schema, rows, &HashMap::new(), overrides)
 }
 
+/// Generate a batch for an imported dataset:
+/// - Tainted fields are taken directly from `import_batch` (ring-filtered file rows).
+/// - Non-tainted, non-expression, non-list-link fields are generated synthetically.
+///
+/// Row count is `import_batch.num_rows()`; `inherited` and `overrides` apply only to
+/// synthetic fields.
+fn generate_batch_with_import(
+    schema: &Schema,
+    inherited: &HashMap<String, Vec<ArrayRef>>,
+    overrides: &HashMap<String, FieldConstraints>,
+    import_batch: &RecordBatch,
+) -> Result<RecordBatch> {
+    let n = import_batch.num_rows();
+    let arrow_schema = Arc::new(schema_to_arrow(schema));
+    let columns = schema
+        .iter()
+        .filter(|f| f.expression.is_none() && !f.is_list_link())
+        .map(|f| -> Result<ArrayRef> {
+            if f.imported_taint {
+                let col_idx = import_batch
+                    .schema()
+                    .index_of(&f.name)
+                    .map_err(|_| anyhow!("imported column '{}' not found in import batch", f.name))?;
+                Ok(import_batch.column(col_idx).clone())
+            } else {
+                let prefix = inherited.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
+                let effective = overrides.get(&f.name).map(|fc| apply_constraints(f, fc));
+                generate_column(effective.as_ref().unwrap_or(f), n, prefix)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(arrow_schema, columns)?)
+}
+
+/// Get a cached `ImportIndex` or load it from disk if this is the first access.
+fn get_or_load_import(
+    dataset_path: &Path,
+    spec: &crate::models::ImportSpec,
+    ring_seed: u64,
+    cache: &mut HashMap<PathBuf, Arc<ImportIndex>>,
+) -> Result<Arc<ImportIndex>> {
+    let import_path = resolve_import_path(dataset_path, &spec.file)?;
+    if let Some(idx) = cache.get(&import_path) {
+        return Ok(Arc::clone(idx));
+    }
+    let idx = load_import_index(spec, dataset_path, ring_seed)?;
+    cache.insert(import_path, Arc::clone(&idx));
+    Ok(idx)
+}
+
 /// Generate M_n rows per parent-row slot, tagging each with `_slot_idx = slot_offset + i`.
 /// The canonical (one-row-per-slot) batch is handled separately by `grow_parent_from_children`;
 /// this function produces the expanded output batch for the lower cover member's output file.
@@ -1752,6 +1943,7 @@ fn generate_member_batch(
                     outputs: vec![],
                     locale: None,
                     include: None,
+                    import: None,
                     links: vec![],
                     data: schema.clone(),
                     variants: vec![],
@@ -1852,6 +2044,45 @@ fn generate_member_expanded_batch(
     let combined = concat_batches(&inner_schema, &slot_batches)?;
     let slot_col: ArrayRef = Arc::new(UInt32Array::from(slot_tags));
     prepend_column(&combined, "_slot_idx", slot_col)
+}
+
+/// Generate the canonical (one-row-per-slot) and optionally expanded (M_n-rows-per-slot)
+/// batches for one lower cover member within a segment, implementing the "children are
+/// preceding" lattice rule.
+///
+/// Returns `(canonical, buffer_batch)` where:
+/// - `canonical`: one row per segment slot; passed to `grow_parent_from_children` for assembly.
+/// - `buffer_batch`: when `Some`, pushed to `member_buffers` for later emission — either an
+///   expanded batch (when `m.cardinality` is set) or the canonical batch itself (otherwise).
+///
+/// When `precomputed` is `Some` and there is no cardinality, the member was itself a parent
+/// in a prior step and its batch is used directly; nothing is added to `member_buffers`
+/// (the prior step already handled emission for this member).
+fn generate_segment_member_batches(
+    m: &LowerCoverMember,
+    n_rows: usize,
+    field_constraints: &HashMap<String, FieldConstraints>,
+    slot_offset: usize,
+    precomputed: Option<&RecordBatch>,
+) -> Result<(RecordBatch, Option<RecordBatch>)> {
+    if let Some(card) = &m.cardinality {
+        // With cardinality: always regenerate canonical fresh (precomputed has total_member_rows,
+        // not n_rows canonical rows). Generate expanded batch for member output.
+        let canonical = generate_member_batch(m, n_rows, field_constraints)?;
+        let expanded =
+            generate_member_expanded_batch(m, n_rows, field_constraints, card, slot_offset)?;
+        Ok((canonical, Some(expanded)))
+    } else if let Some(pre) = precomputed {
+        // Precomputed, no cardinality: row count equals seg.rows — reuse directly.
+        // Member was already emitted by its own prior step; nothing to buffer here.
+        Ok((pre.clone(), None))
+    } else {
+        // Fresh generate, no cardinality: canonical serves as both the assembly input and
+        // the member output batch.
+        let canonical = generate_member_batch(m, n_rows, field_constraints)?;
+        let buf = canonical.clone();
+        Ok((canonical, Some(buf)))
+    }
 }
 
 // ---------------------------------------------------------------------------

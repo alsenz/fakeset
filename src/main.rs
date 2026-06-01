@@ -5,9 +5,10 @@ use fakeset::{
     expand_variants::expand_field_variants,
     expressions::pull_down_expression_deps,
     graph::build_dag,
+    import::load_import_headers,
     load_all_datasets,
-    models::{Format, SyntheticDataset},
-    plan::{ExecutionPlan, ExecutionStep, build_plan},
+    models::{Format, SeedConfig, SyntheticDataset},
+    plan::{ExecutionPlan, ExecutionStep, apply_scale, build_plan},
     rewrite::{apply_global_locales, expand_include_fields, resolve_refs},
     validate::validate,
 };
@@ -46,6 +47,19 @@ struct Cli {
     /// Takes precedence over per-dataset `format:` declarations.
     #[arg(long, value_name = "FORMAT")]
     output_format: Option<Format>,
+
+    /// Seed for the import hash ring. When set, import file partitions are
+    /// deterministic across runs with the same seed and schema. When omitted,
+    /// a random seed is chosen each run.
+    #[arg(long = "seed.ring", value_name = "SEED")]
+    seed_ring: Option<u64>,
+
+    /// Scale all row counts by this factor. Values < 1.0 produce a proportional
+    /// sample (e.g. 0.1 = 10%); values > 1.0 scale up. Import datasets are scaled
+    /// by narrowing or widening their ring segment — scale-up is only permitted when
+    /// every import already uses a ring that leaves unused rows.
+    #[arg(long, value_name = "FACTOR")]
+    scale: Option<f64>,
 }
 
 #[tokio::main]
@@ -57,6 +71,10 @@ async fn main() -> Result<()> {
         for ds in datasets.values_mut() {
             ds.format = fmt.clone();
         }
+    }
+    load_import_headers(&mut datasets)?;
+    if let Some(scale) = cli.scale {
+        apply_scale(&mut datasets, scale)?;
     }
     let dag = build_dag(&datasets)?;
     let datasets = pull_down_expression_deps(&datasets)?;
@@ -95,7 +113,10 @@ async fn main() -> Result<()> {
         dag.graph.edge_count(),
     );
 
-    execute(&plan, &cli.output).await?;
+    let seed_config = SeedConfig {
+        ring: cli.seed_ring.unwrap_or_else(rand::random),
+    };
+    execute(&plan, &cli.output, &seed_config).await?;
 
     println!("Done. Output written to {}", cli.output.display());
     Ok(())

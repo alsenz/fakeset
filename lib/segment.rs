@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::constraints::{FieldConstraints, Merge};
-use crate::models::{CountSpec, SyntheticDataset};
+use crate::models::{CountSpec, RingBounds, SyntheticDataset};
 
 /// Hard cap on the number of feasible segments produced by DFS enumeration.
 /// For tightly constrained groups (e.g. mutually exclusive tiers) K = N+1.
@@ -50,6 +50,34 @@ pub struct Segment {
     /// field name they override. Applied during parent-schema generation for
     /// this segment.
     pub field_constraints: HashMap<String, FieldConstraints>,
+    /// Hash ring slice assigned to this segment by `assign_ring_slices`.
+    /// `None` on segments belonging to non-imported parents.
+    pub ring: Option<RingBounds>,
+}
+
+/// Tile `parent_ring` across `segments` proportionally to their row counts,
+/// writing `segment.ring` for each. Segments with zero rows receive a
+/// zero-width slice (the executor skips them as ⊥).
+///
+/// Only called for imported-dataset parents; segments of non-imported datasets
+/// are left with `ring: None`.
+pub fn assign_ring_slices(segments: &mut [Segment], parent_ring: &RingBounds) {
+    let total: usize = segments.iter().map(|s| s.rows).sum();
+    if total == 0 {
+        return;
+    }
+    let span = parent_ring.end - parent_ring.start;
+    let mut cursor = parent_ring.start;
+    for seg in segments.iter_mut() {
+        let frac = seg.rows as f64 / total as f64;
+        let slice_end = cursor + span * frac;
+        seg.ring = Some(RingBounds { start: cursor, end: slice_end });
+        cursor = slice_end;
+    }
+    // Clamp the last slice to exactly parent_ring.end to avoid f64 rounding drift.
+    if let Some(r) = segments.last_mut().and_then(|s| s.ring.as_mut()) {
+        r.end = parent_ring.end;
+    }
 }
 
 #[inline]
@@ -75,6 +103,7 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
             members: vec![],
             rows: parent_rows,
             field_constraints: HashMap::new(),
+            ring: None,
         }]);
     }
 
@@ -102,6 +131,7 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
             members: vec![],
             rows: parent_rows,
             field_constraints: HashMap::new(),
+            ring: None,
         }]);
     }
 
@@ -141,6 +171,7 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
                 members: member_paths,
                 rows,
                 field_constraints: feasible[&mask].clone(),
+                ring: None,
             })
         })
         .collect();
@@ -150,6 +181,7 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
             members: vec![],
             rows: parent_rows,
             field_constraints: HashMap::new(),
+            ring: None,
         }]);
     }
 
@@ -380,6 +412,7 @@ mod tests {
                 outputs: vec![],
                 locale: None,
                 include: None,
+                import: None,
                 links: vec![],
                 data: fields,
                 variants: vec![],
@@ -614,5 +647,91 @@ mod tests {
             "{{a,c}} should be absent (infeasible bounds)"
         );
         assert!(!has(&["a", "b", "c"]), "{{a,b,c}} should be absent");
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    fn seg(rows: usize) -> Segment {
+        Segment {
+            members: vec![],
+            rows,
+            field_constraints: HashMap::new(),
+            ring: None,
+        }
+    }
+
+    fn parent(start: f64, end: f64) -> RingBounds {
+        RingBounds { start, end }
+    }
+
+    #[test]
+    fn single_segment_gets_full_parent_ring() {
+        let mut segs = vec![seg(100)];
+        assign_ring_slices(&mut segs, &parent(0.0, 1.0));
+        let r = segs[0].ring.as_ref().unwrap();
+        assert!((r.start - 0.0).abs() < 1e-9);
+        assert!((r.end - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_equal_segments_split_evenly() {
+        let mut segs = vec![seg(50), seg(50)];
+        assign_ring_slices(&mut segs, &parent(0.0, 1.0));
+        let r0 = segs[0].ring.as_ref().unwrap();
+        let r1 = segs[1].ring.as_ref().unwrap();
+        assert!((r0.start - 0.0).abs() < 1e-9);
+        assert!((r0.end - 0.5).abs() < 1e-9);
+        assert!((r1.start - 0.5).abs() < 1e-9);
+        assert!((r1.end - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn proportional_split_three_segments() {
+        // rows 30 / 20 / 50 → fractions 0.3 / 0.2 / 0.5
+        let mut segs = vec![seg(30), seg(20), seg(50)];
+        assign_ring_slices(&mut segs, &parent(0.0, 1.0));
+        let r = |i: usize| segs[i].ring.clone().unwrap();
+        assert!((r(0).start - 0.0).abs() < 1e-9);
+        assert!((r(0).end - 0.3).abs() < 1e-9);
+        assert!((r(1).start - 0.3).abs() < 1e-9);
+        assert!((r(1).end - 0.5).abs() < 1e-9);
+        assert!((r(2).start - 0.5).abs() < 1e-9);
+        assert!((r(2).end - 1.0).abs() < 1e-9, "last slice must clamp to parent end");
+    }
+
+    #[test]
+    fn tiling_within_sub_range() {
+        // Parent ring is [0.4, 0.8) — two equal segments each get 0.2 of the full range.
+        let mut segs = vec![seg(1), seg(1)];
+        assign_ring_slices(&mut segs, &parent(0.4, 0.8));
+        let r0 = segs[0].ring.as_ref().unwrap();
+        let r1 = segs[1].ring.as_ref().unwrap();
+        assert!((r0.start - 0.4).abs() < 1e-9);
+        assert!((r0.end - 0.6).abs() < 1e-9);
+        assert!((r1.start - 0.6).abs() < 1e-9);
+        assert!((r1.end - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slices_tile_without_gap_or_overlap() {
+        let mut segs = vec![seg(17), seg(33), seg(50)];
+        assign_ring_slices(&mut segs, &parent(0.0, 1.0));
+        // Each slice's end must equal the next slice's start.
+        for i in 0..segs.len() - 1 {
+            let end = segs[i].ring.as_ref().unwrap().end;
+            let next_start = segs[i + 1].ring.as_ref().unwrap().start;
+            assert!((end - next_start).abs() < 1e-9, "gap/overlap at boundary {i}");
+        }
+        // Last slice ends exactly at 1.0.
+        assert!((segs.last().unwrap().ring.as_ref().unwrap().end - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_segment_list_is_noop() {
+        let mut segs: Vec<Segment> = vec![];
+        assign_ring_slices(&mut segs, &parent(0.0, 1.0)); // must not panic
     }
 }

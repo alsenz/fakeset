@@ -3,7 +3,9 @@ use fakeset::{
     expand_variants::expand_field_variants,
     expressions::pull_down_expression_deps,
     graph::build_dag,
+    import::load_import_headers,
     load_all_datasets,
+    models::SeedConfig,
     plan::build_plan,
     rewrite::{expand_include_fields, resolve_refs},
     validate::validate,
@@ -23,7 +25,8 @@ async fn run(fixture: &str) -> PathBuf {
         Uuid::new_v4()
     ));
 
-    let datasets = load_all_datasets(&[fixture_path]).expect("load datasets");
+    let mut datasets = load_all_datasets(&[fixture_path]).expect("load datasets");
+    load_import_headers(&mut datasets).expect("load import headers");
     let dag = build_dag(&datasets).expect("build dag");
     let datasets = pull_down_expression_deps(&datasets).expect("pull down");
     for w in validate(&datasets).expect("validate") {
@@ -33,7 +36,8 @@ async fn run(fixture: &str) -> PathBuf {
     let datasets = expand_include_fields(&datasets).expect("expand include fields");
     let resolved = resolve_refs(&datasets).expect("resolve refs");
     let plan = build_plan(&dag, &resolved).expect("build plan");
-    execute(&plan, &out).await.expect("execute");
+    let seed_config = SeedConfig { ring: 42 };
+    execute(&plan, &out, &seed_config).await.expect("execute");
     out
 }
 
@@ -147,6 +151,58 @@ async fn test_bernoulli_conflicting_siblings_fan_out_correctly() {
     assert!(
         dog_categories.iter().all(|v| v == "dogs"),
         "every row in dogs.csv should have category='dogs', got: {dog_categories:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Overlap segment ref integrity — BUG-REF regression guard
+//
+// parent.yaml: 100 rows with `id`
+// m1.yaml: includes parent at 0.8, has `parent_id ref: p.id`
+// m2.yaml: includes parent at 0.5, has `parent_id ref: p.id`
+//
+// No constraint conflicts → joint segment {m1, m2} survives with ~40 rows.
+// In that segment, m1 and m2 both ref parent.id; the current implementation
+// generates each member's parent_id independently, then grow_parent_from_children
+// inherits whichever child wins HashMap iteration order. The losing child's
+// parent_id values are orphans (not present in parent.id).
+//
+// SEG-ATOM-1 fixes this by generating one unified atom batch per segment so
+// every member's parent_id matches the parent's. Marked #[ignore] until then.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "BUG-REF — passes once SEG-ATOM-1 is implemented (run with `cargo test -- --ignored`)"]
+async fn test_overlap_shared_ref_integrity() {
+    let out = run("tests/fixtures/execute/overlap_shared_ref").await;
+
+    let parent_ids: std::collections::HashSet<String> =
+        csv_column(&out, "parent", "id").into_iter().collect();
+
+    let m1_parent_ids = csv_column(&out, "m1", "parent_id");
+    let m1_orphans: Vec<&String> = m1_parent_ids
+        .iter()
+        .filter(|v| !parent_ids.contains(*v))
+        .collect();
+    assert!(
+        m1_orphans.is_empty(),
+        "{} of {} m1.parent_id values are not in parent.id (e.g. {:?})",
+        m1_orphans.len(),
+        m1_parent_ids.len(),
+        m1_orphans.iter().take(3).collect::<Vec<_>>(),
+    );
+
+    let m2_parent_ids = csv_column(&out, "m2", "parent_id");
+    let m2_orphans: Vec<&String> = m2_parent_ids
+        .iter()
+        .filter(|v| !parent_ids.contains(*v))
+        .collect();
+    assert!(
+        m2_orphans.is_empty(),
+        "{} of {} m2.parent_id values are not in parent.id (e.g. {:?})",
+        m2_orphans.len(),
+        m2_parent_ids.len(),
+        m2_orphans.iter().take(3).collect::<Vec<_>>(),
     );
 }
 
@@ -1555,5 +1611,195 @@ async fn test_segmented_list_link_assembles_correctly() {
             "B",
             "child_b rows must have tag='B'"
         );
+    }
+}
+
+// ===========================================================================
+// Import tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Import — simple: one imported file, one synthetic field added per row.
+//
+// tickers.csv has 20 rows (symbol, name).
+// stocks.yaml imports it and appends a synthetic `score` column.
+//
+// Assertions:
+//  - stocks.csv has exactly 20 rows (all imported rows, ring = full file)
+//  - both imported columns (symbol, name) and the synthetic column (score) appear
+//  - score values are numeric strings (non-empty)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_import_simple_row_count_and_columns() {
+    let out = run("tests/fixtures/execute/import_simple").await;
+
+    let rows = csv_rows(&out, "stocks");
+    assert_eq!(rows, 20, "stocks should have all 20 tickers from the CSV file");
+
+    // Both imported columns should be present.
+    let symbols = csv_column(&out, "stocks", "symbol");
+    assert_eq!(symbols.len(), 20, "symbol column should have 20 values");
+    assert!(
+        symbols.contains(&"AAPL".to_string()),
+        "imported symbol AAPL should be present"
+    );
+
+    let names = csv_column(&out, "stocks", "name");
+    assert_eq!(names.len(), 20);
+
+    // Synthetic column should be present and non-empty.
+    let scores = csv_column(&out, "stocks", "score");
+    assert_eq!(scores.len(), 20, "score column should have 20 values");
+    for s in &scores {
+        assert!(!s.is_empty(), "each score should be non-empty");
+        s.parse::<f64>().expect("score should be a valid number");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Import — lower cover: imported parent, two children with conflicting fields.
+//
+// stocks.yaml imports tickers.csv (20 rows) and adds a synthetic uuid `stock_id`.
+// nasdaq.yaml and nyse.yaml both include stocks at ratio 0.5, setting conflicting
+// `exchange` constants ("NASDAQ" / "NYSE"). This prunes the overlap segment so
+// every parent row goes to exactly one child.
+//
+// Assertions:
+//  - stocks.csv has 20 rows
+//  - nasdaq.csv row count + nyse.csv row count = 20 (complete partition)
+//  - nasdaq has only "NASDAQ" exchange values; nyse has only "NYSE"
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_import_lower_cover_partitions_rows() {
+    let out = run("tests/fixtures/execute/import_lower_cover").await;
+
+    let stocks = csv_rows(&out, "stocks");
+    assert_eq!(stocks, 20, "stocks should have all 20 tickers");
+
+    let nasdaq = csv_rows(&out, "nasdaq");
+    let nyse = csv_rows(&out, "nyse");
+    assert!(nasdaq > 0, "nasdaq should have some rows");
+    assert!(nyse > 0, "nyse should have some rows");
+    // The conflict-pruned overlap segment means IPF drives the remainder (∅)
+    // segment toward zero; combined children should account for nearly all parent rows.
+    // We use a subset bound (no duplication) plus a lower bound (substantial coverage).
+    assert!(
+        nasdaq + nyse <= stocks,
+        "children rows must not exceed parent rows: nasdaq={nasdaq} nyse={nyse} stocks={stocks}"
+    );
+    assert!(
+        nasdaq + nyse >= stocks * 8 / 10,
+        "children should account for ≥ 80% of parent rows after conflict pruning"
+    );
+
+    // Verify exchange column constants.
+    for ex in csv_column(&out, "nasdaq", "exchange") {
+        assert_eq!(ex, "NASDAQ", "nasdaq rows must have exchange=NASDAQ");
+    }
+    for ex in csv_column(&out, "nyse", "exchange") {
+        assert_eq!(ex, "NYSE", "nyse rows must have exchange=NYSE");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Import — variants: imported dataset split across two 50/50 variants.
+//
+// stocks.yaml imports tickers.csv (20 rows) and defines two variants:
+//   - tier "A" (ratio 0.5) → ring [0.0, 0.5)
+//   - tier "B" (ratio 0.5) → ring [0.5, 1.0)
+//
+// WriteSharedOutput combines both into stocks.csv.
+//
+// Assertions:
+//  - stocks.csv has exactly 20 rows (= full tickers file, no duplicates)
+//  - all rows have tier = "A" or "B"
+//  - symbols are distinct (no ticker appears twice)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_import_variants_cover_full_file() {
+    let out = run("tests/fixtures/execute/import_variants").await;
+
+    let rows = csv_rows(&out, "stocks");
+    assert_eq!(
+        rows, 20,
+        "both variants together must cover all 20 tickers exactly once"
+    );
+
+    let tiers = csv_column(&out, "stocks", "tier");
+    assert!(
+        tiers.iter().all(|t| t == "A" || t == "B"),
+        "every row must have tier A or B"
+    );
+
+    // Each symbol should appear exactly once — no row duplicated across variants.
+    let symbols = csv_column(&out, "stocks", "symbol");
+    let mut seen = std::collections::HashSet::new();
+    for sym in &symbols {
+        assert!(seen.insert(sym.clone()), "symbol '{sym}' appeared more than once");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Import — links: tickers imported as an un-written pool, synthetic trades
+// dataset draws from that pool per row.
+//
+// tickers.yaml: imports tickers.csv with no output_file → NOT written to disk.
+//               Serves only as the linked pool for trades.
+// trades.yaml:  30 synthetic rows. Each row has a `instruments` list of 1-3
+//               tickers drawn from the pool (symbol + ticker_name fields).
+//
+// This models the canonical use-case: "I have real market tick metadata; I
+// want to generate synthetic trade events that reference those real tickers."
+//
+// Assertions:
+//  - no tickers output file exists (the pool is internal-only)
+//  - trades.jsonl has 30 rows
+//  - each trade has a non-empty `instruments` list
+//  - every symbol in instruments is from tickers.csv
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_import_links_pool_not_written_trades_draw_from_it() {
+    let out = run("tests/fixtures/execute/import_links").await;
+
+    // The tickers dataset has no output_file — it must not be written.
+    assert!(
+        !out.join("tickers.parquet").exists() && !out.join("tickers.csv").exists(),
+        "tickers should not be written to disk (it is an un-written import pool)"
+    );
+
+    // trades.jsonl should exist with 30 rows.
+    let trades = jsonl_rows(&out, "trades");
+    assert_eq!(trades.len(), 30, "trades should have 30 rows");
+
+    let valid_symbols: std::collections::HashSet<&str> = [
+        "AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "META", "NVDA", "JPM",
+        "JNJ", "V", "PG", "UNH", "BAC", "XOM", "HD", "WMT", "INTC",
+        "VZ", "CSCO", "ORCL",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    for (i, row) in trades.iter().enumerate() {
+        let instruments = row["instruments"]
+            .as_array()
+            .unwrap_or_else(|| panic!("trade {i}: instruments must be an array"));
+        assert!(
+            !instruments.is_empty(),
+            "trade {i}: instruments list must not be empty"
+        );
+        for item in instruments {
+            let sym = item["symbol"]
+                .as_str()
+                .unwrap_or_else(|| panic!("trade {i}: instrument symbol must be a string"));
+            assert!(
+                valid_symbols.contains(sym),
+                "trade {i}: symbol '{sym}' is not in tickers.csv"
+            );
+        }
     }
 }

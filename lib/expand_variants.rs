@@ -297,6 +297,7 @@ mod tests {
             rows: Some(100),
             locale: None,
             include: None,
+            import: None,
             links: vec![],
             data,
             variants: vec![],

@@ -25,6 +25,7 @@ Every YAML file defines one `SyntheticDataset`.
 | `output` | string \| [`Output`](#output) | — | Output file: plain path string or `Output` block. Sugar for a single-entry `outputs` list. Accepts `output_file` as an alias. |
 | `outputs` | [`Output[]`](#output) | — | Multiple output files (e.g. one clean, one degraded). If both `output` and `outputs` are set, `outputs` wins. |
 | `include` | [`Include`](#include) | — | Declares this dataset as a constrained subset of another. |
+| `import` | [`ImportSpec`](#import) | — | Load rows from a pre-existing external file instead of generating them. Mutually exclusive with `rows`. |
 | `links` | [`Include[]`](#include) | — | Linked datasets for list-link sampling. Each entry names a dataset from which list items are drawn. |
 | `data` | [`Field[]`](#field) | — | Field definitions. Evaluated in declaration order for expressions. |
 | `variants` | [`VariantSchema[]`](#variantschema) | — | When non-empty, virtually splits the dataset into N concrete variants. Each variant inherits `data` fields and overrides/extends them. |
@@ -159,6 +160,93 @@ Controls whether field-level `default_values` replaces or augments the built-in 
 |-------|-------------|
 | `override` | `default_values` replaces the built-in defaults entirely. |
 | `extend` | `default_values` is merged with the built-in defaults. **Default.** |
+
+---
+
+## import
+
+Declares that this dataset's rows come from a pre-existing external file instead of being
+generated from scratch. Mutually exclusive with `rows:`.
+
+Supported formats: **Parquet**, **CSV**, **JSON array**, **JSONL**.
+
+Imported columns are merged into the dataset schema before planning. Synthetic `data:`
+fields are generated per-row and appended alongside the imported columns. Children-by-inclusion
+may not specialise or `ref:` imported columns — see
+[Specialisation restrictions](/concepts/execution-pipeline#import-specialisation-restrictions).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | string | ✓ | Path to the imported file, relative to the schema root. |
+| `ref` | string | ✓ | Reference namespace for imported columns in `expression:` fields (e.g. `ref: tickers` → `tickers.symbol`). |
+| `fields` | string\[\] | — | Column names to project in. `["*"]` or absent = all columns. |
+| `exclude` | string\[\] | — | Column names to suppress after projection. Most useful with `["*"]`. |
+| `ring` | [`RingBounds`](#ringbounds) | — | Hash ring bounds restricting which rows of the file are used. Assigned automatically by the planner for datasets with a lower cover; set manually to use a fixed fraction of the file. |
+
+### RingBounds
+
+Hash ring bounds `[start, end)` over `[0.0, 1.0)`. Row `i` of the imported file is
+included iff `h(i) ∈ [start, end)` where `h` is a deterministic positional hash seeded
+by `--seed.ring`.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `start` | float | ✓ | Ring start (inclusive). Must satisfy `0.0 ≤ start < end`. |
+| `end` | float | ✓ | Ring end (exclusive). Must satisfy `start < end ≤ 1.0`. |
+
+### Example
+
+```yaml
+name: stocks
+format: parquet
+output_file: stocks
+import:
+  file: data/tickers.parquet
+  ref: tickers
+  fields: ["symbol", "name", "sector"]
+  ring:             # optional: restrict to the first 50% of the file
+    start: 0.0
+    end: 0.5
+data:
+  - name: score
+    type: number
+    range: { min: 0.0, max: 100.0 }
+  - name: label
+    type: string
+    expression: "CONCAT(tickers.symbol, ' — ', tickers.sector)"
+```
+
+The typical pattern for using an imported file as a **sampling pool without writing it to disk**:
+
+```yaml
+# tickers.yaml — imported pool, not written to disk (no output_file)
+name: tickers
+format: parquet
+import:
+  file: data/tickers.csv
+  ref: tickers
+
+# trades.yaml — purely synthetic; draws ticker metadata from the pool
+name: trades
+format: jsonl
+output_file: trades
+rows: 10000
+links:
+  - file: tickers.yaml
+    ref: tickers
+    cardinality: { min: 1, max: 3 }
+data:
+  - name: trade_id
+    type: string
+    generator: uuid
+  - name: instruments
+    type: list
+    content:
+      from: tickers
+      fields:
+        - name: symbol
+          ref: tickers.symbol
+```
 
 ---
 

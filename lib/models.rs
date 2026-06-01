@@ -626,6 +626,11 @@ pub struct Field {
     /// needed to evaluate an expression but not otherwise declared.
     #[serde(default)]
     pub hidden: bool,
+    /// When true, this field originates from an `import:` file rather than YAML generation.
+    /// Set by `load_import_headers`; never present in YAML. Children-by-inclusion may not
+    /// ref or specialise tainted fields (see §Specialisation restrictions in specs/IMPORT.md).
+    #[serde(skip)]
+    pub imported_taint: bool,
     /// Number of items per row for `list` type fields. Ignored on all other field types.
     pub count: Option<CountSpec>,
     /// Decimal precision for `number` fields. Positive = decimal places; negative = round by
@@ -769,6 +774,57 @@ pub struct ListContent {
 /// dataset's base `data`), an optional locale override, and an optional row-fraction.
 pub type Schema = Vec<Field>;
 
+/// Runtime seed configuration, bundled so additional seed types can be added later
+/// without breaking call sites.
+#[derive(Debug, Clone)]
+pub struct SeedConfig {
+    /// Seed for the import hash ring. Controls which rows of each imported file
+    /// are assigned to each ring partition. Set to a fixed value for reproducibility;
+    /// by default a random value is chosen at startup (see `--seed.ring` in Phase 7).
+    pub ring: u64,
+}
+
+/// Hash-ring bounds for partitioning an imported file.
+///
+/// Row `i` of the imported file is included iff `h(i) ∈ [start, end)` where
+/// `h` is a deterministic positional hash seeded by `--seed.ring`. Bounds must
+/// satisfy `0.0 ≤ start < end ≤ 1.0`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RingBounds {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Declares that this dataset's rows come from a pre-existing external file rather
+/// than being generated from scratch. Mutually exclusive with `rows:`.
+///
+/// Imported columns are merged into the dataset's schema (as tainted fields) by
+/// `load_import_headers` before validation; synthetic `data.fields` are appended
+/// per-row at execution time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportSpec {
+    /// Path to the imported file, relative to the schema root.
+    /// Supported formats: Parquet, CSV, JSON array, JSONL.
+    pub file: String,
+    /// Reference namespace used to qualify imported columns in `expression:` fields
+    /// within this dataset (e.g. `ref: tickers` → `tickers.symbol` in expressions).
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// Column names to project in. `["*"]` or absent means all columns.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// Column names to suppress after projection. Most useful with `["*"]`.
+    pub exclude: Option<Vec<String>>,
+    /// Hash ring bounds restricting which rows of the file are used.
+    /// Assigned automatically by the planner when a lower cover exists;
+    /// may be set manually to restrict the dataset to a fraction of the file.
+    pub ring: Option<RingBounds>,
+    /// Total row count of the imported file, set by `load_import_headers`.
+    /// Not present in YAML.
+    #[serde(skip)]
+    pub total_rows: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Include {
     pub file: String,
@@ -843,6 +899,10 @@ pub struct SyntheticDataset {
     #[serde(default)]
     pub outputs: Vec<OutputSpec>,
     pub include: Option<Include>,
+    /// Pre-existing external file whose rows become this dataset's rows.
+    /// Mutually exclusive with `rows:`. Imported columns are merged into
+    /// `data` as tainted fields by `load_import_headers` before planning.
+    pub import: Option<ImportSpec>,
     /// Linked datasets for junction or list-link sampling.
     /// Each entry names a dataset (by file + ref) from which atoms draw linked-dataset values.
     /// A link referenced by a `content.from:` field is a **list link** (witness/assembly pipeline).

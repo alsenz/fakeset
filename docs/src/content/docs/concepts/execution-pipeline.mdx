@@ -1,16 +1,17 @@
 ---
 title: Execution Pipeline
-description: The eight-stage pipeline fakeset runs on every invocation, from YAML loading to output files.
+description: The eleven-stage pipeline fakeset runs on every invocation, from YAML loading to output files.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-## The eight stages
+## The eleven stages
 
 Every `fakeset` run executes this fixed sequence:
 
 ```
 load YAML files
+  → load_import_headers   (new: schema + row count from external files)
   → build_dag
   → pull_down_expression_deps
   → validate
@@ -28,7 +29,17 @@ All `.yaml` / `.yml` files are discovered and deserialized into `SyntheticDatase
 structs. File paths are canonicalized so they serve as stable keys throughout the
 pipeline.
 
-### 2. Build DAG
+### 2. Load import headers
+
+For every dataset that carries an `import:` stanza, fakeset reads the **schema only**
+(column names and Arrow types) from the external file without loading data rows. The
+imported columns are merged into the dataset's schema as tainted fields before the DAG
+is built, so all downstream stages (ref validation, type resolution, expression ordering)
+can see them.
+
+`total_rows` — the file's row count — is also recorded here for planning estimates.
+
+### 3. Build DAG
 
 A petgraph directed graph is constructed from the dataset map:
 
@@ -38,16 +49,22 @@ A petgraph directed graph is constructed from the dataset map:
 - **Data-dependency edges** (from `links:`): linked dataset → consumer. The linked
   dataset must be fully generated before its consumer can run.
 
+External import files have no DAG node — they are read directly by the executor.
+
 A topological sort is verified; a cycle causes an immediate error.
 
-### 3. Pull down expression deps
+### 4. Pull down expression deps
 
 If a dataset's `expression:` field references a field defined only in a parent dataset,
 that field needs to be visible in the child's batch. This pass injects those
 dependencies as hidden `hidden: true` fields into the child before the rewrite pass
 runs — so expressions can reference parent fields without users having to re-declare them.
 
-### 4. Validate
+Imported (tainted) columns are deliberately excluded from this injection: children-by-inclusion
+may not ref imported columns, so pulling them down would create refs that validation
+correctly rejects.
+
+### 5. Validate
 
 Structural checks across the whole graph:
 
@@ -56,10 +73,13 @@ Structural checks across the whole graph:
 - Expression identifiers are declared in evaluation order
 - Constraint consistency (e.g. `value:` and `range:` are not both set)
 - `rows:` and `ratio:` are not set simultaneously on the same include
+- `rows:` and `import:` are mutually exclusive
+- `import.ring` bounds are valid (`0.0 ≤ start < end ≤ 1.0`)
+- Children-by-inclusion do not specialise or ref imported columns (see [below](#import-specialisation-restrictions))
 
 Warnings (non-fatal) are printed to stderr; errors abort.
 
-### 5. Expand field variants
+### 6. Expand field variants
 
 `type: variant` fields are expanded. A dataset with a single `type: variant` field
 with N alternatives is replaced by N concrete variant datasets at the same
@@ -68,13 +88,16 @@ semi-lattice position. Multiple variant fields produce a cross-product expansion
 Variant datasets share the same `output_file:` and are written to the same output
 using a union + shuffle step (`WriteSharedOutput`).
 
-### 6. Expand include fields
+### 7. Expand include fields
 
 `include.fields: ["*"]` wildcards and named field lists are expanded into explicit
 `ref: <ref>.<field>` entries on the child dataset. This happens after variant
 expansion so that wildcard copies land on the right expanded dataset.
 
-### 7. Resolve refs
+Wildcard expansion silently skips imported (tainted) columns — they cannot be propagated
+to children-by-inclusion.
+
+### 8. Resolve refs
 
 The main rewrite pass propagates type information and merged constraints *down* the
 lattice toward atoms:
@@ -86,13 +109,13 @@ lattice toward atoms:
 After this pass, every field in every dataset has a resolved type and all ref chains
 are fully materialised.
 
-### 8. Apply global locales
+### 9. Apply global locales
 
 The `locale:` stanza at the dataset level is stamped onto every locale-capable field
 in that dataset that does not have its own explicit locale. Field-level locale always
 takes precedence.
 
-### 9. Build plan
+### 10. Build plan
 
 `build_plan` produces a flat list of `ExecutionStep` variants. This is where:
 
@@ -101,10 +124,17 @@ takes precedence.
 - Inherited field wiring is determined (which parent fields come from which child batch)
 - Collect targets (for `reducer: collect` bindings) are recorded
 
-### 10. Execute
+### 11. Execute
 
 The executor interprets `ExecutionStep`s in order using Apache Arrow record batches.
 DataFusion is used for JOIN operations and expression evaluation.
+
+For imported datasets the executor branches at the batch-generation step: instead of
+generating all `data:` fields from scratch, it calls `filter_ring` to extract the
+pre-loaded `ImportIndex` rows that fall within the step's ring bounds. Synthetic
+`data:` fields (those without `imported_taint`) are then appended per-row in the
+usual way, followed by expression evaluation and output. If `filter_ring` returns an
+empty batch the step is skipped as ⊥.
 
 ## Execution step types
 
@@ -161,3 +191,40 @@ Each DataFusion function creates its own `SessionContext::new()`. There is no sh
 context threaded through the executor. New work should use the programmatic DataFrame
 API rather than SQL strings where possible.
 </Aside>
+
+---
+
+## Import specialisation restrictions {#import-specialisation-restrictions}
+
+When a dataset carries an `import:` stanza, its imported columns become **tainted** —
+they are marked with `imported_taint: true` during header loading and cannot be
+specialised by children-by-inclusion.
+
+**Children-by-inclusion of an imported dataset may not:**
+
+- Declare a `data:` field with the same name as an imported column.
+- Use `ref:` pointing at an imported column, either directly or transitively through
+  an `expression:` field that depends on one.
+- Include an imported column via `include.fields:` (explicit or wildcard).
+
+The taint extends to any `expression:` field in the imported dataset whose SQL
+expression references an imported column — those derived fields are also tainted.
+Validation walks the taint closure and rejects any child field that targets a tainted
+name.
+
+**What children can do:** freely declare and specialise any `data:` field that is
+synthetic (neither an imported column nor derived from one). Those fields propagate
+through the include lattice exactly as normal.
+
+**Why this restriction exists:** the hash-ring mechanism partitions the imported file
+by row index, not by field values. A child's ring slice contains whatever rows fall
+in that hash range — there is no guarantee that those rows satisfy any value-based
+constraint. Allowing children to specialise imported columns (e.g. `value: "NYSE"` on
+an imported `exchange` field) would silently produce contradictory rows or unexpected
+filtering. Synthetic fields are safe because they are generated fresh per imported row
+and fully under fakeset's control.
+
+**Links are not restricted.** A `links:` entry pointing at an imported dataset, or a
+dataset that uses an imported dataset as a `links:` target, may project imported
+columns via `content.fields` `ref:` entries as normal — those are data projections,
+not constraint specialisations, and do not affect the ring partition.

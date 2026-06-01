@@ -123,6 +123,14 @@ fn expand_field_patterns(
         if pattern == "*" {
             for tf in target_data {
                 let name = tf.name.as_str();
+                // Never propagate imported (tainted) columns via wildcard expansion.
+                // Children-by-inclusion may not ref imported fields; silently skipping
+                // here means `fields: ["*"]` only copies synthetic fields, which is
+                // the correct behaviour. Explicit named imports of tainted columns
+                // are caught by the validator.
+                if tf.imported_taint {
+                    continue;
+                }
                 if !exclude.contains(name)
                     && !existing.contains(name)
                     && !out.iter().any(|f| f.name == tf.name)

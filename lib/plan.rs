@@ -11,12 +11,12 @@ use std::sync::Arc;
 use crate::constraints::FieldConstraints;
 use crate::graph::DatasetGraph;
 use crate::models::{
-    CountSpec, DataQuality, Field, Format, Include, Locale, Output, Reducer, RefBinding, Schema,
-    SyntheticDataset, VariantSchema, eligible_linked_rows, expected_cardinality,
-    for_each_list_link, resolve_distributions, resolve_include, split_ref,
+    CountSpec, DataQuality, Field, Format, Include, Locale, Output, Reducer, RefBinding,
+    RingBounds, Schema, SyntheticDataset, VariantSchema, eligible_linked_rows,
+    expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref,
 };
 use crate::rewrite::apply_locale_to_schema;
-use crate::segment::{LowerCoverMember, Segment, plan_segments};
+use crate::segment::{LowerCoverMember, Segment, assign_ring_slices, plan_segments};
 
 const DEFAULT_ROWS: usize = 100;
 
@@ -236,6 +236,7 @@ fn expand_variant_dataset(
         output: Some(crate::models::OutputSpec::Shorthand(output_key.to_string())),
         outputs: vec![],
         include: base.include.clone(),
+        import: base.import.clone(),
         links: base.links.clone(),
         data: merge_variant_fields(&base.data, &variant_fields),
         variants: vec![],
@@ -524,6 +525,303 @@ fn linked_field_default(
         .unwrap_or(YamlValue::Null)
 }
 
+// ---------------------------------------------------------------------------
+// Per-dataset-shape planning functions (called from the topo-sort loop)
+// ---------------------------------------------------------------------------
+
+/// Plan steps for a variant-factored dataset: replace it with N concrete variant datasets,
+/// each writing to the same shared output file (shuffled together by `WriteSharedOutput`).
+/// Finishes with `CombineVariantBatches` so downstream witnesses find a single linked batch.
+///
+/// Note: inherited fields into a variant parent are not wired in v1 — they require a single
+/// stable batch to pull columns from; variants produce N separate batches.
+#[allow(clippy::too_many_arguments)]
+fn plan_variant_steps(
+    path: &Path,
+    dataset: &SyntheticDataset,
+    lower_cover_groups: &HashMap<PathBuf, Vec<LowerCoverMember>>,
+    datasets: &HashMap<PathBuf, SyntheticDataset>,
+    row_counts: &HashMap<PathBuf, usize>,
+    shared_outputs: &mut Vec<(String, Format, Option<DataQuality>, Vec<Field>)>,
+    seen_shared: &mut HashSet<String>,
+    steps: &mut Vec<ExecutionStep>,
+) -> Result<()> {
+    let output_key = dataset
+        .resolved_outputs()
+        .into_iter()
+        .next()
+        .map(|o| o.file)
+        .unwrap_or_else(|| dataset.name.clone());
+    let variant_dists: Vec<Option<f64>> = dataset.variants.iter().map(|v| v.ratio).collect();
+    let dists = resolve_distributions(&variant_dists);
+    let row_counts_v = distribute_rows(row_counts[path], &dists);
+
+    // For imported datasets, pre-tile the parent ring across variants proportional to row
+    // counts. Each expanded variant dataset carries its own ring slice so the executor
+    // loads the correct file segment.
+    let variant_rings: Vec<Option<RingBounds>> = if let Some(spec) = &dataset.import {
+        let parent_ring = spec
+            .ring
+            .clone()
+            .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+        let total: usize = row_counts_v.iter().sum();
+        let span = parent_ring.end - parent_ring.start;
+        let mut cursor = parent_ring.start;
+        row_counts_v
+            .iter()
+            .enumerate()
+            .map(|(i, &vrows)| {
+                let frac = if total > 0 { vrows as f64 / total as f64 } else { 0.0 };
+                // Clamp the last slice to the exact parent end to absorb f64 drift.
+                let end = if i + 1 == row_counts_v.len() {
+                    parent_ring.end
+                } else {
+                    cursor + span * frac
+                };
+                let ring = RingBounds { start: cursor, end };
+                cursor = end;
+                Some(ring)
+            })
+            .collect()
+    } else {
+        vec![None; row_counts_v.len()]
+    };
+
+    for (i, (variant, &variant_rows)) in
+        dataset.variants.iter().zip(row_counts_v.iter()).enumerate()
+    {
+        let virtual_path = variant_key(path, i);
+        let mut concrete = expand_variant_dataset(dataset, variant, i, variant_rows, &output_key);
+        // Narrow the variant's import ring to its pre-computed slice.
+        if let (Some(spec), Some(ring)) = (&mut concrete.import, &variant_rings[i]) {
+            spec.ring = Some(ring.clone());
+        }
+
+        if let Some(members) = lower_cover_groups.get(path) {
+            // Each flat lower cover member accumulates rows from N variant groups; ensure it has
+            // an output so WriteSharedOutput fires once for the combined output.
+            // Witness-source members (is_witness_source=true) have no standalone output.
+            let members_with_output: Vec<LowerCoverMember> = members
+                .iter()
+                .map(|m| {
+                    let mut s = m.clone();
+                    if s.dataset.resolved_outputs().is_empty() && !s.is_witness_source {
+                        s.dataset.output =
+                            Some(crate::models::OutputSpec::Shorthand(m.dataset.name.clone()));
+                    }
+                    s
+                })
+                .collect();
+            let mut segments = plan_segments(variant_rows, &members_with_output)?;
+            if let Some(spec) = &concrete.import {
+                let vring = spec
+                    .ring
+                    .clone()
+                    .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+                assign_ring_slices(&mut segments, &vring);
+            }
+            for m in &members_with_output {
+                track_shared(&m.dataset, shared_outputs, seen_shared);
+            }
+            track_shared(&concrete, shared_outputs, seen_shared);
+            let vpath = virtual_path.clone();
+            let c = Arc::new(concrete.clone());
+            let (s_vpath, s_c) = (vpath.clone(), c.clone());
+            let segs_for_witness = segments.clone();
+            let (s_segs, s_mbrs) = (segments.clone(), members_with_output.clone());
+            push_with_list_link_steps(
+                steps,
+                &concrete,
+                &virtual_path,
+                false,
+                datasets,
+                row_counts,
+                &segs_for_witness,
+                || ExecutionStep::GenerateStagingLowerCoverGroup {
+                    parent_path: s_vpath,
+                    parent: s_c,
+                    segments: s_segs,
+                    members: s_mbrs,
+                },
+                |defer| ExecutionStep::GenerateLowerCoverGroup {
+                    parent_path: vpath,
+                    parent: c,
+                    segments,
+                    members: members_with_output,
+                    defer_emit: defer,
+                },
+            );
+        } else {
+            track_shared(&concrete, shared_outputs, seen_shared);
+            let vpath = virtual_path.clone();
+            let c = Arc::new(concrete.clone());
+            let (s_vpath, s_c) = (vpath.clone(), c.clone());
+            let single_seg = vec![Segment {
+                members: vec![],
+                rows: variant_rows,
+                field_constraints: HashMap::new(),
+                ring: concrete
+                    .import
+                    .as_ref()
+                    .map(|s| s.ring.clone().unwrap_or(RingBounds { start: 0.0, end: 1.0 })),
+            }];
+            push_with_list_link_steps(
+                steps,
+                &concrete,
+                &virtual_path,
+                false,
+                datasets,
+                row_counts,
+                &single_seg,
+                || ExecutionStep::GenerateStagingNode {
+                    path: s_vpath,
+                    dataset: s_c,
+                    rows: variant_rows,
+                    inherited: vec![],
+                },
+                |_| ExecutionStep::GenerateDataset {
+                    path: vpath,
+                    dataset: c,
+                    rows: variant_rows,
+                    inherited: vec![],
+                    defer_emit: false,
+                },
+            );
+        }
+    }
+
+    // Merge all variant batches into the original path in `computed` so downstream
+    // witnesses that link to this dataset can find a single combined batch.
+    let variant_keys: Vec<PathBuf> = (0..dataset.variants.len())
+        .map(|i| variant_key(path, i))
+        .collect();
+    steps.push(ExecutionStep::CombineVariantBatches {
+        original_path: path.to_path_buf(),
+        variant_paths: variant_keys,
+    });
+    Ok(())
+}
+
+/// Plan steps for a lower cover group: segment the parent, generate member batches inside
+/// the group step, and append collect steps for any junction-link members.
+#[allow(clippy::too_many_arguments)]
+fn plan_lower_cover_group_steps(
+    path: &Path,
+    dataset: &SyntheticDataset,
+    members: &[LowerCoverMember],
+    collect_targets: &HashSet<PathBuf>,
+    datasets: &HashMap<PathBuf, SyntheticDataset>,
+    row_counts: &HashMap<PathBuf, usize>,
+    shared_outputs: &mut Vec<(String, Format, Option<DataQuality>, Vec<Field>)>,
+    seen_shared: &mut HashSet<String>,
+    steps: &mut Vec<ExecutionStep>,
+) -> Result<()> {
+    let mut segments = plan_segments(row_counts[path], members)?;
+    if let Some(spec) = &dataset.import {
+        let parent_ring = spec
+            .ring
+            .clone()
+            .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+        assign_ring_slices(&mut segments, &parent_ring);
+    }
+    for m in members.iter() {
+        track_shared(&m.dataset, shared_outputs, seen_shared);
+    }
+    track_shared(dataset, shared_outputs, seen_shared);
+    let p = path.to_path_buf();
+    let d = Arc::new(dataset.clone());
+    let mbrs = members.to_vec();
+    let is_collect_target = collect_targets.contains(path);
+    let (s_p, s_d) = (p.clone(), d.clone());
+    let segs_for_witness = segments.clone();
+    let (s_segs, s_mbrs) = (segments.clone(), mbrs.clone());
+    push_with_list_link_steps(
+        steps,
+        dataset,
+        path,
+        is_collect_target,
+        datasets,
+        row_counts,
+        &segs_for_witness,
+        || ExecutionStep::GenerateStagingLowerCoverGroup {
+            parent_path: s_p,
+            parent: s_d,
+            segments: s_segs,
+            members: s_mbrs,
+        },
+        |defer| ExecutionStep::GenerateLowerCoverGroup {
+            parent_path: p,
+            parent: d,
+            segments,
+            members: mbrs,
+            defer_emit: defer,
+        },
+    );
+    // Junction link members: emit AccumulateToLinked + EmitDataset after the group step.
+    for m in members {
+        if m.is_witness_source {
+            continue;
+        }
+        emit_top_level_collect_steps(&m.dataset, &m.path, datasets, steps);
+    }
+    Ok(())
+}
+
+/// Plan steps for a standalone dataset: no variants, no own lower cover group.
+#[allow(clippy::too_many_arguments)]
+fn plan_standalone_steps(
+    path: &Path,
+    dataset: &SyntheticDataset,
+    lower_cover_set: &HashSet<PathBuf>,
+    collect_targets: &HashSet<PathBuf>,
+    datasets: &HashMap<PathBuf, SyntheticDataset>,
+    row_counts: &HashMap<PathBuf, usize>,
+    shared_outputs: &mut Vec<(String, Format, Option<DataQuality>, Vec<Field>)>,
+    seen_shared: &mut HashSet<String>,
+    steps: &mut Vec<ExecutionStep>,
+) {
+    track_shared(dataset, shared_outputs, seen_shared);
+    let p = path.to_path_buf();
+    let d = Arc::new(dataset.clone());
+    let inherited = compute_lower_cover_inherited(path, datasets, lower_cover_set);
+    let rows = row_counts[path];
+    let is_collect_target = collect_targets.contains(path);
+    let (s_p, s_d) = (p.clone(), d.clone());
+    let s_inherited = inherited.clone();
+    let single_seg = vec![Segment {
+        members: vec![],
+        rows,
+        field_constraints: HashMap::new(),
+        ring: dataset
+            .import
+            .as_ref()
+            .map(|s| s.ring.clone().unwrap_or(RingBounds { start: 0.0, end: 1.0 })),
+    }];
+    push_with_list_link_steps(
+        steps,
+        dataset,
+        path,
+        is_collect_target,
+        datasets,
+        row_counts,
+        &single_seg,
+        || ExecutionStep::GenerateStagingNode {
+            path: s_p,
+            dataset: s_d,
+            rows,
+            inherited: s_inherited,
+        },
+        |defer| ExecutionStep::GenerateDataset {
+            path: p,
+            dataset: d,
+            rows,
+            inherited,
+            defer_emit: defer,
+        },
+    );
+    emit_top_level_collect_steps(dataset, path, datasets, steps);
+}
+
 /// Build the execution plan from the resolved dataset map and its DAG.
 ///
 /// All row counts, lower cover segments, and inherited field wiring are resolved here.
@@ -553,212 +851,55 @@ pub fn build_plan(
             continue;
         };
 
-        // Pure lower cover members (no own lower cover group) are generated inside their parent's step.
-        // Datasets that are *both* a member and a parent need their own step so their
-        // children are generated first and the result is available when the outer parent runs.
+        // Pure lower cover members (no own lower cover group) are generated inside their
+        // parent's step. Datasets that are *both* a member and a parent need their own step
+        // so their children are generated first and the result is available when the outer
+        // parent runs.
         if lower_cover_set.contains(path) && !lower_cover_groups.contains_key(path) {
             track_shared(dataset, &mut shared_outputs, &mut seen_shared);
             continue;
         }
 
-        // Variant expansion: replace this dataset with N concrete variants.
-        // Each variant writes to the same output file so WriteSharedOutput shuffles them.
-        // Note: inherited fields into a variant parent are not wired in v1 — they require
-        // a single stable batch to pull columns from; variants produce N separate batches.
         if !dataset.variants.is_empty() {
-            let output_key = dataset
-                .resolved_outputs()
-                .into_iter()
-                .next()
-                .map(|o| o.file)
-                .unwrap_or_else(|| dataset.name.clone());
-            let variant_dists: Vec<Option<f64>> =
-                dataset.variants.iter().map(|v| v.ratio).collect();
-            let dists = resolve_distributions(&variant_dists);
-            let row_counts_v = distribute_rows(row_counts[path], &dists);
-
-            for (i, (variant, &variant_rows)) in
-                dataset.variants.iter().zip(row_counts_v.iter()).enumerate()
-            {
-                let virtual_path = variant_key(path, i);
-                let concrete =
-                    expand_variant_dataset(dataset, variant, i, variant_rows, &output_key);
-
-                if let Some(members) = lower_cover_groups.get(path) {
-                    // Each flat lower cover member accumulates rows from N variant groups; ensure it has
-                    // an output so WriteSharedOutput fires once for the combined output.
-                    // Witness-source members (is_witness_source=true) have no standalone output.
-                    let members_with_output: Vec<LowerCoverMember> = members
-                        .iter()
-                        .map(|m| {
-                            let mut s = m.clone();
-                            if s.dataset.resolved_outputs().is_empty() && !s.is_witness_source {
-                                s.dataset.output = Some(crate::models::OutputSpec::Shorthand(
-                                    m.dataset.name.clone(),
-                                ));
-                            }
-                            s
-                        })
-                        .collect();
-                    let segments = plan_segments(variant_rows, &members_with_output)?;
-                    for m in &members_with_output {
-                        track_shared(&m.dataset, &mut shared_outputs, &mut seen_shared);
-                    }
-                    track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
-                    let vpath = virtual_path.clone();
-                    let c = Arc::new(concrete.clone());
-                    let (s_vpath, s_c) = (vpath.clone(), c.clone());
-                    let segs_for_witness = segments.clone();
-                    let (s_segs, s_mbrs) = (segments.clone(), members_with_output.clone());
-                    push_with_list_link_steps(
-                        &mut steps,
-                        &concrete,
-                        &virtual_path,
-                        false,
-                        datasets,
-                        &row_counts,
-                        &segs_for_witness,
-                        || ExecutionStep::GenerateStagingLowerCoverGroup {
-                            parent_path: s_vpath,
-                            parent: s_c,
-                            segments: s_segs,
-                            members: s_mbrs,
-                        },
-                        |defer| ExecutionStep::GenerateLowerCoverGroup {
-                            parent_path: vpath,
-                            parent: c,
-                            segments,
-                            members: members_with_output,
-                            defer_emit: defer,
-                        },
-                    );
-                } else {
-                    track_shared(&concrete, &mut shared_outputs, &mut seen_shared);
-                    let vpath = virtual_path.clone();
-                    let c = Arc::new(concrete.clone());
-                    let (s_vpath, s_c) = (vpath.clone(), c.clone());
-                    let single_seg = vec![Segment {
-                        members: vec![],
-                        rows: variant_rows,
-                        field_constraints: HashMap::new(),
-                    }];
-                    push_with_list_link_steps(
-                        &mut steps,
-                        &concrete,
-                        &virtual_path,
-                        false,
-                        datasets,
-                        &row_counts,
-                        &single_seg,
-                        || ExecutionStep::GenerateStagingNode {
-                            path: s_vpath,
-                            dataset: s_c,
-                            rows: variant_rows,
-                            inherited: vec![],
-                        },
-                        |_| ExecutionStep::GenerateDataset {
-                            path: vpath,
-                            dataset: c,
-                            rows: variant_rows,
-                            inherited: vec![],
-                            defer_emit: false,
-                        },
-                    );
-                }
-            }
-            // Merge all variant batches into the original path in `computed` so downstream
-            // witnesses that link to this dataset can find a single combined batch.
-            let variant_keys: Vec<PathBuf> = (0..dataset.variants.len())
-                .map(|i| variant_key(path, i))
-                .collect();
-            steps.push(ExecutionStep::CombineVariantBatches {
-                original_path: path.clone(),
-                variant_paths: variant_keys,
-            });
+            plan_variant_steps(
+                path,
+                dataset,
+                &lower_cover_groups,
+                datasets,
+                &row_counts,
+                &mut shared_outputs,
+                &mut seen_shared,
+                &mut steps,
+            )?;
             continue;
         }
 
         if let Some(members) = lower_cover_groups.get(path) {
-            let segments = plan_segments(row_counts[path], members)?;
-            for m in members.iter() {
-                track_shared(&m.dataset, &mut shared_outputs, &mut seen_shared);
-            }
-            track_shared(dataset, &mut shared_outputs, &mut seen_shared);
-            let p = path.clone();
-            let d = Arc::new(dataset.clone());
-            let mbrs = members.clone();
-            let is_collect_target = collect_targets.contains(path);
-            let (s_p, s_d) = (p.clone(), d.clone());
-            let segs_for_witness = segments.clone();
-            let (s_segs, s_mbrs) = (segments.clone(), mbrs.clone());
-            push_with_list_link_steps(
-                &mut steps,
-                dataset,
+            plan_lower_cover_group_steps(
                 path,
-                is_collect_target,
+                dataset,
+                members,
+                &collect_targets,
                 datasets,
                 &row_counts,
-                &segs_for_witness,
-                || ExecutionStep::GenerateStagingLowerCoverGroup {
-                    parent_path: s_p,
-                    parent: s_d,
-                    segments: s_segs,
-                    members: s_mbrs,
-                },
-                |defer| ExecutionStep::GenerateLowerCoverGroup {
-                    parent_path: p,
-                    parent: d,
-                    segments,
-                    members: mbrs,
-                    defer_emit: defer,
-                },
-            );
-            // Junction link members: emit AccumulateToLinked + EmitDataset after the group step.
-            for m in members {
-                if m.is_witness_source {
-                    continue;
-                }
-                emit_top_level_collect_steps(&m.dataset, &m.path, datasets, &mut steps);
-            }
+                &mut shared_outputs,
+                &mut seen_shared,
+                &mut steps,
+            )?;
             continue;
         }
 
-        track_shared(dataset, &mut shared_outputs, &mut seen_shared);
-        let p = path.clone();
-        let d = Arc::new(dataset.clone());
-        let inherited = compute_lower_cover_inherited(path, datasets, &lower_cover_set);
-        let rows = row_counts[path];
-        let is_collect_target = collect_targets.contains(path);
-        let (s_p, s_d) = (p.clone(), d.clone());
-        let s_inherited = inherited.clone();
-        let single_seg = vec![Segment {
-            members: vec![],
-            rows,
-            field_constraints: HashMap::new(),
-        }];
-        push_with_list_link_steps(
-            &mut steps,
-            dataset,
+        plan_standalone_steps(
             path,
-            is_collect_target,
+            dataset,
+            &lower_cover_set,
+            &collect_targets,
             datasets,
             &row_counts,
-            &single_seg,
-            || ExecutionStep::GenerateStagingNode {
-                path: s_p,
-                dataset: s_d,
-                rows,
-                inherited: s_inherited,
-            },
-            |defer| ExecutionStep::GenerateDataset {
-                path: p,
-                dataset: d,
-                rows,
-                inherited,
-                defer_emit: defer,
-            },
+            &mut shared_outputs,
+            &mut seen_shared,
+            &mut steps,
         );
-        emit_top_level_collect_steps(dataset, path, datasets, &mut steps);
     }
 
     for (output_file, format, quality, schema) in shared_outputs {
@@ -1139,6 +1280,7 @@ fn collect_linked_lower_cover_members(
                 rows: None,
                 locale: dataset.locale.clone(),
                 include: None,
+                import: None,
                 links: vec![],
                 data: item_fields.to_vec(),
                 variants: vec![],
@@ -1159,10 +1301,86 @@ fn linked_lower_cover_path(outer_path: &Path, field_name: &str) -> PathBuf {
     internal_path(outer_path, &format!("{field_name}___linked"))
 }
 
+/// Apply a scale factor to all datasets in-place.
+///
+/// Non-import datasets with explicit `rows:` have their row count multiplied by `scale`.
+/// Import datasets have their ring bounds narrowed (scale < 1) or widened (scale > 1).
+/// Datasets whose row count is derived from parents (no `rows:`, no `import:`) are left
+/// untouched — they inherit scaled counts from their scaled parents via `plan_row_counts`.
+///
+/// Scale-up is only permitted when every import already has a ring (i.e. is not consuming
+/// the full file). The maximum allowed scale factor is `(1.0 − ring.start) / span` for each
+/// import; validation rejects any request that exceeds the minimum across all imports.
+pub fn apply_scale(
+    datasets: &mut HashMap<PathBuf, SyntheticDataset>,
+    scale: f64,
+) -> anyhow::Result<()> {
+    if (scale - 1.0).abs() < 1e-9 {
+        return Ok(());
+    }
+    if scale <= 0.0 {
+        anyhow::bail!("--scale must be a positive number; got {scale}");
+    }
+
+    // Validate scale-up against every import's available headroom.
+    if scale > 1.0 {
+        for ds in datasets.values() {
+            let Some(spec) = &ds.import else { continue };
+            let ring = spec
+                .ring
+                .clone()
+                .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+            let span = ring.end - ring.start;
+            // Max scale is how much this ring segment can grow before hitting 1.0.
+            let max_scale = (1.0 - ring.start) / span;
+            if scale > max_scale + 1e-9 {
+                anyhow::bail!(
+                    "--scale {scale:.4} exceeds the maximum available scale-up ({max_scale:.4}×) \
+                     for import dataset '{}' (ring [{:.4}, {:.4})). \
+                     Import files can only be scaled up when they already use a ring that \
+                     leaves unused rows; this import is already consuming its available budget.",
+                    ds.name,
+                    ring.start,
+                    ring.end,
+                );
+            }
+        }
+    }
+
+    for ds in datasets.values_mut() {
+        if let Some(spec) = &mut ds.import {
+            let ring = spec
+                .ring
+                .clone()
+                .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+            let span = ring.end - ring.start;
+            let new_end = (ring.start + span * scale).min(1.0);
+            spec.ring = Some(RingBounds {
+                start: ring.start,
+                end: new_end,
+            });
+        } else if let Some(rows) = ds.rows {
+            ds.rows = Some(((rows as f64 * scale).round() as usize).max(1));
+        }
+    }
+
+    Ok(())
+}
+
 fn plan_row_counts(datasets: &HashMap<PathBuf, SyntheticDataset>) -> HashMap<PathBuf, usize> {
     let mut counts: HashMap<PathBuf, usize> = datasets
         .iter()
-        .filter_map(|(path, ds)| ds.rows.map(|r| (path.clone(), r)))
+        .filter_map(|(path, ds)| {
+            if let Some(spec) = &ds.import {
+                // Row count is the number of file rows that fall inside the ring bounds.
+                // If no ring is specified the full file is used (fraction = 1.0).
+                let fraction = spec.ring.as_ref().map_or(1.0, |r| r.end - r.start);
+                let n = ((spec.total_rows as f64 * fraction).round() as usize).max(1);
+                Some((path.clone(), n))
+            } else {
+                ds.rows.map(|r| (path.clone(), r))
+            }
+        })
         .collect();
 
     loop {
@@ -1240,6 +1458,7 @@ mod tests {
             outputs: vec![],
             locale: None,
             include: None,
+            import: None,
             links: vec![],
             data: Schema::default(),
             variants: vec![],
@@ -1272,5 +1491,65 @@ mod tests {
         let counts = plan_row_counts(&datasets);
         assert_eq!(counts[&p1], 10);
         assert_eq!(counts[&p2], 25);
+    }
+
+    fn imported_dataset(total_rows: usize, ring: Option<RingBounds>) -> SyntheticDataset {
+        use crate::models::ImportSpec;
+        SyntheticDataset {
+            name: "imported".into(),
+            format: Format::Csv,
+            rows: None,
+            output: None,
+            outputs: vec![],
+            locale: None,
+            include: None,
+            import: Some(ImportSpec {
+                file: "data.csv".into(),
+                reference: "data".into(),
+                fields: vec![],
+                exclude: None,
+                ring,
+                total_rows,
+            }),
+            links: vec![],
+            data: Schema::default(),
+            variants: vec![],
+        }
+    }
+
+    #[test]
+    fn imported_dataset_full_file_uses_total_rows() {
+        let path = PathBuf::from("/a/data.yaml");
+        let mut datasets = HashMap::new();
+        datasets.insert(path.clone(), imported_dataset(500, None));
+        assert_eq!(plan_row_counts(&datasets)[&path], 500);
+    }
+
+    #[test]
+    fn imported_dataset_ring_fraction_applied() {
+        let path = PathBuf::from("/a/data.yaml");
+        let ring = Some(RingBounds { start: 0.0, end: 0.25 });
+        let mut datasets = HashMap::new();
+        datasets.insert(path.clone(), imported_dataset(400, ring));
+        // 400 * 0.25 = 100
+        assert_eq!(plan_row_counts(&datasets)[&path], 100);
+    }
+
+    #[test]
+    fn imported_dataset_partial_ring_rounds() {
+        let path = PathBuf::from("/a/data.yaml");
+        let ring = Some(RingBounds { start: 0.1, end: 0.4 });
+        let mut datasets = HashMap::new();
+        datasets.insert(path.clone(), imported_dataset(100, ring));
+        // 100 * 0.3 = 30
+        assert_eq!(plan_row_counts(&datasets)[&path], 30);
+    }
+
+    #[test]
+    fn imported_dataset_zero_total_rows_clamps_to_one() {
+        let path = PathBuf::from("/a/data.yaml");
+        let mut datasets = HashMap::new();
+        datasets.insert(path.clone(), imported_dataset(0, None));
+        assert_eq!(plan_row_counts(&datasets)[&path], 1);
     }
 }

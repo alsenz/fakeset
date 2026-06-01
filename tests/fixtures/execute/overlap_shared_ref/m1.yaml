@@ -1,0 +1,13 @@
+name: m1
+format: csv
+output_file: m1
+include:
+  file: parent.yaml
+  ref: p
+  ratio: 0.8
+data:
+  - name: parent_id
+    ref: p.id
+  - name: tag
+    type: string
+    value: "m1"

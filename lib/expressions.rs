@@ -107,7 +107,14 @@ fn include_refs_containing(
         let Some(inc_ds) = all.get(&inc_path) else {
             continue;
         };
-        if inc_ds.data.iter().any(|f| f.name == name) {
+        // Skip tainted (imported) fields: children-by-inclusion may not ref them, so
+        // injecting hidden pull-down refs for imported columns would produce refs that
+        // validate correctly rejects — but with a confusing "auto-injected" origin.
+        if inc_ds
+            .data
+            .iter()
+            .any(|f| f.name == name && !f.imported_taint)
+        {
             refs.push(include.reference.clone());
         }
     }

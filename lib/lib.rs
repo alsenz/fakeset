@@ -11,6 +11,7 @@ pub mod expand_variants;
 pub mod expressions;
 pub mod generator;
 pub mod graph;
+pub mod import;
 pub mod models;
 pub mod plan;
 pub mod rewrite;

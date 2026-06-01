@@ -1,0 +1,5 @@
+name: tickers
+format: parquet
+import:
+  file: tickers.csv
+  ref: tickers

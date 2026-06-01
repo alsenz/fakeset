@@ -49,6 +49,7 @@ fn main() {
             f("output",      "OutputSpec?",      false, "Output file: plain path string or Output block. Sugar for a single-entry outputs list. Accepts output_file as an alias."),
             f("outputs",     "Output[]",         false, "Multiple output files (e.g. a clean and a degraded copy). If both output and outputs are set, outputs wins."),
             f("include",     "Include?",         false, "Declares this dataset as a constrained subset of another."),
+            f("import",      "ImportSpec?",      false, "Load rows from a pre-existing external file instead of generating them. Mutually exclusive with rows."),
             f("links",       "Include[]",        false, "Linked datasets for list-link sampling."),
             f("data",        "Field[]",          false, "Field definitions. Evaluated in declaration order for expressions."),
             f("variants",    "VariantSchema[]",  false, "Virtually splits the dataset into N concrete variants."),
@@ -67,6 +68,31 @@ fn main() {
             f("overlap",        "float?",       false, "links: only. Cross-list sampling scope: 0 = non-overlapping (each staging row draws from an exclusive shard), 1 or absent = unrestricted (default), >1 = power-law popularity bias across lists. Values in (0,1) are invalid."),
             f("fields",         "string[]",     false, "Field names to copy as ref entries. Use [\"*\"] for all fields."),
             f("exclude",        "string[]?",    false, "Field names to suppress after fields expansion."),
+        ]),
+        variants: None,
+    });
+
+    types.insert("ImportSpec".into(), TypeDoc {
+        description: "Declares that this dataset's rows come from a pre-existing external file. \
+                      Mutually exclusive with rows:. Imported columns are merged into the dataset \
+                      schema as read-only tainted fields; synthetic data: fields are appended per-row.".into(),
+        fields: Some(vec![
+            f("file",    "string",       true,  "Path to the imported file, relative to the schema root. Supported formats: Parquet, CSV, JSON array, JSONL."),
+            f("ref",     "string",       true,  "Reference namespace. Imported columns are accessible in expression: fields as <ref>.<column>."),
+            f("fields",  "string[]",     false, "Column names to project in. Use [\"*\"] or omit to include all columns."),
+            f("exclude", "string[]?",    false, "Column names to suppress after projection. Most useful with fields: [\"*\"]."),
+            f("ring",    "RingBounds?",  false, "Hash ring bounds [start, end) restricting which rows of the file are used. When absent the full file is used. Assigned automatically by the planner for datasets with a lower cover."),
+        ]),
+        variants: None,
+    });
+
+    types.insert("RingBounds".into(), TypeDoc {
+        description: "Hash ring bounds for partitioning an imported file. \
+                      Row i is included iff h(i) ∈ [start, end) where h is a deterministic \
+                      positional hash seeded by --seed.ring.".into(),
+        fields: Some(vec![
+            f("start", "float", true,  "Ring start (inclusive). Must be in [0.0, 1.0) and less than end."),
+            f("end",   "float", true,  "Ring end (exclusive). Must be in (0.0, 1.0] and greater than start."),
         ]),
         variants: None,
     });

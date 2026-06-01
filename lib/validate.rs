@@ -18,6 +18,7 @@ pub fn validate(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<Vec<Str
     for (path, dataset) in datasets {
         validate_dataset(path, dataset, datasets, &mut warnings)?;
     }
+    check_import_taint(datasets)?;
     Ok(warnings)
 }
 
@@ -57,7 +58,7 @@ fn validate_dataset(
         }
     }
 
-    // Rule 1: explicit rows is incompatible with ratio includes.
+    // Rule 1a: explicit rows is incompatible with ratio includes.
     if dataset.rows.is_some() && dataset.include.as_ref().is_some_and(|i| i.ratio.is_some()) {
         bail!(
             "dataset '{}': `rows` cannot be set when `include` specifies a `ratio` \
@@ -67,13 +68,44 @@ fn validate_dataset(
         );
     }
 
-    // Rule 2: root datasets (no include) must declare an explicit row count.
-    if dataset.rows.is_none() && dataset.include.is_none() {
+    // Rule 1b: explicit rows is incompatible with import (row count comes from the file).
+    if dataset.rows.is_some() && dataset.import.is_some() {
+        bail!(
+            "dataset '{}': `rows` cannot be set when `import` is present \
+             — row count is determined by the imported file. Remove the `rows` field.",
+            dataset.name
+        );
+    }
+
+    // Rule 2: root datasets (no include, no import) must declare an explicit row count.
+    if dataset.rows.is_none() && dataset.include.is_none() && dataset.import.is_none() {
         warnings.push(format!(
             "warning: dataset '{}' has no includes and no explicit `rows` \
              — defaulting to 100 rows",
             dataset.name
         ));
+    }
+
+    // Rule: import ring bounds must be valid.
+    if let Some(ring) = dataset.import.as_ref().and_then(|s| s.ring.as_ref()) {
+        if ring.start < 0.0 || ring.end > 1.0 {
+            bail!(
+                "dataset '{}': `import.ring` values must lie in [0.0, 1.0); \
+                 got [{}, {})",
+                dataset.name,
+                ring.start,
+                ring.end
+            );
+        }
+        if ring.start >= ring.end {
+            bail!(
+                "dataset '{}': `import.ring.start` ({}) must be less than \
+                 `import.ring.end` ({})",
+                dataset.name,
+                ring.start,
+                ring.end
+            );
+        }
     }
 
     // Rule: validate links.
@@ -551,6 +583,11 @@ fn validate_locale_generator(
 }
 
 fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Result<()> {
+    // Tainted fields come from an imported Arrow schema, not from YAML.
+    // Their type is already resolved by load_import_headers; YAML structural rules don't apply.
+    if field.imported_taint {
+        return Ok(());
+    }
     // Expression fields are fully self-contained: no type, ref, or generation constraints.
     if field.expression.is_some() {
         if field.field_type.is_some() {
@@ -1268,4 +1305,476 @@ fn validate_expression_order(dataset: &SyntheticDataset) -> Result<()> {
         available.insert(field.name.as_str());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Import taint checks
+// ---------------------------------------------------------------------------
+
+/// For every imported dataset, ensure that no child-by-inclusion refs or
+/// specialises an imported column (or an expression field derived from one).
+///
+/// Called once from `validate` after all per-dataset checks complete, so that
+/// all `imported_taint` flags are already set by `load_import_headers`.
+fn check_import_taint(datasets: &HashMap<PathBuf, SyntheticDataset>) -> Result<()> {
+    for (parent_path, parent_ds) in datasets {
+        if parent_ds.import.is_none() {
+            continue;
+        }
+
+        let taint = taint_closure(parent_ds);
+        if taint.is_empty() {
+            continue;
+        }
+
+        for (child_path, child_ds) in datasets {
+            let Some(inc) = &child_ds.include else {
+                continue;
+            };
+            let Some(resolved) = resolve_include(child_path, &inc.file) else {
+                continue;
+            };
+            if resolved != *parent_path {
+                continue;
+            }
+            check_child_against_taint(child_ds, inc, &taint)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compute the taint closure for an imported dataset:
+/// - All directly imported fields (`imported_taint == true`).
+/// - Plus any `expression:` fields whose expression AST references any tainted name.
+///
+/// One pass is sufficient because expressions may only reference fields defined above
+/// them (enforced by `validate_expression_order`), so the closure is already stable
+/// after a single top-to-bottom sweep.
+fn taint_closure(dataset: &SyntheticDataset) -> HashSet<String> {
+    let mut tainted: HashSet<String> = dataset
+        .data
+        .iter()
+        .filter(|f| f.imported_taint)
+        .map(|f| f.name.clone())
+        .collect();
+
+    for field in &dataset.data {
+        let Some(ref expr) = field.expression else {
+            continue;
+        };
+        if extract_identifiers(expr)
+            .iter()
+            .any(|id| tainted.contains(*id))
+        {
+            tainted.insert(field.name.clone());
+        }
+    }
+
+    tainted
+}
+
+/// Build a minimal `SyntheticDataset` for use in tests.
+#[cfg(test)]
+fn test_dataset(name: &str, rows: Option<usize>, data: Vec<Field>) -> SyntheticDataset {
+    use crate::models::{Format, ImportSpec};
+    SyntheticDataset {
+        name: name.into(),
+        format: Format::Csv,
+        rows,
+        output: None,
+        outputs: vec![],
+        locale: None,
+        include: None,
+        import: None,
+        links: vec![],
+        data,
+        variants: vec![],
+    }
+}
+
+#[cfg(test)]
+fn test_imported_dataset(name: &str, total_rows: usize, imported_cols: &[&str]) -> SyntheticDataset {
+    use crate::models::{Format, ImportSpec};
+    let mut ds = SyntheticDataset {
+        name: name.into(),
+        format: Format::Csv,
+        rows: None,
+        output: None,
+        outputs: vec![],
+        locale: None,
+        include: None,
+        import: Some(ImportSpec {
+            file: format!("{name}.csv"),
+            reference: name.into(),
+            fields: vec![],
+            exclude: None,
+            ring: None,
+            total_rows,
+        }),
+        links: vec![],
+        data: vec![],
+        variants: vec![],
+    };
+    for col in imported_cols {
+        ds.data.push(Field {
+            name: col.to_string(),
+            imported_taint: true,
+            ..Default::default()
+        });
+    }
+    ds
+}
+
+/// Validate that a child-by-inclusion does not ref or specialise any tainted field.
+fn check_child_against_taint(
+    child: &SyntheticDataset,
+    inc: &Include,
+    taint: &HashSet<String>,
+) -> Result<()> {
+    // include.fields: explicit list of field names to wildcard-copy from the parent.
+    // Wildcard "*" is already filtered by expand_include_fields; named tainted entries
+    // must be rejected here (before expansion runs).
+    for field_name in &inc.fields {
+        if field_name != "*" && taint.contains(field_name.as_str()) {
+            bail!(
+                "dataset '{}': `include.fields` lists '{}' which is an imported \
+                 column (or derived from one) in the included dataset; \
+                 imported fields may not be propagated to children-by-inclusion",
+                child.name,
+                field_name
+            );
+        }
+    }
+
+    // data.fields: same-name shadowing or explicit ref to a tainted column.
+    for field in &child.data {
+        // Same name as a tainted field — would silently shadow or specialise it.
+        if taint.contains(field.name.as_str()) {
+            bail!(
+                "dataset '{}': field '{}' has the same name as an imported column \
+                 (or derived field) in the included dataset '{}'; imported fields \
+                 may not be specialised by children-by-inclusion",
+                child.name,
+                field.name,
+                inc.reference
+            );
+        }
+
+        // Explicit ref pointing at a tainted column via the include reference.
+        if let Some((ref_part, col_part)) = field
+            .simple_ref()
+            .and_then(|r| split_ref(r))
+            .filter(|(rp, cp)| *rp == inc.reference && taint.contains(*cp))
+        {
+            bail!(
+                "dataset '{}': field '{}' references imported column \
+                 '{}.{}'; imported fields may not be referenced by \
+                 children-by-inclusion",
+                child.name,
+                field.name,
+                ref_part,
+                col_part
+            );
+        }
+    }
+
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod import_taint_tests {
+    use super::*;
+    use crate::models::{Format, ImportSpec, Include, RefsSpec};
+    use std::path::PathBuf;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn make_include(file: &str, reference: &str, fields: Vec<String>) -> Include {
+        Include {
+            file: file.into(),
+            reference: reference.into(),
+            ratio: None,
+            cardinality: None,
+            reinforcement: None,
+            overlap: None,
+            fields,
+            exclude: None,
+        }
+    }
+
+    fn imported_ds(name: &str, cols: &[(&str, bool)]) -> SyntheticDataset {
+        let mut ds = SyntheticDataset {
+            name: name.into(),
+            format: Format::Csv,
+            rows: None,
+            output: None,
+            outputs: vec![],
+            locale: None,
+            include: None,
+            import: Some(ImportSpec {
+                file: format!("{name}.csv"),
+                reference: name.into(),
+                fields: vec![],
+                exclude: None,
+                ring: None,
+                total_rows: 100,
+            }),
+            links: vec![],
+            data: vec![],
+            variants: vec![],
+        };
+        for (col, tainted) in cols {
+            ds.data.push(Field {
+                name: col.to_string(),
+                imported_taint: *tainted,
+                ..Default::default()
+            });
+        }
+        ds
+    }
+
+    fn plain_ds(name: &str, data: Vec<Field>) -> SyntheticDataset {
+        SyntheticDataset {
+            name: name.into(),
+            format: Format::Csv,
+            rows: Some(50),
+            output: None,
+            outputs: vec![],
+            locale: None,
+            include: None,
+            import: None,
+            links: vec![],
+            data,
+            variants: vec![],
+        }
+    }
+
+    /// Build a (parent, child) dataset map. The child's include file resolves to the
+    /// parent by path equality — no disk access needed when calling `check_import_taint`
+    /// directly (bypassing `validate_dataset_refs` which requires real files).
+    fn parent_child_map(
+        parent_data: Vec<Field>,
+        child_include_fields: Vec<String>,
+        child_data: Vec<Field>,
+    ) -> HashMap<PathBuf, SyntheticDataset> {
+        let parent_path = PathBuf::from("/schema/parent.yaml");
+        let child_path = PathBuf::from("/schema/child.yaml");
+        let mut parent = imported_ds("parent", &[]);
+        parent.data = parent_data;
+        let mut child = plain_ds("child", child_data);
+        // The include file "parent.yaml" must resolve (via resolve_include) to parent_path.
+        // resolve_include calls canonicalize, so we need a real path. Instead we call
+        // check_import_taint directly, which uses resolve_include internally. Since those
+        // paths don't exist on disk the taint check falls through — so we call
+        // check_child_against_taint directly for the cross-dataset assertions.
+        child.include = Some(make_include("parent.yaml", "par", child_include_fields));
+        let mut map = HashMap::new();
+        map.insert(parent_path, parent);
+        map.insert(child_path, child);
+        map
+    }
+
+    // ── rows + import mutual exclusion (use full validate — no cross-dataset refs) ──
+
+    #[test]
+    fn rows_and_import_errors() {
+        let mut ds = imported_ds("tickers", &[("symbol", true)]);
+        ds.rows = Some(50);
+        let mut datasets = HashMap::new();
+        datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
+        let err = validate(&datasets).unwrap_err().to_string();
+        assert!(err.contains("`rows` cannot be set when `import` is present"), "{err}");
+    }
+
+    #[test]
+    fn import_without_rows_is_ok() {
+        let ds = imported_ds("tickers", &[("symbol", true)]);
+        let mut datasets = HashMap::new();
+        datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
+        assert!(validate(&datasets).is_ok());
+    }
+
+    #[test]
+    fn imported_dataset_no_false_row_warning() {
+        let ds = imported_ds("tickers", &[("symbol", true)]);
+        let mut datasets = HashMap::new();
+        datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
+        let warnings = validate(&datasets).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("defaulting to 100 rows")),
+            "spurious row-count warning: {warnings:?}"
+        );
+    }
+
+    // ── ring bounds (single dataset — full validate is fine) ─────────────────
+
+    #[test]
+    fn ring_start_ge_end_errors() {
+        let mut ds = imported_ds("tickers", &[("symbol", true)]);
+        ds.import.as_mut().unwrap().ring =
+            Some(crate::models::RingBounds { start: 0.6, end: 0.3 });
+        let mut datasets = HashMap::new();
+        datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
+        let err = validate(&datasets).unwrap_err().to_string();
+        assert!(err.contains("must be less than"), "{err}");
+    }
+
+    #[test]
+    fn ring_out_of_range_errors() {
+        let mut ds = imported_ds("tickers", &[("symbol", true)]);
+        ds.import.as_mut().unwrap().ring =
+            Some(crate::models::RingBounds { start: 0.0, end: 1.5 });
+        let mut datasets = HashMap::new();
+        datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
+        let err = validate(&datasets).unwrap_err().to_string();
+        assert!(err.contains("[0.0, 1.0)"), "{err}");
+    }
+
+    // ── taint closure (unit-test taint_closure directly) ─────────────────────
+
+    #[test]
+    fn taint_closure_includes_imported_fields() {
+        let ds = imported_ds("p", &[("symbol", true), ("region", false)]);
+        let t = taint_closure(&ds);
+        assert!(t.contains("symbol"));
+        assert!(!t.contains("region"));
+    }
+
+    #[test]
+    fn taint_closure_expands_expression_referencing_tainted_field() {
+        let mut ds = imported_ds("p", &[("symbol", true)]);
+        ds.data.push(Field {
+            name: "display".into(),
+            expression: Some("CONCAT(symbol, '-USD')".into()),
+            ..Default::default()
+        });
+        let t = taint_closure(&ds);
+        assert!(t.contains("display"), "expression derived from imported field must be tainted");
+    }
+
+    #[test]
+    fn taint_closure_does_not_taint_unrelated_expression() {
+        let mut ds = imported_ds("p", &[("symbol", true), ("exchange", false)]);
+        ds.data.push(Field {
+            name: "suffix".into(),
+            expression: Some("CONCAT(exchange, '-SFX')".into()),
+            ..Default::default()
+        });
+        let t = taint_closure(&ds);
+        assert!(!t.contains("suffix"), "expression with no imported deps should not be tainted");
+    }
+
+    // ── check_child_against_taint (called directly to avoid disk-path resolution) ──
+
+    fn taint(cols: &[&str]) -> HashSet<String> {
+        cols.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn child_with_include(
+        reference: &str,
+        include_fields: Vec<String>,
+        data: Vec<Field>,
+    ) -> (SyntheticDataset, Include) {
+        let mut ds = plain_ds("child", data);
+        let inc = make_include("parent.yaml", reference, include_fields);
+        ds.include = Some(inc.clone());
+        (ds, inc)
+    }
+
+    #[test]
+    fn child_same_name_as_imported_column_errors() {
+        let (child, inc) = child_with_include(
+            "par",
+            vec![],
+            vec![Field { name: "symbol".into(), ..Default::default() }],
+        );
+        let err = check_child_against_taint(&child, &inc, &taint(&["symbol"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same name as an imported column"), "{err}");
+    }
+
+    #[test]
+    fn child_ref_to_imported_column_errors() {
+        let (child, inc) = child_with_include(
+            "par",
+            vec![],
+            vec![Field {
+                name: "ticker".into(),
+                refs: Some(RefsSpec::Single("par.symbol".into())),
+                ..Default::default()
+            }],
+        );
+        let err = check_child_against_taint(&child, &inc, &taint(&["symbol"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("references imported column"), "{err}");
+    }
+
+    #[test]
+    fn child_ref_to_synthetic_column_is_ok() {
+        let (child, inc) = child_with_include(
+            "par",
+            vec![],
+            vec![Field {
+                name: "area".into(),
+                refs: Some(RefsSpec::Single("par.region".into())),
+                ..Default::default()
+            }],
+        );
+        // "region" is NOT in the taint set — only "symbol" is.
+        assert!(check_child_against_taint(&child, &inc, &taint(&["symbol"])).is_ok());
+    }
+
+    #[test]
+    fn child_include_fields_listing_imported_column_errors() {
+        let (child, inc) =
+            child_with_include("par", vec!["symbol".into()], vec![]);
+        let err = check_child_against_taint(&child, &inc, &taint(&["symbol"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`include.fields` lists"), "{err}");
+    }
+
+    #[test]
+    fn child_include_fields_wildcard_is_ok() {
+        // Wildcard is silently filtered by expand_include_fields; the validator
+        // should not reject it here.
+        let (child, inc) = child_with_include("par", vec!["*".into()], vec![]);
+        assert!(check_child_against_taint(&child, &inc, &taint(&["symbol"])).is_ok());
+    }
+
+    #[test]
+    fn child_ref_to_expression_derived_column_errors() {
+        let (child, inc) = child_with_include(
+            "par",
+            vec![],
+            vec![Field {
+                name: "label".into(),
+                refs: Some(RefsSpec::Single("par.display".into())),
+                ..Default::default()
+            }],
+        );
+        // "display" is in the taint set (derived from imported "symbol").
+        let err = check_child_against_taint(&child, &inc, &taint(&["symbol", "display"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("references imported column"), "{err}");
+    }
+
+    #[test]
+    fn child_ref_to_expression_from_synthetic_is_ok() {
+        let (child, inc) = child_with_include(
+            "par",
+            vec![],
+            vec![Field {
+                name: "exch_tag".into(),
+                refs: Some(RefsSpec::Single("par.suffix".into())),
+                ..Default::default()
+            }],
+        );
+        // "suffix" is NOT in the taint set.
+        assert!(check_child_against_taint(&child, &inc, &taint(&["symbol"])).is_ok());
+    }
 }
