@@ -1,0 +1,20 @@
+name: main
+format: jsonl
+rows: 3
+links:
+  - file: source.yaml
+    ref: src
+data:
+  - name: items
+    type: list
+    content:
+      from: src
+      fields:
+        - name: src_id
+          ref: src.id
+        - name: tier            # error: variants not supported in linked content (VAR-LINKED-CONTENT)
+          type: variant
+          variants:
+            - value: "gold"
+              ratio: 0.5
+            - value: "silver"

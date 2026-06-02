@@ -798,6 +798,16 @@ fn validate_list_link_content(
             bail!("field '{fpath}': `expression` is not supported inside list-link content");
         }
 
+        // VAR-LINKED-CONTENT gate: tagged-union (`type: variant`) item fields on a linked
+        // content list interact with the witness/staging pipeline (`n_eligible_slots`,
+        // `_staging_refs`) in ways VAR-EXPAND deliberately deferred. Reject until designed.
+        if matches!(field.field_type, Some(FieldType::Variant)) {
+            bail!(
+                "field '{fpath}': `type: variant` is not yet supported inside list-link content \
+                 (linked content lists) — see specs/VAR-LINKED-CONTENT.md"
+            );
+        }
+
         if let Some(ref_str) = field.simple_ref() {
             // Determine scope: linked-scoped (dot matches the link ref) or outer-scoped.
             let linked_scoped = split_ref(ref_str).and_then(|(ref_part, _)| {

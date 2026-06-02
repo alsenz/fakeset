@@ -110,6 +110,18 @@ impl std::fmt::Display for FieldType {
     }
 }
 
+/// Sentinel-column prefix for tagged-union discriminants (VAR-EXPAND). When a
+/// `type: variant` field is lowered into its cases, each case is tagged with
+/// `_disc_<union_field>` so the planner can enforce "exactly one case per row" and
+/// the executor can tell cases apart. Stripped from output like the other
+/// `_`-prefixed sentinels.
+pub const DISCRIMINANT_PREFIX: &str = "_disc_";
+
+/// The discriminant sentinel column name for a tagged-union field.
+pub fn discriminant_column(union_field: &str) -> String {
+    format!("{DISCRIMINANT_PREFIX}{union_field}")
+}
+
 /// Arrow/Parquet datatype override for a field.
 /// When set, controls the Arrow schema type used for that field instead of the
 /// type inferred from `field_type`.  Applies during both schema construction and

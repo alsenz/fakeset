@@ -34,6 +34,38 @@ pub struct LowerCoverMember {
     pub is_witness_source: bool,
 }
 
+/// A set of lowered cases of one tagged union (VAR-EXPAND), grouping members of a
+/// parent's lower cover that arose from lowering a single `type: variant` field.
+///
+/// Exactly one case fires per row — mutual exclusion is *structural* in the DFS
+/// (the group branches over "no case" ∪ "pick one case"), so the discriminant
+/// column is not needed to enforce it; it carries the chosen case to the executor
+/// and is what VAR-SPECIALIZE's subset restrictions constrain. The categorical prior
+/// factor weights each case by its absolute ratio `r_M·vᵢ`, with `1 − Σ ratios`
+/// reserved for "member absent" (= 0 for a mandatory union).
+#[derive(Clone, Debug)]
+pub struct ExclusionGroup {
+    /// Discriminant sentinel column for this union (`_disc_<field>`).
+    pub discriminant: String,
+    /// Indices into the lower cover's member slice — the union's lowered cases.
+    pub members: Vec<usize>,
+    /// Absolute case ratios `r_M·vᵢ`, parallel to `members`.
+    pub ratios: Vec<f64>,
+    /// True when the union is mandatory (`Σ ratios ≈ 1`): "no case" has weight 0.
+    pub mandatory: bool,
+}
+
+/// The product-Bernoulli prior factor a union contributes to a segment: the chosen
+/// case's absolute ratio, or `1 − Σ ratios` for "no case". Computing this per-union
+/// (rather than as a product of independent per-case Bernoulli trials) is what zeroes
+/// the illegal "no case of a mandatory union" mass at the source — see VAR-EXPAND.
+pub(crate) fn categorical_prior_factor(group: &ExclusionGroup, chosen: Option<usize>) -> f64 {
+    match chosen {
+        Some(k) => group.ratios[k],
+        None => (1.0 - group.ratios.iter().sum::<f64>()).max(0.0),
+    }
+}
+
 /// A planned generation segment produced by Bernoulli factoring.
 ///
 /// Each segment represents the subset of parent rows that belong simultaneously
@@ -95,7 +127,11 @@ fn in_subset(mask: usize, i: usize) -> bool {
 ///    accumulated as products of marginal (in/out) probabilities along the DFS path.
 /// 3. Apply IPF over the feasible set to restore declared marginal distributions.
 /// 4. Bernoulli-round to integer row counts; drop zero-row segments.
-pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result<Vec<Segment>> {
+pub fn plan_segments(
+    parent_rows: usize,
+    members: &[LowerCoverMember],
+    groups: &[ExclusionGroup],
+) -> Result<Vec<Segment>> {
     let n = members.len();
 
     if n == 0 {
@@ -111,6 +147,11 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
     let member_constraints: Vec<HashMap<String, FieldConstraints>> =
         members.iter().map(lower_cover_field_constraints).collect();
 
+    // Collapse each tagged union's lowered cases into one categorical DFS entry; all
+    // other members stay independent Bernoulli entries. With `groups == &[]` every
+    // entry is a lone member, in member order — byte-identical to the pre-VAR-EXPAND DFS.
+    let entries = build_dfs_entries(n, groups);
+
     let mut feasible: HashMap<usize, HashMap<String, FieldConstraints>> = HashMap::new();
     let mut weights: HashMap<usize, f64> = HashMap::new();
     enumerate_segments_dfs(
@@ -118,7 +159,9 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
         0,
         HashMap::new(),
         1.0,
+        &entries,
         members,
+        groups,
         &conflict_masks,
         &member_constraints,
         &mut feasible,
@@ -188,28 +231,67 @@ pub fn plan_segments(parent_rows: usize, members: &[LowerCoverMember]) -> Result
     Ok(segments)
 }
 
-/// Enumerate all feasible membership subsets via branch-and-bound DFS.
+/// One step of the branch-and-bound DFS: either a lone Bernoulli member or one
+/// tagged-union exclusion group (whose lowered cases branch categorically).
+enum DfsEntry {
+    /// A lone member — index into the member slice.
+    Lone(usize),
+    /// A tagged union — index into the `groups` slice.
+    Group(usize),
+}
+
+/// Build the DFS entry plan. Each member belongs to at most one exclusion group;
+/// grouped members collapse into a single `Group` entry, emitted at the position of
+/// the group's first member. Ungrouped members become `Lone` entries in member order.
+/// With `groups == &[]` this is exactly `[Lone(0), …, Lone(n-1)]`.
+fn build_dfs_entries(n: usize, groups: &[ExclusionGroup]) -> Vec<DfsEntry> {
+    let mut group_of: Vec<Option<usize>> = vec![None; n];
+    for (g, grp) in groups.iter().enumerate() {
+        for &m in &grp.members {
+            group_of[m] = Some(g);
+        }
+    }
+    let mut emitted = vec![false; groups.len()];
+    let mut entries = Vec::new();
+    for (i, slot) in group_of.iter().enumerate().take(n) {
+        match slot {
+            None => entries.push(DfsEntry::Lone(i)),
+            Some(g) if !emitted[*g] => {
+                emitted[*g] = true;
+                entries.push(DfsEntry::Group(*g));
+            }
+            Some(_) => {}
+        }
+    }
+    entries
+}
+
+/// Enumerate all feasible segments via branch-and-bound DFS over the entry plan.
 ///
-/// At each step, we decide whether to include or exclude `members[idx]`.
-/// The include branch is pruned when:
-/// - any already-included member conflicts with `members[idx]` (pairwise conflict check), or
-/// - `members[idx]`'s constraints cannot be merged with the running partial constraints.
+/// - A `Lone` member branches include/exclude, exactly as the pre-VAR-EXPAND DFS did.
+/// - A `Group` branches over "no case" (when its weight is non-zero) plus one branch
+///   per lowered case — so at most one case of a union is ever set, making mutual
+///   exclusion structural. A mandatory union's "no case" weight is 0 and is pruned,
+///   keeping the feasible set bounded.
 ///
-/// Weights are products of marginal probabilities accumulated along the path.
-/// Both `feasible` and `weights` are populated at leaves (when `idx == members.len()`).
+/// Either branch's include is pruned when the new member pairwise-conflicts with an
+/// already-included member or its constraints cannot be merged. Weights are products
+/// of marginal probabilities; leaves populate `feasible` and `weights`.
 #[allow(clippy::too_many_arguments)]
 fn enumerate_segments_dfs(
-    idx: usize,
+    entry_idx: usize,
     mask: usize,
     merged: HashMap<String, FieldConstraints>,
     weight: f64,
+    entries: &[DfsEntry],
     members: &[LowerCoverMember],
+    groups: &[ExclusionGroup],
     conflict_masks: &[usize],
     member_constraints: &[HashMap<String, FieldConstraints>],
     feasible: &mut HashMap<usize, HashMap<String, FieldConstraints>>,
     weights: &mut HashMap<usize, f64>,
 ) -> Result<()> {
-    if idx == members.len() {
+    if entry_idx == entries.len() {
         if feasible.len() >= MAX_FEASIBLE_SEGMENTS {
             bail!(
                 "lower cover group produced more than {} feasible segments. \
@@ -222,36 +304,93 @@ fn enumerate_segments_dfs(
         return Ok(());
     }
 
-    let ratio = members[idx].ratio;
+    let next = entry_idx + 1;
+    match &entries[entry_idx] {
+        DfsEntry::Lone(i) => {
+            let i = *i;
+            let ratio = members[i].ratio;
 
-    // Branch A: exclude member idx (clone merged — still needed for Branch B)
-    enumerate_segments_dfs(
-        idx + 1,
-        mask,
-        merged.clone(),
-        weight * (1.0 - ratio),
-        members,
-        conflict_masks,
-        member_constraints,
-        feasible,
-        weights,
-    )?;
+            // Branch A: exclude member i (clone merged — still needed for Branch B).
+            enumerate_segments_dfs(
+                next,
+                mask,
+                merged.clone(),
+                weight * (1.0 - ratio),
+                entries,
+                members,
+                groups,
+                conflict_masks,
+                member_constraints,
+                feasible,
+                weights,
+            )?;
 
-    // Branch B: include member idx — prune if any already-included member conflicts
-    if (mask & conflict_masks[idx]) == 0
-        && let Some(new_merged) = try_merge_incremental(merged, &member_constraints[idx])
-    {
-        enumerate_segments_dfs(
-            idx + 1,
-            mask | (1 << idx),
-            new_merged,
-            weight * ratio,
-            members,
-            conflict_masks,
-            member_constraints,
-            feasible,
-            weights,
-        )?;
+            // Branch B: include member i — prune on conflict / unmergeable constraints.
+            if (mask & conflict_masks[i]) == 0
+                && let Some(new_merged) = try_merge_incremental(merged, &member_constraints[i])
+            {
+                enumerate_segments_dfs(
+                    next,
+                    mask | (1 << i),
+                    new_merged,
+                    weight * ratio,
+                    entries,
+                    members,
+                    groups,
+                    conflict_masks,
+                    member_constraints,
+                    feasible,
+                    weights,
+                )?;
+            }
+        }
+        DfsEntry::Group(g) => {
+            let grp = &groups[*g];
+
+            // Branch: no case of this union (member absent). Pruned when its weight is
+            // 0 — i.e. a mandatory union — which is precisely the illegal-mass cell.
+            let none_factor = categorical_prior_factor(grp, None);
+            if none_factor > f64::EPSILON {
+                enumerate_segments_dfs(
+                    next,
+                    mask,
+                    merged.clone(),
+                    weight * none_factor,
+                    entries,
+                    members,
+                    groups,
+                    conflict_masks,
+                    member_constraints,
+                    feasible,
+                    weights,
+                )?;
+            }
+
+            // Branch: pick exactly one case. Structural mutual exclusion — at most one
+            // case member's bit is ever set across these branches.
+            for (k, &ci) in grp.members.iter().enumerate() {
+                if (mask & conflict_masks[ci]) != 0 {
+                    continue;
+                }
+                if let Some(new_merged) =
+                    try_merge_incremental(merged.clone(), &member_constraints[ci])
+                {
+                    enumerate_segments_dfs(
+                        next,
+                        mask | (1 << ci),
+                        new_merged,
+                        weight * categorical_prior_factor(grp, Some(k)),
+                        entries,
+                        members,
+                        groups,
+                        conflict_masks,
+                        member_constraints,
+                        feasible,
+                        weights,
+                    )?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -445,7 +584,7 @@ mod tests {
     fn single_lower_cover_member_two_segments() {
         // One lower cover member at 60%: segment {A}=60 rows, remainder=40 rows.
         let members = vec![make_member("a", 0.6, vec![])];
-        let segs = plan_segments(100, &members).unwrap();
+        let segs = plan_segments(100, &members, &[]).unwrap();
         assert_eq!(segs.len(), 2);
         let total: usize = segs.iter().map(|s| s.rows).sum();
         assert_eq!(total, 100);
@@ -458,7 +597,7 @@ mod tests {
     #[test]
     fn two_lower_cover_members_four_segments() {
         let members = vec![make_member("a", 0.5, vec![]), make_member("b", 0.4, vec![])];
-        let segs = plan_segments(100, &members).unwrap();
+        let segs = plan_segments(100, &members, &[]).unwrap();
         // All four subsets survive (no conflicts).
         assert_eq!(segs.len(), 4);
         let total: usize = segs.iter().map(|s| s.rows).sum();
@@ -471,7 +610,7 @@ mod tests {
             make_member("a", 0.95, vec![("status", value_str("micro"))]),
             make_member("b", 0.04, vec![("status", value_str("small"))]),
         ];
-        let segs = plan_segments(1000, &members).unwrap();
+        let segs = plan_segments(1000, &members, &[]).unwrap();
         let total: usize = segs.iter().map(|s| s.rows).sum();
         assert_eq!(total, 1000);
     }
@@ -487,7 +626,7 @@ mod tests {
             make_member("a", 0.5, vec![("status", value_str("micro"))]),
             make_member("b", 0.5, vec![("status", value_str("small"))]),
         ];
-        let segs = plan_segments(100, &members).unwrap();
+        let segs = plan_segments(100, &members, &[]).unwrap();
         let joint = segs.iter().find(|s| s.members.len() == 2);
         assert!(
             joint.is_none(),
@@ -519,7 +658,7 @@ mod tests {
             make_member("a", 0.5, vec![("n", bounds(0.0, 100.0))]),
             make_member("b", 0.5, vec![("n", bounds(50.0, 200.0))]),
         ];
-        let segs = plan_segments(100, &members).unwrap();
+        let segs = plan_segments(100, &members, &[]).unwrap();
         // All four subsets survive; joint segment should have min=50, max=100.
         let joint = segs.iter().find(|s| s.members.len() == 2).unwrap();
         let fc = joint.field_constraints.get("n").unwrap();
@@ -537,7 +676,7 @@ mod tests {
             make_member("a", 0.5, vec![("n", bounds(0.0, 30.0))]),
             make_member("b", 0.5, vec![("n", bounds(60.0, 100.0))]),
         ];
-        let segs = plan_segments(100, &members).unwrap();
+        let segs = plan_segments(100, &members, &[]).unwrap();
         // The joint {a,b} segment is infeasible and must be absent.
         let joint = segs.iter().find(|s| s.members.len() == 2);
         assert!(joint.is_none());
@@ -554,7 +693,7 @@ mod tests {
 
     #[test]
     fn no_lower_cover_members_single_remainder_segment() {
-        let segs = plan_segments(50, &[]).unwrap();
+        let segs = plan_segments(50, &[], &[]).unwrap();
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].rows, 50);
         assert!(segs[0].members.is_empty());
@@ -575,7 +714,7 @@ mod tests {
                 )
             })
             .collect();
-        let segs = plan_segments(1000, &members).unwrap();
+        let segs = plan_segments(1000, &members, &[]).unwrap();
         // 21 segments: 20 singletons + empty (which may round to 0 and be dropped when Σd=0.8)
         // At least the 20 singletons must be present.
         let singleton_count = segs.iter().filter(|s| s.members.len() == 1).count();
@@ -603,7 +742,7 @@ mod tests {
         let members: Vec<LowerCoverMember> = (0..20)
             .map(|i| make_member(&format!("m{i}"), 0.5, vec![]))
             .collect();
-        let result = plan_segments(1000, &members);
+        let result = plan_segments(1000, &members, &[]);
         assert!(
             result.is_err(),
             "expected cap error for fully-compatible N=20 group"
@@ -629,7 +768,7 @@ mod tests {
             make_member("b", 0.5, vec![("n", bounds(30.0, 100.0))]),
             make_member("c", 0.5, vec![("n", bounds(60.0, 100.0))]),
         ];
-        let segs = plan_segments(100, &members).unwrap();
+        let segs = plan_segments(100, &members, &[]).unwrap();
         let has = |ms: &[&str]| {
             let paths: Vec<PathBuf> = ms.iter().map(|&s| PathBuf::from(s)).collect();
             segs.iter().any(|s| {
@@ -647,6 +786,100 @@ mod tests {
             "{{a,c}} should be absent (infeasible bounds)"
         );
         assert!(!has(&["a", "b", "c"]), "{{a,b,c}} should be absent");
+    }
+
+    // --- VAR-EXPAND exclusion groups (PR 2 dormant machinery) ---
+    //
+    // Drive `plan_segments` with hand-built groups (no lowering pass yet) to verify the
+    // entry-DFS + categorical factor produce structurally-exclusive, marginal-correct
+    // segments — including the `r_M < 1` (optional member) case the Q-prototype omitted.
+
+    /// Rows in segments whose member set contains `path`.
+    fn rows_for(segs: &[Segment], path: &str) -> usize {
+        let p = PathBuf::from(path);
+        segs.iter()
+            .filter(|s| s.members.contains(&p))
+            .map(|s| s.rows)
+            .sum()
+    }
+
+    #[test]
+    fn exclusion_group_mandatory_union_is_exclusive_and_exact() {
+        // A mandatory union (Σ ratios == 1): cases c0 (0.6) and c1 (0.4).
+        let members = vec![make_member("c0", 0.6, vec![]), make_member("c1", 0.4, vec![])];
+        let group = ExclusionGroup {
+            discriminant: "_disc_tier".to_string(),
+            members: vec![0, 1],
+            ratios: vec![0.6, 0.4],
+            mandatory: true,
+        };
+        let segs = plan_segments(1000, &members, &[group]).unwrap();
+
+        // No segment carries both cases (structural mutual exclusion).
+        let c0 = PathBuf::from("c0");
+        let c1 = PathBuf::from("c1");
+        assert!(
+            !segs.iter().any(|s| s.members.contains(&c0) && s.members.contains(&c1)),
+            "no segment may contain two cases of one union"
+        );
+        // Mandatory ⇒ no "member absent" (empty) segment survives.
+        assert!(
+            !segs.iter().any(|s| s.members.is_empty()),
+            "a mandatory union leaves no holder-less rows"
+        );
+        // Marginals restored ~600 / ~400 (Bernoulli rounding ± a few).
+        assert!((rows_for(&segs, "c0") as i64 - 600).abs() <= 25, "c0 ≈ 600");
+        assert!((rows_for(&segs, "c1") as i64 - 400).abs() <= 25, "c1 ≈ 400");
+    }
+
+    #[test]
+    fn exclusion_group_optional_union_keeps_member_absent_cell() {
+        // An optional member (r_M = 0.5) with a union split 0.6/0.4 within it ⇒ absolute
+        // case ratios 0.3 / 0.2, and a legitimate "member absent" mass of 0.5.
+        let members = vec![make_member("c0", 0.3, vec![]), make_member("c1", 0.2, vec![])];
+        let group = ExclusionGroup {
+            discriminant: "_disc_tier".to_string(),
+            members: vec![0, 1],
+            ratios: vec![0.3, 0.2],
+            mandatory: false,
+        };
+        let segs = plan_segments(1000, &members, &[group]).unwrap();
+
+        // The "no case" (member absent) segment exists and carries ~500 rows.
+        let absent: usize = segs.iter().filter(|s| s.members.is_empty()).map(|s| s.rows).sum();
+        assert!((absent as i64 - 500).abs() <= 30, "member-absent ≈ 500, got {absent}");
+        assert!((rows_for(&segs, "c0") as i64 - 300).abs() <= 25, "c0 ≈ 300");
+        assert!((rows_for(&segs, "c1") as i64 - 200).abs() <= 25, "c1 ≈ 200");
+    }
+
+    #[test]
+    fn exclusion_group_with_plain_sibling_factors_jointly() {
+        // Mandatory union {c0 0.6, c1 0.4} alongside an independent plain member s (0.5).
+        let members = vec![
+            make_member("c0", 0.6, vec![]),
+            make_member("c1", 0.4, vec![]),
+            make_member("s", 0.5, vec![]),
+        ];
+        let group = ExclusionGroup {
+            discriminant: "_disc_tier".to_string(),
+            members: vec![0, 1],
+            ratios: vec![0.6, 0.4],
+            mandatory: true,
+        };
+        let segs = plan_segments(1000, &members, &[group]).unwrap();
+
+        let c0 = PathBuf::from("c0");
+        let c1 = PathBuf::from("c1");
+        assert!(
+            !segs.iter().any(|s| s.members.contains(&c0) && s.members.contains(&c1)),
+            "union cases stay mutually exclusive even with a sibling present"
+        );
+        // Every segment picks exactly one case (mandatory union, no empty segments).
+        assert!(segs.iter().all(|s| s.members.contains(&c0) || s.members.contains(&c1)));
+        // Marginals: each case ~ its ratio; sibling ~ 0.5.
+        assert!((rows_for(&segs, "c0") as i64 - 600).abs() <= 30, "c0 ≈ 600");
+        assert!((rows_for(&segs, "c1") as i64 - 400).abs() <= 30, "c1 ≈ 400");
+        assert!((rows_for(&segs, "s") as i64 - 500).abs() <= 40, "s ≈ 500");
     }
 }
 

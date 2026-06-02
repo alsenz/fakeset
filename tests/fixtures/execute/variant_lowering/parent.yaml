@@ -1,0 +1,11 @@
+name: parent
+format: csv
+output_file: parent
+rows: 200
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: code
+    type: string
+    generator: word

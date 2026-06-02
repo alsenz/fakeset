@@ -612,7 +612,7 @@ fn plan_variant_steps(
                     s
                 })
                 .collect();
-            let mut segments = plan_segments(variant_rows, &members_with_output)?;
+            let mut segments = plan_segments(variant_rows, &members_with_output, &[])?;
             if let Some(spec) = &concrete.import {
                 let vring = spec
                     .ring
@@ -716,7 +716,7 @@ fn plan_lower_cover_group_steps(
     seen_shared: &mut HashSet<String>,
     steps: &mut Vec<ExecutionStep>,
 ) -> Result<()> {
-    let mut segments = plan_segments(row_counts[path], members)?;
+    let mut segments = plan_segments(row_counts[path], members, &[])?;
     if let Some(spec) = &dataset.import {
         let parent_ring = spec
             .ring

@@ -1,0 +1,17 @@
+name: subscribers
+format: csv
+output_file: subscribers
+include:
+  file: parent.yaml
+  ref: p
+  ratio: 1.0
+data:
+  - name: parent_id
+    ref: p.id
+  - name: tier
+    type: variant
+    variants:
+      - value: "gold"
+        ratio: 0.6
+      - value: "silver"
+        ratio: 0.4

@@ -1887,3 +1887,72 @@ async fn test_chained_links_ref_integrity() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// VAR-EXPAND lock-in tests (PR 1).
+//
+// A parent with a mandatory (ratio 1.0) lower-cover member carrying a tagged-union
+// field (`tier`), plus an overlapping sibling (`flagged`, ratio 0.5) so a joint
+// segment exists. These pin the behaviour variant lowering must preserve.
+// See specs/VAR-EXPAND-impl.md PR 1 and the traceability matrix.
+// ---------------------------------------------------------------------------
+
+// These pass today under VAR-2 and must keep passing after lowering — pure non-ref
+// variant lowering is behaviour-preserving (verified empirically: 200 rows, exact
+// 60/40, zero orphans/empties). IPF-exactness under *coupling* (a case conflicting
+// with a sibling's constraint) is a VAR-SPECIALIZE concern and is tested there.
+
+/// Every lowered case value is drawn from the union's declared set — never a
+/// freshly-generated random string (the BUG-VAR failure mode) or empty.
+#[tokio::test]
+async fn test_variant_lowering_case_membership() {
+    let out = run("tests/fixtures/execute/variant_lowering").await;
+    let tiers = csv_column(&out, "subscribers", "tier");
+    assert!(!tiers.is_empty(), "subscribers should have rows");
+    let stray: Vec<&String> = tiers
+        .iter()
+        .filter(|t| *t != "gold" && *t != "silver")
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "tier must be one of the declared cases {{gold, silver}}; found {} stray (first 3: {:?})",
+        stray.len(),
+        stray.iter().take(3).collect::<Vec<_>>(),
+    );
+}
+
+/// A mandatory (ratio 1.0) union member produces one case for every parent row it
+/// covers — no holder-less / orphan rows, and every ref resolves to the parent.
+#[tokio::test]
+async fn test_variant_lowering_mandatory_member_no_orphan() {
+    let out = run("tests/fixtures/execute/variant_lowering").await;
+    let parent_ids: std::collections::HashSet<String> =
+        csv_column(&out, "parent", "id").into_iter().collect();
+    let sub_ids = csv_column(&out, "subscribers", "parent_id");
+
+    // ratio 1.0 ⇒ every parent row is a subscriber.
+    assert_eq!(
+        sub_ids.len(),
+        parent_ids.len(),
+        "mandatory member should have one row per parent row"
+    );
+    let orphans = sub_ids.iter().filter(|v| !parent_ids.contains(*v)).count();
+    assert_eq!(orphans, 0, "subscribers.parent_id has {orphans} orphan refs");
+}
+
+/// The union's declared ratios are honoured (loose band — segment Bernoulli rounding
+/// is stochastic). Both cases appear and gold dominates ~60/40.
+#[tokio::test]
+async fn test_variant_lowering_case_distribution() {
+    let out = run("tests/fixtures/execute/variant_lowering").await;
+    let tiers = csv_column(&out, "subscribers", "tier");
+    let n = tiers.len() as f64;
+    let gold = tiers.iter().filter(|t| *t == "gold").count() as f64;
+    let silver = tiers.iter().filter(|t| *t == "silver").count() as f64;
+    assert!(gold > 0.0 && silver > 0.0, "both cases must appear");
+    let gold_frac = gold / n;
+    assert!(
+        (gold_frac - 0.6).abs() < 0.12,
+        "gold fraction {gold_frac:.3} should be near declared 0.6 (gold={gold}, silver={silver})"
+    );
+}

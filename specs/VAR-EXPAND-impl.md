@@ -39,8 +39,8 @@ behaviour is byte-identical), so PR 3 is a focused flip.
 
 | PR | Subject | Scope |
 |----|---------|-------|
-| 1 | Lock target behaviour + `VAR-LINKED-CONTENT` gate | New fixtures/tests (`#[ignore]` where they need lowering) + validation rejection of variants on linked content lists |
-| 2 | Dormant machinery | `models.rs` types; `segment.rs` exclusion-group-aware DFS + categorical factor + discriminant constraint; `plan_segments` signature change (all callers pass `&[]`) — behaviour unchanged |
+| 1 ✅ | Lock target behaviour + `VAR-LINKED-CONTENT` gate | Lock-in fixtures/tests (regression guards — pure non-ref lowering is behaviour-preserving) + validation rejection of variants on linked content lists |
+| 2 ✅ | Dormant machinery | `models.rs` discriminant helper; `segment.rs` `ExclusionGroup` + categorical factor + entry-based DFS; `plan_segments` signature change (all callers pass `&[]`) — behaviour-neutral |
 | 3 | The lowering switchover | `plan.rs` `lower_variant_unions`; executor discriminant handling; delete VAR-2 variant sub-distribution; remove `#[ignore]` |
 | 4 | Docs + terminology adoption | `variant-lowering.mdx` (celebratory), CLAUDE.md glossary/module-map/sentinels, README, testing.mdx, docgen |
 | 5 | Close-out | Mark specs complete, move to `specs/done/`, re-point VAR-SPECIALIZE |
@@ -68,59 +68,67 @@ appears among the content (item) fields of a linked content list:
 - `tests/validate_tests.rs` (or inline) — a fixture/builder with a list-link whose
   item field is `type: variant`; assert the error fires. Lands green immediately.
 
-**Lock-in tests for lowering (mostly `#[ignore]` until PR 3).**
+**Lock-in tests for lowering (regression guards — all passing).** A finding from
+building PR 1: for a *pure non-ref* union (the VAR-EXPAND case), VAR-2 already
+produces correct output — verified empirically on the fixture below (200 rows,
+exact 60/40, zero orphans/empties). So lowering is **behaviour-preserving** here,
+and these tests are regression guards that pin what lowering must not break, *not*
+`#[ignore]`-until-PR-3 tests. (The case VAR-2 genuinely gets wrong — proportional
+vs. IPF-exact `(case, segment)` counts — only arises under *coupling*, i.e. a case
+conflicting with a sibling's constraint; that is a VAR-SPECIALIZE concern and is
+tested there, not here.)
 
-- `tests/fixtures/execute/variant_lowering/` — a parent with a leaf member carrying
-  a 2–3-case **mandatory** union, plus a sibling member chosen so a non-trivial
-  joint segment exists. Tests in `tests/executor_tests.rs`:
-  - `variant_case_membership` — every member row's case value is in the declared
-    set. *(May already pass under VAR-2; if so, not ignored.)*
-  - `mandatory_union_no_orphan` — no parent row that belongs to the mandatory
-    member lacks a case value. **`#[ignore]` until PR 3** (VAR-2 can leave the
-    proportional-rounding gap; lowering makes it exact).
-  - `joint_case_segment_counts_are_ipf_exact` — per-`(case, segment)` row counts
-    match the IPF expectation, not VAR-2's proportional split. **`#[ignore]` until
-    PR 3.**
+- `tests/fixtures/execute/variant_lowering/` — `parent` (200 rows) + `subscribers`
+  (mandatory, ratio 1.0, tagged-union `tier: gold 0.6 / silver 0.4`) + `flagged`
+  (ratio 0.5) so a joint segment exists. Tests in `tests/executor_tests.rs`:
+  - `test_variant_lowering_case_membership` — every `tier` is a declared case (never
+    a stray random string — the BUG-VAR failure mode — nor empty).
+  - `test_variant_lowering_mandatory_member_no_orphan` — one subscriber row per
+    parent row (ratio 1.0), every `parent_id` resolves to the parent.
+  - `test_variant_lowering_case_distribution` — declared ratios honoured (loose band;
+    segment Bernoulli rounding is stochastic).
 - Statistical (`tests/statistical/test_insurance.py`): the existing variant
-  membership + distribution tests are the main regression guard (insurance's
-  `premiums`/`claims` are leaf-member unions). Optionally add a joint-proportion
-  assertion, `#[xfail]`-style skipped until PR 3.
+  membership + distribution tests remain the main regression guard (insurance's
+  `premiums`/`claims` are leaf-member unions).
 
 ### PR 2 — Dormant machinery
 
-Everything compiles and the full suite stays green because no caller produces a
-non-empty `ExclusionGroup` yet, and the categorical factor over zero groups equals
-today's product-Bernoulli prior.
+**Status: done.** Everything compiles and the full suite stays green because no
+caller produces a non-empty `ExclusionGroup` yet, and the categorical factor over
+zero groups equals today's product-Bernoulli prior. Landed:
 
-1. **`lib/models.rs`** — add:
-   - `LoweredCase` (case schema + `case_ratio = r_M·vᵢ` + owning group id +
-     discriminant index), or carry the equivalent on `LowerCoverMember`.
-   - `ExclusionGroup { discriminant: String, members: Vec<usize>, ratios: Vec<f64>, mandatory: bool }`
-     — `members` index into the lower cover's member vector; `ratios` are absolute
-     `r_M·vᵢ`; `mandatory == (Σ ratios ≈ 1)`. **One group per union *field*.**
-   - `discriminant_column(union_field: &str) -> String` → `_disc_<union>`, and a
-     `DISCRIMINANT_PREFIX` const next to the other sentinels.
+1. **`lib/models.rs`** — `DISCRIMINANT_PREFIX` const + `discriminant_column(field)
+   -> String` (`_disc_<union>`). *(`LoweredCase` deferred to PR 3 — nothing produces
+   or consumes it until the lowering pass, so adding it now would be dead code.)*
 
-2. **`lib/segment.rs`** — refactor the DFS to be entry-based and add the factor:
-   - `enumerate_segments_dfs` iterates a list of **entries**, where an entry is
-     either a lone member or an `ExclusionGroup`. A group branches over
-     `{no case} ∪ {pick case j}` (≤1 group member set per branch); a lone member
-     branches include/exclude as today. Weights use `categorical_prior_factor`.
-   - `categorical_prior_factor(group, chosen: Option<usize>) -> f64` — `ratios[j]`
-     for a chosen case, `1 − Σ ratios` for none.
-   - `discriminant_constraint(idx) -> FieldConstraints` — pins `_disc_<union>` to a
-     case index (the `meet = ⊥` encoder); `allowed_values` form reserved for
-     VAR-SPECIALIZE.
-   - `plan_segments(parent_rows, members, groups: &[ExclusionGroup])` — **signature
-     change**; `ipf_rescale_sparse` **unchanged**. With `groups == &[]` the
-     entry list is all-lone-members → byte-identical to today.
-   - Extend `mod var_expand_prototype` (or add unit tests) to cover `r_M < 1`
-     (optional member: "no case" = `1 − r_M` is legitimate, not driven to 0).
+2. **`lib/segment.rs`** —
+   - `ExclusionGroup { discriminant, members: Vec<usize>, ratios: Vec<f64>, mandatory }`
+     (one group per union *field*; `ratios` absolute `r_M·vᵢ`).
+   - `categorical_prior_factor(group, chosen) -> f64` — `ratios[k]` for a case,
+     `1 − Σ ratios` for none.
+   - Entry-based `enumerate_segments_dfs` over `DfsEntry::{Lone, Group}` built by
+     `build_dfs_entries`. A `Group` branches `{no case} ∪ {pick case}`, so mutual
+     exclusion is **structural** — at most one case bit is ever set. The "no case"
+     branch is pruned when its weight is 0 (mandatory union), keeping the feasible
+     set bounded. `ipf_rescale_sparse` **unchanged**. With `groups == &[]` the entry
+     list is all-lone-members → byte-identical to the pre-VAR-EXPAND DFS.
+   - `plan_segments(parent_rows, members, groups: &[ExclusionGroup])` — signature
+     change; all callers (`plan.rs` ×2, segment tests) pass `&[]`.
+   - Unit tests `exclusion_group_{mandatory_union_is_exclusive_and_exact,
+     optional_union_keeps_member_absent_cell, with_plain_sibling_factors_jointly}` —
+     drive `plan_segments` with hand-built groups, covering the `r_M < 1` (optional
+     member: "no case" = `1 − r_M`, legitimate) case the Q-prototype omitted.
 
-3. **Callers** — `plan.rs::build_lower_cover_groups` and every test/fixture caller
-   pass `&[]`. Trivial wrapping ripple.
+   *Adaptation:* `discriminant_constraint` is **not** added here. The entry-DFS gets
+   intra-union exclusion structurally, so it needs no `meet = ⊥` constraint; in PR 3
+   the discriminant arrives naturally as each lowered case's `ref: parent._disc,
+   value: idx` field (extracted by `lower_cover_field_constraints` like any ref), and
+   only VAR-SPECIALIZE's subset restriction needs the `allowed_values` form. So the
+   discriminant *column* helper lands here (PR 2), the discriminant *constraint*
+   construction lands with lowering (PR 3).
 
-Green-point: full `cargo test` + `pytest` unchanged from pre-PR counts.
+Green-point (met): full `cargo test` (100 lib + integration) and `pytest` (74)
+unchanged from pre-PR counts; 3 new exclusion-group unit tests added.
 
 ### PR 3 — The lowering switchover (atomic)
 
@@ -200,10 +208,13 @@ no test.)
 | Categorical prior gives `M₀ = 0`, preserved by IPF | `var_expand_prototype::categorical_prior_zeroes_illegal_mass_and_restores_marginals` | ✅ done |
 | Interior IPF converges fast on stacked mandatory unions | `var_expand_prototype::stacked_mandatory_unions_with_conflicts_converge_fast` | ✅ done |
 | Naive prior leaks (justifies the categorical factor) | `var_expand_prototype::naive_prior_leaks_under_low_iteration_cap` | ✅ done |
-| Case ratios are absolute `r_M·vᵢ`; "no case" = `1−r_M` | new `r_M < 1` unit test in `mod var_expand_prototype` | PR 2 |
-| Each case is in the declared value set | `executor_tests::variant_case_membership` | PR 1 (may pass pre-flip) |
-| Mandatory union ⇒ no orphan (every member row has a case) | `executor_tests::mandatory_union_no_orphan` | PR 3 (ignored → on) |
-| Per-`(case, segment)` counts are IPF-exact, not proportional | `executor_tests::joint_case_segment_counts_are_ipf_exact` | PR 3 (ignored → on) |
+| Case ratios are absolute `r_M·vᵢ`; "no case" = `1−r_M` | `segment::tests::exclusion_group_optional_union_keeps_member_absent_cell` | ✅ PR 2 |
+| Union cases mutually exclusive; mandatory ⇒ no empty segment | `segment::tests::exclusion_group_{mandatory_union_is_exclusive_and_exact, with_plain_sibling_factors_jointly}` | ✅ PR 2 |
+| `groups == &[]` ⇒ DFS byte-identical to pre-VAR-EXPAND | existing segment/plan/executor suites unchanged | ✅ PR 2 |
+| Each case is in the declared value set | `executor_tests::test_variant_lowering_case_membership` | ✅ PR 1 (regression guard) |
+| Mandatory union ⇒ no orphan (one case per covered parent row) | `executor_tests::test_variant_lowering_mandatory_member_no_orphan` | ✅ PR 1 (regression guard) |
+| Declared case ratios honoured | `executor_tests::test_variant_lowering_case_distribution` | ✅ PR 1 (regression guard) |
+| Per-`(case, segment)` counts IPF-exact *under coupling* | VAR-SPECIALIZE test plan (proportional==exact without coupling, so not a VAR-EXPAND-observable) | VAR-SPECIALIZE |
 | One group per union field (cross-product via segments) | new two-union-field unit test (members `== n+m`) | PR 3 |
 | Cases share one Arrow schema (else error) | new validation test | PR 3 |
 | `_disc_<union>` never reaches output | `filter_hidden_columns` test | PR 3 |

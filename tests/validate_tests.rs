@@ -57,6 +57,23 @@ fn test_content_on_non_list_field_errors() {
     assert!(msg.contains("list"), "error should mention `list`: {msg}");
 }
 
+/// VAR-LINKED-CONTENT gate: a `type: variant` field among linked content list item
+/// fields is rejected until the feature is designed (see specs/VAR-LINKED-CONTENT.md).
+#[test]
+fn test_variant_in_list_link_content_errors() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/variant_in_list_link_content",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("should fail validation");
+    let msg = err.to_string();
+    assert!(msg.contains("variant"), "error should mention `variant`: {msg}");
+    assert!(
+        msg.contains("list-link content"),
+        "error should mention `list-link content`: {msg}"
+    );
+}
+
 #[test]
 fn test_ref_with_type_errors() {
     let paths = vec![PathBuf::from("tests/fixtures/validation/ref_with_type")];
