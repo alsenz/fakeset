@@ -1,0 +1,21 @@
+name: countries
+format: jsonl
+output_file: countries
+rows: 3
+links:
+  - file: regions.yaml
+    ref: region
+    cardinality:
+      min: 1
+      max: 3
+data:
+  - name: country_id
+    type: string
+    generator: uuid
+  - name: country_regions
+    type: list
+    content:
+      from: region
+      fields:
+        - name: region_id
+          ref: region.region_id

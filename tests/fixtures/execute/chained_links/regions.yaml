@@ -1,0 +1,23 @@
+name: regions
+format: jsonl
+output_file: regions
+rows: 8
+links:
+  - file: cities.yaml
+    ref: city
+    cardinality:
+      min: 2
+      max: 3
+data:
+  - name: region_id
+    type: string
+    generator: uuid
+  - name: region_cities
+    type: list
+    content:
+      from: city
+      fields:
+        - name: city_id
+          ref: city.city_id
+        - name: city_name
+          ref: city.city_name

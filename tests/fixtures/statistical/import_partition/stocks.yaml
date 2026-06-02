@@ -8,3 +8,5 @@ data:
   - name: stock_id
     type: string
     generator: uuid
+  - name: bucket
+    type: string

@@ -65,14 +65,15 @@ down to the child's ref field so the child knows what to generate.
 ### Phase 2 — Accumulate up
 
 Generated atom values propagate *upward* toward parent nodes. For include
-relationships this means: once all atoms are generated, each parent is assembled
-from its children via a LEFT JOIN on `_row_idx`. Fields present in a child are
-**inherited** (their values copied into the parent's batch); remaining fields are
-generated fresh.
+relationships this is done per-segment by the **segment-atom pipeline**: every
+parent field that one or more members ref is materialised once into a unified
+*atom batch*, and the parent and each member project their copy of that column
+from it. Parent fields with no member ref are generated fresh.
 
-Consistency is guaranteed by construction: any field shared between a parent and
-child dataset carries the *same value* in both outputs, because the parent batch is
-assembled *from* the child batch.
+Consistency is guaranteed by construction: every member that refs a parent column
+and the parent itself receive the **same generated values** for the same segment
+slot, because they all read from one atom column. There is no first-child-wins
+race or post-hoc reconciliation step.
 
 ## A worked example
 

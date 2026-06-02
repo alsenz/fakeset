@@ -57,19 +57,6 @@ Tests skip automatically when the sample is too small for the chosen statistic
 (e.g. the KS test for grants when fewer than 15 rows are generated, or the χ²
 test when any expected cell count falls below 5).
 
-## Known bugs documented by the suite
-
-One bug is currently marked `xfail` because it exposes a pre-existing issue.
-
-**BUG-REF (first-child-wins)** — For overlap segments where two lower cover members
-both appear (e.g. a contract row that belongs to both the premiums and claims subsets),
-`grow_parent_from_children` inherits the parent's shared field (e.g. `contract_id`) from
-whichever child is first in `child_batches` — determined by HashMap iteration order.
-The other child's on-disk rows were generated with different values for that field and
-will not match the parent.
-*Affects:* `claims.contract_id` and `claims.customer_id` in the `{premiums ∩ claims}`
-overlap segment (~34% of contract rows).  Non-deterministic: may pass or fail across runs.
-
 ## File layout
 
 ```

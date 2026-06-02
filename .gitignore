@@ -6,3 +6,5 @@
 /docs/dist
 /docs/.astro
 /docs/src/data/schema.json
+__pycache__/
+*.pyc

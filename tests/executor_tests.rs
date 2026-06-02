@@ -155,55 +155,64 @@ async fn test_bernoulli_conflicting_siblings_fan_out_correctly() {
 }
 
 // ---------------------------------------------------------------------------
-// 3b. Overlap segment ref integrity — BUG-REF regression guard
+// 3b. Overlap segment ref integrity — SEG-ATOM-1 regression guard
 //
-// parent.yaml: 100 rows with `id`
-// m1.yaml: includes parent at 0.8, has `parent_id ref: p.id`
-// m2.yaml: includes parent at 0.5, has `parent_id ref: p.id`
+// parent.yaml: 100 rows with `id` and `code` (two synthesised parent fields)
+// m1.yaml: includes parent at 0.8, refs both p.id and p.code
+// m2.yaml: includes parent at 0.5, refs both p.id and p.code
 //
 // No constraint conflicts → joint segment {m1, m2} survives with ~40 rows.
-// In that segment, m1 and m2 both ref parent.id; the current implementation
-// generates each member's parent_id independently, then grow_parent_from_children
-// inherits whichever child wins HashMap iteration order. The losing child's
-// parent_id values are orphans (not present in parent.id).
-//
-// SEG-ATOM-1 fixes this by generating one unified atom batch per segment so
-// every member's parent_id matches the parent's. Marked #[ignore] until then.
+// SEG-ATOM-1 generates one unified atom batch per segment so every member and
+// the parent receive the same generated values for shared ref columns. Tests:
+//   (1) every member ref value is present in the parent (no orphans)
+//   (2) the (parent_id, parent_code) pairs in each member appear as
+//       (id, code) pairs in the parent — i.e. the two shared refs are kept in
+//       sync row-by-row (the multi-ref-per-member case that BUG-REF broke).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "BUG-REF — passes once SEG-ATOM-1 is implemented (run with `cargo test -- --ignored`)"]
 async fn test_overlap_shared_ref_integrity() {
     let out = run("tests/fixtures/execute/overlap_shared_ref").await;
 
     let parent_ids: std::collections::HashSet<String> =
         csv_column(&out, "parent", "id").into_iter().collect();
-
-    let m1_parent_ids = csv_column(&out, "m1", "parent_id");
-    let m1_orphans: Vec<&String> = m1_parent_ids
-        .iter()
-        .filter(|v| !parent_ids.contains(*v))
+    let parent_codes: std::collections::HashSet<String> =
+        csv_column(&out, "parent", "code").into_iter().collect();
+    let parent_pairs: std::collections::HashSet<(String, String)> = csv_column(&out, "parent", "id")
+        .into_iter()
+        .zip(csv_column(&out, "parent", "code"))
         .collect();
-    assert!(
-        m1_orphans.is_empty(),
-        "{} of {} m1.parent_id values are not in parent.id (e.g. {:?})",
-        m1_orphans.len(),
-        m1_parent_ids.len(),
-        m1_orphans.iter().take(3).collect::<Vec<_>>(),
-    );
 
-    let m2_parent_ids = csv_column(&out, "m2", "parent_id");
-    let m2_orphans: Vec<&String> = m2_parent_ids
-        .iter()
-        .filter(|v| !parent_ids.contains(*v))
-        .collect();
-    assert!(
-        m2_orphans.is_empty(),
-        "{} of {} m2.parent_id values are not in parent.id (e.g. {:?})",
-        m2_orphans.len(),
-        m2_parent_ids.len(),
-        m2_orphans.iter().take(3).collect::<Vec<_>>(),
-    );
+    for m in ["m1", "m2"] {
+        let m_ids = csv_column(&out, m, "parent_id");
+        let m_codes = csv_column(&out, m, "parent_code");
+        assert_eq!(
+            m_ids.len(),
+            m_codes.len(),
+            "{m}: parent_id and parent_code columns must have the same length"
+        );
+
+        let id_orphans = m_ids.iter().filter(|v| !parent_ids.contains(*v)).count();
+        assert_eq!(id_orphans, 0, "{m}.parent_id has {id_orphans} orphan refs");
+
+        let code_orphans = m_codes.iter().filter(|v| !parent_codes.contains(*v)).count();
+        assert_eq!(code_orphans, 0, "{m}.parent_code has {code_orphans} orphan refs");
+
+        // (parent_id, parent_code) pairs must appear together in the parent.
+        // This is the multi-ref-per-member integrity check: each member row
+        // points at one specific parent row, with all its ref columns aligned.
+        let pair_mismatches: Vec<(String, String)> = m_ids
+            .into_iter()
+            .zip(m_codes)
+            .filter(|pair| !parent_pairs.contains(pair))
+            .collect();
+        assert!(
+            pair_mismatches.is_empty(),
+            "{m}: {} rows have (parent_id, parent_code) pairs not present in parent (first 3: {:?})",
+            pair_mismatches.len(),
+            pair_mismatches.iter().take(3).collect::<Vec<_>>(),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1799,6 +1808,81 @@ async fn test_import_links_pool_not_written_trades_draw_from_it() {
             assert!(
                 valid_symbols.contains(sym),
                 "trade {i}: symbol '{sym}' is not in tickers.csv"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chained links — REFRAME §Step 3 regression guard
+//
+// countries → regions → cities. Each level has a `links:` stanza, so the
+// planner must recursively decompose into staging/witness/assembly nodes per
+// link. Topological order must sequence innermost atoms first (cities), then
+// regions complete with their city items, then countries complete with their
+// region items. Ref integrity at every level: every region_id in
+// countries.country_regions must exist in regions.region_id; every city_id in
+// regions.region_cities must exist in cities.city_id.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_chained_links_ref_integrity() {
+    let out = run("tests/fixtures/execute/chained_links").await;
+
+    let cities = jsonl_rows(&out, "cities");
+    let regions = jsonl_rows(&out, "regions");
+    let countries = jsonl_rows(&out, "countries");
+
+    assert_eq!(cities.len(), 20, "cities should have 20 rows");
+    assert_eq!(regions.len(), 8, "regions should have 8 rows");
+    assert_eq!(countries.len(), 3, "countries should have 3 rows");
+
+    let city_ids: std::collections::HashSet<&str> = cities
+        .iter()
+        .map(|r| r["city_id"].as_str().expect("cities.city_id must be string"))
+        .collect();
+    let region_ids: std::collections::HashSet<&str> = regions
+        .iter()
+        .map(|r| r["region_id"].as_str().expect("regions.region_id must be string"))
+        .collect();
+
+    // Inner link: regions.region_cities[].city_id ⊆ cities.city_id
+    for (i, region) in regions.iter().enumerate() {
+        let items = region["region_cities"]
+            .as_array()
+            .unwrap_or_else(|| panic!("region {i}: region_cities must be an array"));
+        assert!(
+            (2..=3).contains(&items.len()),
+            "region {i}: cardinality min:2 max:3, got {}",
+            items.len()
+        );
+        for item in items {
+            let cid = item["city_id"].as_str().expect("city_id must be string");
+            assert!(
+                city_ids.contains(cid),
+                "region {i}: city_id '{cid}' is not in cities (chain broken at innermost link)"
+            );
+        }
+    }
+
+    // Outer link: countries.country_regions[].region_id ⊆ regions.region_id.
+    // This is the proof that the outer witness sees the fully-completed inner
+    // dataset — innermost atoms generated first, then the inner witness/assembly,
+    // then the outer witness's seed edge is satisfied.
+    for (i, country) in countries.iter().enumerate() {
+        let items = country["country_regions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("country {i}: country_regions must be an array"));
+        assert!(
+            (1..=3).contains(&items.len()),
+            "country {i}: cardinality min:1 max:3, got {}",
+            items.len()
+        );
+        for item in items {
+            let rid = item["region_id"].as_str().expect("region_id must be string");
+            assert!(
+                region_ids.contains(rid),
+                "country {i}: region_id '{rid}' is not in regions (chain broken at outer link)"
             );
         }
     }

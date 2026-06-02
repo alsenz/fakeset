@@ -8,6 +8,8 @@ include:
 data:
   - name: parent_id
     ref: p.id
+  - name: parent_code
+    ref: p.code
   - name: tag
     type: string
     value: "m2"

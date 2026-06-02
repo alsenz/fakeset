@@ -127,7 +127,8 @@ takes precedence.
 ### 11. Execute
 
 The executor interprets `ExecutionStep`s in order using Apache Arrow record batches.
-DataFusion is used for JOIN operations and expression evaluation.
+DataFusion is used for expression evaluation, shuffling, and hidden-column projection;
+parent assembly itself is pure Arrow column selection (the segment-atom pipeline).
 
 For imported datasets the executor branches at the batch-generation step: instead of
 generating all `data:` fields from scratch, it calls `filter_ring` to extract the
@@ -156,7 +157,6 @@ from emitted output.
 
 | Column | Type | Purpose |
 |--------|------|---------|
-| `_row_idx` | `UInt32` | JOIN key for `grow_parent_from_children`; prepended and stripped within that function |
 | `_slot_idx` | `UInt32` | Staging-node slot index; maps each child row to its parent slot for list assembly and grandchild access |
 | `_staging_refs` | `List<UInt32>` | Per-witness-row list of all staging slot indices that drew that linked row; consumed and dropped by `AssembleFromWitness` |
 | `_linked_idx` | `UInt32` | Index into the eligible linked-dataset batch; retained for `AccumulateToLinked` collect bindings |
@@ -176,15 +176,17 @@ Because DQ is applied after the full execution DAG completes, row-count changes 
 DataFusion provides the query-engine layer for batch operations that would be
 awkward in plain Arrow:
 
-- **`grow_parent_from_children`** — LEFT JOIN on `_row_idx` to merge child field
-  values into the parent skeleton. Implemented via the programmatic DataFrame API
-  (type-safe, no string formatting).
 - **`evaluate_expressions`** — CTE chain in SQL evaluates expression fields in YAML
   declaration order. A fresh `SessionContext` is created per call to avoid
   registration lifecycle issues.
 - **`filter_hidden_columns`** — project out hidden fields before emitting.
 - **`union_and_shuffle`** — union accumulated variant batches and sort by a random
   column for reproducibility-agnostic shuffles.
+
+Parent assembly is pure Arrow column selection: `generate_segment_atom_batch`
+materialises the shared ref columns once per segment, then
+`project_parent_columns_from_atom` and `project_member_columns` fan those columns
+to the parent and each member. No DataFusion JOIN is involved.
 
 <Aside type="note">
 Each DataFusion function creates its own `SessionContext::new()`. There is no shared

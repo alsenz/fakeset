@@ -1,0 +1,534 @@
+# VAR-EXPAND — Variant lowering via tagged-union discriminants
+
+## Status
+
+**Proposed — approach chosen (tagged-union lowering with discriminant exclusion +
+categorical prior factor).** Planner-math de-risked (§Q-prototype, passing);
+implementation plan ready; one open question remains (variants on linked content
+lists, deferred to [`VAR-LINKED-CONTENT`](VAR-LINKED-CONTENT.md)).
+
+**Implementation plan:** [`VAR-EXPAND-impl.md`](VAR-EXPAND-impl.md) — PR
+sequencing, per-PR green-points, an invariant→test→PR traceability matrix, and the
+risks found in planning. It folds in the `VAR-LINKED-CONTENT` validation gate and
+the `variant-lowering.mdx` concepts page.
+
+Supersedes and absorbs the planner-side concerns of
+[`VAR-SPECIALIZE`](VAR-SPECIALIZE.md): once variants are *lowered* into the
+lattice, specialisation constraints flow naturally as ordinary conflict pruning
+during Bernoulli factoring, and VAR-SPECIALIZE's contribution narrows to the
+merge-table change and the new `allowed_values:` YAML key.
+
+---
+
+## The insight (and why it matters)
+
+This spec is built on a single reframing that makes variant handling fall out of
+machinery the codebase already has, instead of needing a parallel path. It is
+worth stating plainly, because it is the kind of clarifying idea the rest of the
+design hangs off — and it deserves to be written into the user-facing docs, not
+just the spec (see §Documentation plan).
+
+> **A `type: variant` field is a tagged union (sum type). The planner *lowers* it
+> into its cases — the literal REFRAME §Step 2 expansion — and attaches a
+> *discriminant* that records which case is active. The discriminant makes the
+> cases' pairwise meet `⊥`, so the existing Bernoulli factorer enforces "exactly
+> one case per row" for free. Variants need no special execution path: lowering +
+> discriminant + the factorer we already have.**
+
+Three borrowed-but-precise terms carry this, and we **adopt them into the
+framework vocabulary** (CLAUDE.md glossary, README, docs):
+
+| Term | Meaning in fakeset |
+|------|--------------------|
+| **tagged union** | A `type: variant` field — a node that is exactly one of N *cases* per row. The order-theoretic statement is that the cases partition the node's population and their pairwise meet is `⊥`. |
+| **lowering** (variant lowering) | The planner-time rewrite that replaces a tagged-union node with its N **lowered cases** at the same lattice position — REFRAME §Step 2 made literal. Borrowed from compilers (lowering a high-level construct to a simpler IR before the back end runs). |
+| **discriminant** (a.k.a. **tag**) | The synthetic field that records which case a row took. Each lowered case pins it to its own index, so `caseᵢ ∧ caseⱼ = ⊥` (`i ≠ j`). It is a hidden sentinel, stripped from output — the same role a tag plays in a tagged-union memory layout. |
+| **exclusion group** | The lightweight annotation that groups a union's lowered cases (with their ratios) so the segment **prior** can treat them as one categorical factor rather than N independent Bernoulli trials. |
+| **illegal mass** (the *leak*) | Prior probability assigned to "this row took *no* case of a mandatory union" — a state that must not exist. The categorical prior factor sets it to zero at the source. |
+
+Why this is the right framing and not just cute: it expresses everything in
+concepts the lattice already owns — nodes, cases, meets, `⊥`, constraints,
+Bernoulli factoring. It introduces **no execution path** orthogonal to the
+generate-atoms / accumulate-up model. The one genuinely new structural fact —
+"the cases of a union are mutually exclusive" — is encoded as `meet = ⊥`, which
+the factorer already knows how to drop. That is the bar the
+[[framing-vocabulary-is-primary]] principle sets, and this clears it.
+
+---
+
+## Context and motivation — the misalignment being fixed
+
+The audit at the end of the SEG-ATOM-1 work surfaced a tension with REFRAME-1
+with the same *shape* as BUG-REF: a pre-REFRAME design that survived the rewrite
+by being renamed but not actually moved into the planner.
+
+REFRAME `§Step 2 — Expand variants` says:
+
+> Elements with `type: variant` fields are expanded. A dataset with N declared
+> values on a single variant field is replaced by N new elements at the same
+> position in the semi-lattice (same include edges; the original is removed).
+> For multiple independent variant fields of sizes n₁, n₂, …, the expansion is
+> the cross-product ∏nᵢ.
+
+That *is* lowering. And the planner already lowers some nodes — but not all.
+
+Stated in the framework's terms: lowering is applied to **every node except leaf
+members** — a *leaf member* being a lower-cover member that is not itself the
+parent of any lower cover. A standalone node, or any node that is the *parent* of
+a lower-cover group, is lowered into its cases and planned in full (mechanism:
+`plan_variant_steps`, `plan.rs:863`, dispatched before the lower-cover-group
+branch). A member that is itself a parent is lowered too, because lowering fires
+when the lattice reaches it.
+
+The gap is exactly the **leaf members**. The lattice never lowers their variants
+before factoring — so a leaf member with N cases enters Bernoulli factoring as a
+*single* entry where the framework's reading would have N, and the variant axis
+is invisible to factoring. The N-way sub-distribution is instead deferred to
+generation time, after factoring has already run. (In code: the leaf member is
+skipped at `plan.rs:858` (`lower_cover_set.contains(path) &&
+!lower_cover_groups.contains_key(path)`), its variants stay packed in a single
+`LowerCoverMember.dataset.variants`, and the sub-distribution happens inside
+`generate_member_nonref_fields` (VAR-2).)
+
+(Don't conflate *leaf member* with *atom*: a leaf member is a **declared** minimal
+node; it becomes one or more **segment-atoms** only once factoring materialises
+its meets with siblings. A non-overlapping leaf member is its own singleton
+segment-atom; an overlapping one is split across several. Either way the gap is
+about the *declared* leaf member, whose cases factoring never sees. The
+distinction that matters is leaf-ness, not atom-ness — members that are themselves
+parents already reach `plan_variant_steps`.)
+
+### Why generation is anchored at the parent (it is not a hack)
+
+Worth stating precisely, because it is *not* that the atoms are interdependent —
+atoms are exactly what factoring makes independent. The *declared* lower-cover
+members of a group overlap: a row can satisfy several, so before factoring they
+are not atoms, just overlapping concepts. **Bernoulli factoring is the operation
+that resolves the overlap** — it computes the meets and partitions the parent into
+the disjoint joint-and-singleton **segment-atoms**, each covering `⊥`, each
+carrying one membership combination. Those segment-atoms *are* independent: each
+could be generated in parallel, and accumulation up to the parent and members is
+pure fan-out. What is anchored at the parent is the **factoring**, because it
+needs the whole sibling group at once, and the group meets only at the parent.
+Lowering changes what feeds the factorer, not this shape.
+
+### Why the deferred path is wrong, not just inelegant
+
+It produces correct *membership* today (VAR-2's
+`test_variant_incompatible_with_segment_constraint_is_pruned` passes), but when
+several leaf members in a group each have variants, the planner cannot reason about
+*joint* feasibility across them. The generation-time filter prunes a case only
+against the *already-fixed* segment constraints of that one member; it cannot
+redistribute pruned mass across sibling members' cases, nor restore each case's
+global marginal. So row counts per `(case, segment)` cell are *proportional*, not
+IPF-exact — precisely the "Level 2 IPF upgrade" gap VAR-SPECIALIZE flags. Lowering
+closes it by putting the variant axis where the factorer can see it.
+
+---
+
+## The structural fact, and the trap in the obvious fix
+
+The obvious fix is naive pre-expansion: lower each case into an independent
+Bernoulli member and let existing machinery handle it — *zero* variant-specific
+code. It is right to lower, but naive lowering is **incorrect**, for a reason that
+is correctness-first, not efficiency.
+
+**The cases of a union are mutually exclusive by construction** — exactly one
+fires per row. The trap: this exclusivity is generally **not expressible as a
+Bernoulli conflict**. Conflict pruning (`lower_cover_field_constraints`,
+`segment.rs:363`) only extracts constraints from a member's *parent-ref* fields.
+But cases typically differ on the member's *own non-ref* fields (`billing_period`,
+`eats`, a plain `status` value), which never enter conflict pruning. So if cases
+are lowered into N *independent* members with nothing tying them together:
+
+- DFS would **not detect** that `case₀` and `case₁` cannot co-occur — there is no
+  parent-column clash — and would emit illegal `{case₀, case₁}` joint segments. A
+  row cannot be two cases of the same union at once: a correctness bug.
+- *Even granting* detection (the sub-case where cases happen to pin a shared
+  parent-ref differently), the 2^N enumeration sees N members where there is
+  logically one categorical choice, and branch-and-bound must still *visit* every
+  same-union joint subset (∑ᵢ(2^nᵢ − nᵢ − 1)) to reject it. Bounded for small nᵢ,
+  but pure overhead.
+
+**This is what the discriminant is for.** It supplies the missing fact directly:
+each lowered case pins a synthetic parent column `_disc_<union>` to its own index,
+so `caseᵢ ∧ caseⱼ` pins the discriminant to two values at once → unsatisfiable →
+`⊥`. The factorer already drops `⊥` segments. Mutual exclusivity becomes a *meet
+that bottoms out*, expressed in the constraint vocabulary the factorer speaks —
+no new pruning rule, no synthetic-constraint special case beyond the one column.
+
+---
+
+## The remaining subtlety: the leak, and the categorical prior factor
+
+Discriminant lowering is correct, but a *second* subtlety remains if you stop
+there. Lowering replaces a member `M` with its cases, so "M is present" is no
+longer a single tracked Bernoulli event — it is "some case of M fired." For a
+**mandatory** union (`ratio: 1`), the product-Bernoulli prior therefore assigns
+positive weight to "M took *no* case" — the **illegal mass / leak**. Those cells
+are feasible (nothing *conflicts* — the row simply drew no case); only the fact
+that the union is mandatory forbids them, and that fact lives only in the IPF
+marginals. IPF drives the leak toward zero *asymptotically* (see §The
+mathematics), so a tight iteration cap or stacked mandatory unions can leave
+residual mass that Bernoulli rounding turns into a **bad row**: e.g. a parent row
+belonging to no case of a mandatory union → a guaranteed field left null, or a
+mandatory child population missing a member it must have (a referential break). A
+full worked example is in §Worked example.
+
+The fix is to not create the leak in the first place. I-projection (hence IPF)
+multiplies cells by positive factors, so it **can never move mass into, or out of,
+a cell whose prior is exactly 0** — structural zeros are preserved. So when
+computing a segment's prior weight, a union contributes a **single categorical
+factor** via its exclusion group:
+
+```
+prior factor for union S in a segment =
+    v_i          if the segment took case i of S
+    1 − Σ v_i    if the segment took no case of S   (= 0 for a mandatory union)
+```
+
+instead of the product ∏ᵢ(1−vᵢ) of independent Bernoullis. For a mandatory union
+the "no case" factor is 0, so every "M-absent" segment starts at prior 0 and IPF
+holds it there exactly. **Illegal mass M₀ = 0; the boundary-convergence problem
+disappears.** Convergence reverts to the ordinary interior-IPF problem over legal
+cells only, which is well-conditioned and fast.
+
+Crucially this keeps the discriminant approach's wins. Cases stay members, so:
+
+- **IPF stays vanilla.** Existing per-member marginal restoration already restores
+  each case's ratio `r_M·vᵢ` and redistributes pruned mass (the VAR-SPECIALIZE
+  rebalance) — **no per-variant IPF extension is needed.**
+- **Generation stays per-member.** Each lowered case carries its concrete schema,
+  so existing per-member generation produces its values; the variant
+  sub-distribution logic inside `generate_member_nonref_fields` is **deleted**.
+
+The exclusion group is the only genuinely new concept, and it is consulted at
+exactly one place: computing a segment's prior factor (and, as a bonus, to skip
+enumerating co-occurrence branches rather than enumerate-then-prune them).
+
+---
+
+## The synthesis (chosen approach), end to end
+
+1. **Lower** every tagged union — top-level *and* leaf-member — into its cases.
+   This unifies today's two paths (`plan_variant_steps` for top-level;
+   generation-time sub-distribution for leaf members) into **one operation applied
+   uniformly**. A node with multiple independent union fields lowers to **one
+   exclusion group per union field** — `f (n)` and `g (m)` give `n + m` cases
+   across two groups with two discriminants, *not* `∏ = n·m` combination-nodes.
+   The two fields are independent choices, so REFRAME §Step 2's cross-product ∏nᵢ
+   is realised *implicitly* as segment combinations of the independent groups,
+   never materialised — avoiding the exponential blow-up.
+2. **Discriminant.** Inject a synthetic parent sentinel column `_disc_<union>`;
+   each lowered case refs it pinned to its index. Existing conflict pruning then
+   yields `caseᵢ ∧ caseⱼ = ⊥`. The column is hidden and stripped from output.
+3. **Exclusion group.** Group representation is a **flat `Vec<LowerCoverMember>`
+   plus a side `Vec<ExclusionGroup>`** whose entries index into the members vector
+   and carry `{ratios, mandatory, discriminant}` — one group per union field.
+   Cases stay members (so IPF and generation treat them as members); the DFS
+   becomes group-aware, branching *categorically* over a group's cases when it
+   first reaches one of them, and the segment prior uses the **categorical factor**
+   above. `M₀ = 0`; no leak.
+4. **Vanilla IPF + per-member generation.** Cases are members; per-case marginals
+   and generation come for free from existing machinery.
+5. **Pre-flight guard.** Compute `M₀` (closed form) and a conservative IPF rate,
+   estimate the iteration need `t*`, and warn on near-degenerate marginal configs.
+   With the categorical factor `M₀ = 0` for unions, but the guard still protects
+   against other near-degenerate configurations (e.g. extreme plain-member ratios).
+
+---
+
+## Worked example of the leak (and how the synthesis removes it)
+
+Schema:
+
+- `accounts` — parent, 1000 rows, field `account_id`.
+- `holders` — includes `accounts`, **`ratio: 1.0`** (mandatory), tagged-union field
+  `kyc_status ∈ {verified: 0.6, pending: 0.4}`, refs `account_id`.
+- `flagged` — includes `accounts`, `ratio: 0.5`, plain member.
+
+Intended: every account has a holder (so a `kyc_status`), 60/40, half flagged —
+four legal segments over 1000 rows, no holder-less account:
+
+```
+{verified, flagged}: 300   {verified}: 300
+{pending,  flagged}: 200   {pending}: 200
+```
+
+**Naive Bernoulli lowering.** `holders` lowers to `H_v` (0.6), `H_p` (0.4), plus
+plain `F` (0.5), independent; the discriminant prunes `{H_v, H_p}`:
+
+```
+{}        0.4·0.6·0.5 = 0.12   ← ILLEGAL (no case of a mandatory union)
+{H_v}     0.6·0.6·0.5 = 0.18
+{H_p}     0.4·0.4·0.5 = 0.08
+{F}       0.4·0.6·0.5 = 0.12   ← ILLEGAL
+{H_v,F}   0.6·0.6·0.5 = 0.18
+{H_p,F}   0.4·0.4·0.5 = 0.08
+{H_v,H_p}, {H_v,H_p,F}  pruned (disc conflict)
+```
+
+Illegal mass `M₀ = {} + {F} = 0.24`. IPF (targets `P(H_v)=0.6, P(H_p)=0.4,
+P(F)=0.5`) shrinks it geometrically, not at once:
+
+```
+prior 0.240 → sweep1 0.171 → sweep2 0.100 → sweep3 0.071 → …  (~30%/sweep)
+```
+
+For this schema it reaches ~0 well within the cap → 0 bad rows. But it is
+*asymptotic*: a tight cap or stacked mandatory unions can leave, say, 0.4%
+residual → ~4 rows in `{}`/`{F}` — accounts that are flagged but took **no holder
+case**: `kyc_status` null on a guaranteed field, and no `holders` row for that
+`account_id` (a referential break — a holder-less account the schema forbids).
+
+**Synthesis.** The exclusion group makes `holders`' prior factor categorical:
+`v` for `{…verified…}`, `0.4` for `{…pending…}`, **`1 − (0.6+0.4) = 0`** for "no
+case". Every `{}`/`{F}`-style cell starts at prior 0; IPF preserves it. `M₀ = 0`,
+no leak, no bad row — structurally, not asymptotically.
+
+---
+
+## The mathematics: bounding the iteration cap
+
+Even with `M₀ = 0` for unions, the closed-form guard below is cheap and worth
+keeping as a general degeneracy check.
+
+The illegal mass after `t` IPF sweeps is bounded geometrically, `Mₜ ≤ M₀·rᵗ`. To
+keep expected bad rows under ½ on an `N`-row table (so it rounds to 0):
+
+```
+t* = ⌈ ln(0.5 / (N · M₀)) / ln r ⌉
+```
+
+- **`M₀` is closed-form in the ratios.** For independent mandatory unions,
+  `M₀ = 1 − ∏_S (1 − L_S)`, where `L_S = ∏_{i∈S}(1 − vᵢ)` is union `S`'s per-row
+  "drew nothing" probability. (`L_S` is largest for uniform ratios: a 50/50 union
+  leaks 0.25; a uniform k-way union leaks `(1−1/k)^k → 1/e`.)
+- **`r` is the IPF contraction rate.** IPF is cyclic I-projection (Csiszár);
+  its asymptotic linear rate is `cos²θ` for the Friedrichs angle `θ` between the
+  marginal constraint manifolds in the Fisher/KL geometry — computable as a
+  sub-dominant eigenvalue of a matrix built from the prior and the marginal
+  incidence structure. There is no tight closed form for `r` in just
+  `(k, #covers, ratios)` once unions and plain members couple; use the eigenvalue,
+  or a conservative analytic upper bound (looser → over-warns, never under-warns).
+- **`r → 1` (cap → ∞) in two regimes, both detectable pre-flight without running
+  IPF:** (1) a rare case in a mandatory union (`min vᵢ → 0`), and (2) stacked
+  mandatory unions, whose all-absent cells are forbidden only by a high-order
+  joint condition no single marginal touches.
+
+The synthesis sets `M₀ = 0` for unions, collapsing `t*` to the interior-IPF case.
+The guard remains as a warning for any *other* near-degenerate marginal config.
+
+---
+
+## Implications for the executor
+
+- Each lowered case is a normal member carrying its concrete schema, so existing
+  per-member generation produces its non-ref columns. `generate_member_nonref_fields`'s
+  variant filtering / proportional split / concat is **deleted** (or reduced to a
+  trivial wrapper).
+- `build_segment_atom_schema` / `member_ref_to_parent_map` already read each
+  member's `dataset.data`. Because a lowered case's `data` *is* its concrete
+  (case-specific) schema, the earlier "variant-added ref field is invisible to the
+  atom schema" gap **dissolves** — lowering materialises those fields onto the case
+  before factoring sees it. (This is a real simplification lowering buys.)
+- The `_disc_<union>` discriminant is a sentinel: skipped during atom-column
+  materialisation, never generated as data, and stripped by `filter_hidden_columns`
+  on emit — same lifecycle as `_slot_idx`.
+- Specialisation *of* a ref (const `value`, `allowed_values`, or a case that pins a
+  ref) is a constraint on a ref column, so it routes through the constraint-bearing
+  atom batch, never the non-ref residual — unchanged by lowering.
+
+## Implications for VAR-SPECIALIZE
+
+VAR-SPECIALIZE shrinks to:
+
+- A specialisation (e.g. "this child restricts `parent.field` to `{A, B}`")
+  propagates into the planner as a `FieldConstraints` on the parent column.
+- During DFS it conflicts with any lowered case whose ref-bound value falls outside
+  the allowed set — those cases are pruned at enumeration time, like any conflict.
+- Vanilla IPF rebalances surviving weights to restore case marginals (cases are
+  members), so the pruned mass is redistributed correctly with **no** VAR-SPECIALIZE-
+  specific IPF pass.
+
+Its remaining contribution: (a) the broader `FieldConstraints::Merge` table
+(value-specialises-generator, allowed-values-specialises-generator) and (b) the new
+`allowed_values:` YAML key.
+
+---
+
+## Symbol naming (terminology in the implementation)
+
+We **adopt** the vocabulary into code symbols — these are precise, established
+concepts and naming them directly keeps code and framework speaking one language.
+
+| Symbol | Kind | Role |
+|--------|------|------|
+| `lower_variant_unions` | planner fn (`plan.rs`) | The lowering pass — replaces a tagged-union node with its lowered cases. Unifies/extends `plan_variant_steps` so top-level and leaf-member unions lower through one path. |
+| `LoweredCase` | struct / member metadata | One case produced by lowering: its concrete schema, ratio `vᵢ`, owning exclusion group, discriminant index. |
+| `ExclusionGroup` | struct | Groups a union's lowered cases: `{ discriminant: String, cases: Vec<usize>, ratios: Vec<f64>, mandatory: bool }`. Consumed by the prior-factor computation. |
+| `DISCRIMINANT_PREFIX` / `_disc_<union>` | const / column | Sentinel discriminant column, mirroring `_slot_idx`. `discriminant_column(union_field) -> String`. |
+| `discriminant_constraint(idx)` | fn (`segment.rs`) | Builds the `FieldConstraints` pinning `_disc_<union>` to a case index — the `meet = ⊥` encoder. |
+| `categorical_prior_factor(group, chosen)` | fn (`segment.rs`) | The per-union categorical prior weight (`vᵢ`, or `1−Σvᵢ`). |
+| `illegal_prior_mass(groups) -> f64` | fn | `M₀` closed form for the guard. |
+| `conservative_ipf_rate(...) -> f64`, `estimate_ipf_cap(m0, r, n, tol) -> usize` | fns | The `t*` guard and warning. |
+
+(Final names subject to the implementation plan, but the **terms** — discriminant,
+tag, lowering, lowered case, exclusion group, tagged union — are fixed.)
+
+## Documentation plan (adoption + celebrating the insight)
+
+Part of implementation, not optional:
+
+- **New concepts page** `docs/src/content/docs/concepts/variant-lowering.mdx`,
+  titled "Variants as tagged unions". It explains, for users: a `type: variant`
+  field *is* a tagged union; the planner *lowers* it into cases; the *discriminant*
+  records the active case and makes the cases mutually exclusive (`meet = ⊥`); and
+  therefore variants ride the same Bernoulli-factoring machinery as everything else
+  — no special path. Include the leak → categorical-prior insight as a short "why
+  this is correct" aside. Add it to the Concepts sidebar in `astro.config.mjs`.
+- **CLAUDE.md** — add to the glossary: *tagged union, lowering, lowered case,
+  discriminant (tag), exclusion group, illegal mass*. Update the execution-pipeline
+  description (lowering as a named stage feeding factoring), the module map
+  (`lower_variant_unions`), and the sentinel list (`_disc_<union>`). Remove the
+  variant-handling "two paths" framing.
+- **README** — one line in the feature summary: variants are tagged unions lowered
+  into the lattice.
+- **`src/docgen.rs` / `reference/yaml-schema.mdx`** — no new YAML (the `variants:`
+  stanza is unchanged); note that the model is now described as a tagged union.
+- **`reference/testing.mdx`** — document the new invariants (case membership &
+  exclusivity; mandatory-union no-orphan).
+
+## API ripple
+
+`plan_segments`' input gains the lowered cases plus their exclusion-group
+annotation (rather than the bare `Vec<LowerCoverMember>` it would otherwise see for
+a union member). Most callers have no unions and pass the trivial grouping. Ripples
+through `plan.rs::build_lower_cover_groups`, the segment tests, and fixture
+helpers — scope fully in the implementation plan.
+
+## Resolved decisions
+
+1. **Exclusion-group representation & threading.** *Resolved.* Flat
+   `Vec<LowerCoverMember>` + side `Vec<ExclusionGroup>` indexing into it, **one
+   group per union field** (not per case-combination); cases stay members; the DFS
+   is group-aware and branches categorically over a group. See §The synthesis.
+2. **Output sharing across cases.** *Resolved.* Leaf-member cases share one Arrow
+   schema (VAR-2 already requires this) and are generated inside the parent's
+   segment loop, so they **accumulate to the single original-member output path**,
+   with the segment's discriminant selecting which case schema to generate. No
+   `CombineVariantBatches`-style step is needed for leaf-member cases; the top-level
+   path is unchanged.
+3. **Discriminant lifecycle.** *Resolved.* `_disc_<union>` is a synthetic parent
+   sentinel handled exactly like `_slot_idx`: each case carries
+   `ref: parent._disc_<union>, value: <idx>` (already extracted by
+   `lower_cover_field_constraints`, so conflict pruning works with no new rule);
+   skipped/stripped on emit via `filter_hidden_columns`; synthetic ⇒ never
+   import-tainted.
+4. **Cardinality per case.** *Resolved.* The case is a node-level property, so for
+   a member with `cardinality: {min,max}` it is chosen **once per slot and
+   replicated** across the M_n replicas — matching today's non-ref-under-cardinality
+   behaviour. No per-row variant draw.
+5. **Pre-flight guard.** *Resolved (design); constants at implementation.* Compute
+   `M₀` closed-form and a conservative `r`; warn when `t*` exceeds the cap. Set the
+   cap/tolerance constants to give **as much slack as possible without letting the
+   IPF iteration count dominate compute** — tuned against the Q-prototype sweep
+   (below). Since the synthesis makes `M₀ = 0` for unions, this is a secondary net.
+
+## Open questions
+
+1. **Variants on linked content lists.** A *witness-source* member (a linked
+   content list's item fields) carrying a tagged union interacts with the
+   `n_eligible_slots` boundary and `_staging_refs` dedup — unresolved and rare.
+   **Decision: reject at validation in v1** (`lib/validate.rs`), and carry the
+   feature forward as a stub spec, [`VAR-LINKED-CONTENT`](VAR-LINKED-CONTENT.md).
+*(IPF convergence stress was the second open question; it is now resolved by the
+prototype below.)*
+
+## Q-prototype: the IPF convergence stress test — **DONE (passing)**
+
+Implemented as `#[cfg(test)] mod var_expand_prototype` in `lib/segment.rs`, run against
+the real `ipf_rescale_sparse`. Results:
+
+- **`M₀ = 0` confirmed and preserved.** Across stacked unions (1–4) × arities (2/3/5) ×
+  ratio skew (incl. min vᵢ = 0.01), the categorical prior starts at zero illegal mass and
+  the real `ipf_rescale_sparse` (an I-projection) keeps it there; all case marginals
+  restored to `vᵢ`.
+- **Interior IPF is fast.** 3 mandatory ternary unions + 2 cross-union (specialisation-style)
+  conflicts + 2 plain members converged in **14 sweeps** — far under the 200-iter cap.
+- **The leak is real (justifying the categorical factor).** The naive product-Bernoulli
+  prior still holds **5.45% illegal mass after 4 sweeps** (~54 bad rows / 1000), while the
+  categorical prior is at 0 from sweep 0.
+
+Two assertions, no lowering plumbing required (runs today against `ipf_rescale_sparse`):
+
+- **Correctness (real function).** For each config, hand-build the feasible segments
+  with **categorical-factor** priors + per-case marginal targets, feed the real
+  `ipf_rescale_sparse`, and assert: every illegal cell (a mandatory union with no
+  case) stays weight 0; per-case marginals hit `r_M·vᵢ`; plain-member marginals hit
+  their ratios.
+- **Cost (instrumented mirror).** A faithful mirror of the IPF update loop logs
+  `max|marginal − target|` per sweep; swept over `unions K ∈ {1..4}`,
+  `cases/union k ∈ {2,3,5}`, ratio profiles `{uniform, mild skew, extreme min vᵢ=0.01}`,
+  ± plain members, `N=1000`. Pass: max sweeps-to-tolerance stays well under a sane
+  cap; the extreme-skew configs are where the count climbs (confirming the
+  pre-flight guard fires in the right place, and calibrating the Q-resolved-5 cap).
+
+## Alternatives considered (the endpoints this sits between)
+
+**Pure categorical enum (`LowerCoverEntry::VariantSet`).** Treat the union as one
+DFS entry branching N+1 ways; structural exactness, no leak. Rejected as the sole
+mechanism because it requires a new planner primitive *and* a per-variant extension
+to `ipf_rescale_sparse` (cases aren't members, so their marginals must be added by
+hand). The synthesis gets the same structural exactness with vanilla IPF and no new
+enum, because cases *are* members.
+
+**Pure Bernoulli discriminant (lowering without the categorical factor).** Correct
+membership via the discriminant, but the independent prior leaks illegal mass on
+mandatory unions → the soft-enforcement / iteration-cap risk above. The categorical
+prior factor is the cheap fix that removes it at the source.
+
+**Naive pre-expansion (no discriminant).** Lower cases into independent members with
+nothing tying them. Rejected on **correctness**: union exclusivity is generally not
+a parent-column conflict, so DFS emits illegal `{caseᵢ, caseⱼ}` segments. The
+discriminant is precisely the missing fact.
+
+**Status quo (VAR-2 deferred path).** Keep leaf-member variants packed and split at
+generation time. Rejected: the planner sees an incomplete lattice and `(case,
+segment)` counts are proportional, not IPF-exact (the VAR-SPECIALIZE gap).
+
+## Next steps before implementation begins
+
+1. ~~Resolve exclusion-group representation~~ — done (§Resolved decisions 1).
+2. ~~Run the Q-prototype~~ — done & passing (§Q-prototype): `M₀ = 0` preserved,
+   interior IPF ≤14 sweeps, naive leak demonstrated. Guard cap can be calibrated
+   from the sweep when the guard is implemented.
+3. ~~Draft a companion implementation plan~~ — done:
+   [`VAR-EXPAND-impl.md`](VAR-EXPAND-impl.md).
+4. The `variant-lowering.mdx` concepts page and the `VAR-LINKED-CONTENT` validation
+   gate are now sequenced **inside** the implementation plan (PR 4 and PR 1
+   respectively) — no longer standalone pre-work.
+
+Implementation can begin against `VAR-EXPAND-impl.md` PR 1.
+
+## Files (preliminary, subject to design)
+
+| File | Expected change |
+|------|----------------|
+| `lib/plan.rs` | `lower_variant_unions` lowering pass; unify with `plan_variant_steps`; emit `LoweredCase`s + `ExclusionGroup`s into lower-cover groups |
+| `lib/segment.rs` | `discriminant_constraint`, `categorical_prior_factor`, exclusion-group-aware prior in `enumerate_segments_dfs`; `illegal_prior_mass` / `estimate_ipf_cap` guard; `ipf_rescale_sparse` **unchanged** |
+| `lib/executor.rs` | Discriminant sentinel handling in segment-atom build + `filter_hidden_columns`; delete variant logic in `generate_member_nonref_fields` |
+| `lib/models.rs` | `LoweredCase` / `ExclusionGroup` types; discriminant column helper |
+| `lib/validate.rs` | Reject `type: variant` on linked content list item fields (VAR-LINKED-CONTENT gate) |
+| `docs/.../concepts/variant-lowering.mdx` | New page (per §Documentation plan); sidebar entry |
+| `CLAUDE.md`, `README.md`, `reference/testing.mdx`, `src/docgen.rs` | Terminology adoption (per §Documentation plan) |
+| `specs/VAR-SPECIALIZE.md` | Already re-scoped to the merge-table change and `allowed_values:` |
+
+## Dependencies
+
+| Spec | Reason |
+|------|--------|
+| REFRAME-1 (complete) | The lattice model; lowering is REFRAME §Step 2 made literal |
+| SEG-1 (complete) | Branch-and-bound DFS + IPF that lowering feeds |
+| VAR-2 (complete) | The deferred path being replaced |
+| SEG-ATOM-1 (complete) | The segment-atom pipeline lowered cases feed into |

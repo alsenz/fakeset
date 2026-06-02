@@ -1,0 +1,11 @@
+name: cities
+format: jsonl
+output_file: cities
+rows: 20
+data:
+  - name: city_id
+    type: string
+    generator: uuid
+  - name: city_name
+    type: string
+    generator: word

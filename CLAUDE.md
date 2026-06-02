@@ -9,7 +9,7 @@ A declarative, DAG-structured synthetic dataset generator. Users write YAML sche
 ```bash
 cargo build                  # debug
 cargo build --release        # release binary → target/release/fakeset
-cargo test                   # all unit + integration tests (~194 tests)
+cargo test                   # all unit + integration tests (~234 tests)
 cargo check                  # fast type-check without linking
 ```
 
@@ -30,7 +30,7 @@ distributional correctness using polars and scipy:
 # install Python deps (one-time)
 pip install pytest polars scipy
 
-# run all statistical tests (~40 tests)
+# run all statistical tests (~74 tests)
 pytest
 ```
 
@@ -56,7 +56,7 @@ cargo install rust-code-analysis-cli  # one-time
 rust-code-analysis-cli --metrics -p lib/ -l rust
 ```
 
-The functions with historically high cognitive/cyclomatic complexity are `plan_segments` (`segment.rs`), `execute` and `grow_parent_from_children` (`executor.rs`), and `build_plan` (`plan.rs`). Use the output to identify where decomposition would have the highest impact — treat metrics as a guide, not a hard threshold.
+The functions with historically high cognitive/cyclomatic complexity are `plan_segments` (`segment.rs`), `execute` and `execute_lower_cover_group_core` (`executor.rs`), and `build_plan` (`plan.rs`). Use the output to identify where decomposition would have the highest impact — treat metrics as a guide, not a hard threshold.
 
 ## Documentation site
 
@@ -145,9 +145,9 @@ The algorithm has two symmetric phases:
 
 1. **Push down** — field definitions, type constraints, and ref bindings propagate *down* the lattice toward atoms. For linked datasets, the staging node pre-generates scalar fields before the witness (atom) is generated.
 
-2. **Accumulate up** — generated atom values propagate *up* the lattice toward parents and linked nodes. For include relationships this is `grow_parent_from_children` (DataFusion LEFT JOIN on `_row_idx`). For collect bindings this is `AccumulateToLinked` — the symmetric operation that accumulates atom-level values back into linked-dataset fields.
+2. **Accumulate up** — generated atom values propagate *up* the lattice toward parents and linked nodes. For include relationships this is the segment-atom pipeline in `execute_lower_cover_group_core`: `generate_segment_atom_batch` materialises shared ref columns once per segment, then `project_parent_columns_from_atom` and `project_member_columns` fan those columns to the parent and each member. For collect bindings this is `AccumulateToLinked` — the symmetric operation that accumulates atom-level values back into linked-dataset fields.
 
-The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so atoms are always generated before their parents. When a parent field matches a child's field (by ref-wiring or same name), the child's column is *inherited* directly; fields with no child source are generated fresh. This logic lives in `executor.rs::grow_parent_from_children`.
+The DAG is a hierarchy of ever-narrowing constraints, sorted topologically so atoms are always generated before their parents. Within each segment, fields that two or more members ref are deduplicated into a single atom column; the parent and every member that refs that field receive the same generated values, guaranteeing referential integrity structurally. Parent fields with no member-ref source are generated fresh by `project_parent_columns_from_atom`.
 
 *Theoretical note:* all generator invocations could conceptually happen in parallel — the algorithm's serialisation is purely a scheduling constraint imposed by the inherited-field lattice. The interesting work is resolving which pre-solved values propagate to which nodes and in what order.
 
@@ -210,7 +210,7 @@ load YAML files
 | `plan.rs` | `build_plan` — row counts, lower cover groups, ring assignment, inherited-field wiring, collect targets → `ExecutionPlan` / `ExecutionStep` |
 | `schema.rs` | `schema_to_arrow`, `field_to_arrow`, `parquet_datatype_to_arrow` — Arrow schema conversion |
 | `generator.rs` | `generate_column`, `sample_count` — per-field fake data generation via fake-rs; handles `type: object` by recursively generating sub-fields into a `StructArray`. `fake_date`/`fake_datetime` handle `after`/`before` bounds; `fake_string` threads `args` to range-bearing generators (`Sentence`, `Paragraph`, `Password`, `Words`, `Sentences`, `Paragraphs`, `Geohash`, `NumberWithFormat`); `locale_fake_join!` macro handles generators that return `Vec<String>`. |
-| `executor.rs` | `execute` — interprets the plan; staging node generation, witness generation, assembly, `grow_parent_from_children`, `AccumulateToLinked`. Import branch: loads `ImportIndex` on first access, applies ring filter, appends synthetic fields. All DataFusion and Arrow batch operations. |
+| `executor.rs` | `execute` — interprets the plan; staging node generation, witness generation, assembly, segment-atom pipeline (`generate_segment_atom_batch` + `project_parent_columns_from_atom` + `project_member_columns`), `AccumulateToLinked`. Import branch: loads `ImportIndex` on first access, applies ring filter, appends synthetic fields. All DataFusion and Arrow batch operations. |
 
 ## DataFusion usage
 
@@ -219,7 +219,8 @@ DataFusion is used for query-engine operations, not as a storage layer:
 - **`union_and_shuffle`** — `ctx.read_batch(combined).sort([random()])` for reproducibility-agnostic shuffles.
 - **`evaluate_expressions`** — CTE chain in SQL evaluates expression fields in YAML order. Fresh `SessionContext::new()` per call; table registered as `"src"` so there is no registration lifecycle to manage.
 - **`filter_hidden_columns`** — `ctx.read_batch(batch).select(visible_cols)` to project out hidden fields.
-- **`grow_parent_from_children`** — LEFT JOIN on `_row_idx` expressing parent-field inheritance: skeleton (rule-3 fresh columns) joined with indexed child batches; the SELECT clause names exactly which source each parent field comes from. Takes an explicit `n: usize` (= `seg.rows`) so the skeleton is always the planned size — a precomputed child batch that is shorter than `seg.rows` (due to stochastic rounding in its own segment plan) is handled gracefully by the LEFT JOIN producing fresh values for unmatched skeleton rows.
+
+The segment-atom pipeline that replaced `grow_parent_from_children` is pure Arrow column selection plus `generate_column`, with no DataFusion involvement: `generate_segment_atom_batch` materialises shared ref columns once (resolving import-taint → precomputed-member → fresh per column), then `project_parent_columns_from_atom` and `project_member_columns` stitch the parent and member batches. `pad_or_generate_tail` absorbs stochastic-rounding mismatch when a precomputed member batch is shorter than `seg.rows`.
 
 Each function creates its own `SessionContext::new()` — there is no shared context threaded through the executor.
 
@@ -231,7 +232,6 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 - **`output/` is gitignored** — generated data never lands in version control.
 - **Doc comments welcome** — `///` comments documenting public functions, structs, and fields are encouraged. Inline comments should only explain non-obvious *why* (hidden constraints, invariants, workarounds) — not *what* the code does, which well-named identifiers already convey.
 - **No `sql_safe_name`** — DataFusion column names are double-quoted in SQL strings (`"field_name"`), so arbitrary field names are safe without sanitisation.
-- **`_row_idx` sentinel** — a `UInt32` 0..n column prepended to batches for positional JOIN keying inside `grow_parent_from_children`; stripped from all outputs.
 - **`_slot_idx` sentinel** — a `UInt32` staging-node slot index present in all witness and child batches — which source slot each atom row belongs to. Used by `AssembleFromWitness` to fold witness rows into per-slot lists. Also used in top-level cardinality batches to record which parent-row slot each child row belongs to. Retained in `computed` for grandchild access; stripped from emitted output by `filter_hidden_columns`.
 - **`_staging_refs` sentinel** — a `List<UInt32>` column in each witness batch. Entry i lists all staging-slot indices that drew witness row i (the many-to-one pairing from source slots to linked rows). Built in `execute_witness`; consumed and dropped by `AssembleFromWitness` during list folding.
 - **`_linked_idx` sentinel** — a `UInt32` column in witness batches recording which linked-dataset row was drawn (index into the eligible linked batch). Persisted for `AccumulateToLinked` collect bindings.
@@ -245,8 +245,6 @@ Anything expressible as a SQL string can also be constructed programmatically vi
 
 **Mixed-type variant fields** — `type: variant` fields whose choices span more than one type (e.g. one choice is a string, another is a number) are not currently rejected at validation time. Instead, `expand_field_variants` produces an untyped stub (`field_type = None`), which causes a runtime panic when `schema_to_arrow` or `generate_column_raw` hits the unresolved type. Workaround: ensure all choices in a `type: variant` field share the same type. See `specs/VAR-1.md` for the planned fix and the longer-term `type: any` encoding design.
 
-**BUG-REF (first-child-wins) — overlap segment ref integrity** — In overlap segments where two lower-cover members both appear, `grow_parent_from_children` inherits shared fields (e.g. `contract_id`) from whichever child is first in `child_batches` (HashMap iteration order). The other child's rows were generated with different values for that field and will not match the parent. Affects `claims.contract_id` / `claims.customer_id` in the `{premiums ∩ claims}` overlap segment (~34% of contract rows). Non-deterministic. Documented by `_BUG_REF` xfail markers in `tests/statistical/test_insurance.py`.
-
 **Generator-plus-value constraint should specialise, not conflict** — A child field with `ref: parent.field, value: "constant"` currently errors in `resolve_refs` if the parent field declares a `generator:`. The intended semantics are that `value:` is a specialisation overriding the generator, but the constraint merge treats them as conflicting. Workaround: omit `generator:` from any parent field that children will specialise with a constant `value:`. See `rewrite.rs::resolve_refs` / `constraints.rs::Merge` for the fix location.
 
 ## Feature specs
@@ -259,15 +257,17 @@ Full design specs and implementation plans live in `specs/`:
 | `specs/done/MULT-2a.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-2.md` | **Complete** — implemented and merged |
 | `specs/done/MULT-3.md` | **Complete** — implemented and merged |
-| `specs/done/REFRAME-1.md` | **Partially complete** — planning stages correct; segment atom generation in executor not implemented per spec (see SEG-ATOM-1) |
+| `specs/done/REFRAME-1.md` | **Complete** — planning stages and segment-atom execution (via SEG-ATOM-1) both implemented per spec |
 | `specs/VAR-1.md` | **Planned** — Phase 1 (validation gate); Phase 2 (`type: any` encoding) pending design sign-off |
 | `specs/done/DQ-1.md` | **Complete** — post-write DQ layer implemented: nulls, defaults, corruptions (char deletion/insertion/truncation/encoding, noise, day shift), duplication, row deletion; field-level overrides; multiple output files per dataset |
 | *(no spec file)* ARGS-1 | **Complete** — `args` map on `Field` for generator-specific parameters; `after`/`before` top-level date bounds (parallel to `range`); new generators `words`, `sentences`, `paragraphs`, `geohash`, `number_with_format`; boolean `ratio` via `args` |
 | `specs/done/SEG-1.md` | **Complete** — branch-and-bound DFS replaces dense 2^N weight pass; N-based cap removed; `MAX_FEASIBLE_SEGMENTS` K-based cap; O(K·N) memory |
-| `specs/done/VAR-2.md` | **Complete** — two-level variant factoring; `generate_member_batch` applies Level 2 variant sub-distribution in the lower cover segment loop; BUG-VAR resolved |
+| `specs/done/VAR-2.md` | **Complete** — two-level variant factoring; `generate_member_nonref_fields` (formerly `generate_member_batch` pre-SEG-ATOM-1) applies Level 2 variant sub-distribution in the lower cover segment loop; BUG-VAR resolved |
 | `specs/done/IMPORT.md` | **Complete** — `import:` stanza on `SyntheticDataset`; hash-ring partitioning (`assign_ring_slices`); `load_import_headers` / `load_import_index` / `filter_ring`; import taint validation; `--seed.ring` CLI flag |
-| `specs/VAR-SPECIALIZE.md` | **Future** — child specialisation of parent variant fields; Level 2 IPF upgrade; needs design sign-off on YAML syntax and `FieldConstraints` set-value encoding; depends on VAR-2 |
-| `specs/SEG-ATOM-1.md` | **Planned** — correct segment atom generation per REFRAME. Unified shared-ref atom batch per segment with column source priority (import → precomputed → fresh); non-ref columns generated per-member via the variant-aware path. Replaces `grow_parent_from_children` / `resolve_inherited_source_columns` / `generate_segment_member_batches` / `generate_member_expanded_batch`; refactors `generate_member_batch` to non-ref-only. Root-cause fix for BUG-REF; removes `_BUG_REF` xfail markers |
+| `specs/VAR-SPECIALIZE.md` | **Proposed (design exploration)** — child specialisation of parent fields, covering both variant-subset restriction (`allowed_values:`) and generator-domain specialisation (constant `value:` overrides parent `generator:`). Depends on VAR-EXPAND for variant-aware planning; introduces a broader `FieldConstraints::Merge` table treating generators as open domains a child can narrow. Resolves the "Generator-plus-value constraint should specialise, not conflict" known limitation |
+| `specs/done/SEG-ATOM-1.md` | **Complete** — unified shared-ref atom batch per segment with column source priority (import → precomputed → fresh); non-ref columns generated per-member via the variant-aware path. Replaced `grow_parent_from_children` / `resolve_inherited_source_columns` / `generate_segment_member_batches` / `generate_member_expanded_batch`; refactored `generate_member_batch` to non-ref-only. Root-cause fix for BUG-REF; `_BUG_REF` xfail markers removed |
+| `specs/VAR-EXPAND.md` | **Proposed — approach chosen (tagged-union lowering)** — model a `type: variant` field as a **tagged union**; the planner **lowers** it into its **cases** (REFRAME §Step 2 made literal) and attaches a **discriminant** sentinel (`_disc_<union>`) that makes the cases' pairwise meet `⊥`, so existing Bernoulli factoring enforces "exactly one case per row" for free. An **exclusion group** makes each union one categorical factor in the segment prior, zeroing the "no case chosen" **illegal mass** (`M₀`) at the source — so IPF stays vanilla (cases are members → per-case marginals restored for free) and no boundary-convergence cap is needed. Closes the same REFRAME-misalignment shape as BUG-REF; subsumes VAR-SPECIALIZE's planner concerns; adopts the discriminant/lowering/tagged-union vocabulary into the framework. Q-prototype **validated (passing)** in `lib/segment.rs` (`mod var_expand_prototype`): categorical prior holds `M₀=0` through the real `ipf_rescale_sparse`, interior IPF converges in ≤14 sweeps on stacked mandatory unions, naive prior demonstrably leaks (5.45% after 4 sweeps). Implementation plan pending |
+| `specs/VAR-LINKED-CONTENT.md` | **Future — stub** — variants on **linked content list** item fields (a witness-source member carrying a tagged union); deferred out of VAR-EXPAND (Q4) because of `n_eligible_slots` / `_staging_refs` interactions. Rejected at validation in v1 until designed |
 
 ## Planned next steps
 

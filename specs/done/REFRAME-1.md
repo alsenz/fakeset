@@ -466,16 +466,39 @@ their assembly nodes emit — all before the outer witness node's seed edge is s
 ### Phase 2 — Accumulate upward (child-first, parent-last)
 
 For each non-atom node in topological order:
-- **Inherited-field accumulation**: LEFT JOIN on `_row_idx` from each child batch. Fields
-  present in a child are inherited; remaining fields are generated fresh.
-- **List assembly**: for assembly nodes, witness rows are grouped by `_staging_refs` entry
-  to reconstruct per-source-slot pairings, then folded into list columns.
-- **Expression evaluation**: after all inherited fields are present. Evaluation order follows YAML field declaration order, as established during planning's push-down phase.
+- **Segment-atom pipeline** (the realisation of Phase 1's "atoms generate as a unit"
+  mandate for include relationships, implemented by SEG-ATOM-1): for each Bernoulli
+  segment of the parent, every parent column that one or more members ref is
+  materialised once into a unified **atom batch**, then the parent and each member
+  project their copy of that column from it. Per-column source priority within the
+  atom batch is **import-taint → precomputed-member → fresh generate** under the
+  segment's merged field constraints. Parent fields with no member-ref source are
+  generated fresh by `project_parent_columns_from_atom`. Member-specific non-ref
+  fields are generated per-member via the variant-aware path
+  (`generate_member_nonref_fields`). Because every consumer of a shared parent column
+  reads the same atom column, referential integrity for ref fields is structural and
+  cannot be broken by HashMap iteration order, ordering of children in a list, or any
+  other downstream choice.
+- **List assembly**: for assembly nodes, witness rows are grouped by `_staging_refs`
+  entry to reconstruct per-source-slot pairings, then folded into list columns.
+- **Expression evaluation**: after all atom and inherited columns are present.
+  Evaluation order follows YAML field declaration order, as established during
+  planning's push-down phase.
 - **Filter hidden fields**: strip `hidden: true` fields before emitting.
 - **Emit**: write to output file (CSV/Parquet/JSONL/JSON).
 
 Within a component, all atoms are generated before any accumulation. A component completes
 both phases before any downstream component starts.
+
+> **Historical note.** Earlier drafts of this spec described Phase 2 as a DataFusion
+> LEFT JOIN over per-member batches keyed by `_row_idx`. That description was a
+> carry-over from the pre-REFRAME implementation: it generated each member
+> independently and then resolved shared parent fields via first-child-wins HashMap
+> iteration. The carry-over silently broke referential integrity in joint segments
+> (BUG-REF). SEG-ATOM-1 replaced this with the unified atom batch above and is the
+> canonical Phase 2 from this point onward. If you find yourself reaching for a
+> per-member-then-join shape, that is the pattern to avoid — every shared parent
+> column should be generated once into the atom batch and projected out from there.
 
 ## Glossary
 

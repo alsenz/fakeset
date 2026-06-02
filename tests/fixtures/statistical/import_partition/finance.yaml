@@ -9,5 +9,5 @@ data:
   - name: stock_id
     ref: stocks.stock_id
   - name: bucket
-    type: string
+    ref: stocks.bucket
     value: "finance"

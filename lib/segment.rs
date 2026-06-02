@@ -735,3 +735,377 @@ mod ring_tests {
         assign_ring_slices(&mut segs, &parent(0.0, 1.0)); // must not panic
     }
 }
+
+/// Q-prototype for VAR-EXPAND (tagged-union lowering). See `specs/VAR-EXPAND.md`
+/// §Q-prototype. Validates, ahead of any lowering implementation, the two load-bearing
+/// claims of the chosen synthesis:
+///
+///   1. The **categorical prior factor** gives a mandatory union's "no case chosen"
+///      cells prior weight 0 (`M₀ = 0`), and the real `ipf_rescale_sparse` — being an
+///      I-projection — preserves that structural zero. So no row can ever land in an
+///      illegal "took no case of a mandatory union" segment.
+///   2. With cases lowered to ordinary members, **vanilla per-member IPF** restores
+///      every case marginal `vᵢ` (no per-variant extension), and interior IPF converges
+///      fast even on stacked mandatory unions with cross-union (specialisation-style)
+///      conflicts.
+///
+/// It also demonstrates *why* the categorical factor is needed: the naive
+/// product-Bernoulli prior leaves real **illegal mass** that only decays asymptotically,
+/// so a low iteration cap leaks bad rows.
+///
+/// No lowering plumbing is required — feasible sets and priors are hand-built and fed to
+/// the production `ipf_rescale_sparse`; an instrumented mirror of its loop measures
+/// per-sweep convergence.
+#[cfg(test)]
+mod var_expand_prototype {
+    use super::{LowerCoverMember, ipf_rescale_sparse};
+    use crate::constraints::FieldConstraints;
+    use crate::models::{Format, SyntheticDataset};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // Mirror the production loop's constants so the instrumented study matches.
+    const TOL: f64 = 1e-9;
+    const EPS: f64 = 1e-12;
+
+    /// A synthetic lowering configuration over a single parent's lower cover.
+    struct Config {
+        /// `unions[u]` is the case-ratio vector of mandatory union `u` (entries sum to 1.0,
+        /// so the "no case" categorical factor `1 − Σvᵢ` is 0 — the union is mandatory).
+        unions: Vec<Vec<f64>>,
+        /// Ratios of plain (non-union) lower-cover members.
+        plain: Vec<f64>,
+        /// Cross-union conflicts: `((uₐ, caseₐ), (u_b, case_b))` cannot co-occur — the shape
+        /// VAR-SPECIALIZE pruning produces. Drives genuine (non-trivial) IPF work.
+        conflicts: Vec<((usize, usize), (usize, usize))>,
+    }
+
+    /// Flat member layout: union 0's cases, union 1's cases, …, then plain members.
+    /// Member index == bit index in a segment mask (matching `ipf_rescale_sparse`).
+    struct Layout {
+        offsets: Vec<usize>,
+        plain_off: usize,
+        total: usize,
+    }
+
+    fn layout(cfg: &Config) -> Layout {
+        let mut offsets = Vec::new();
+        let mut acc = 0;
+        for u in &cfg.unions {
+            offsets.push(acc);
+            acc += u.len();
+        }
+        Layout { offsets, plain_off: acc, total: acc + cfg.plain.len() }
+    }
+
+    fn case_bit(l: &Layout, u: usize, c: usize) -> usize {
+        l.offsets[u] + c
+    }
+    fn plain_bit(l: &Layout, p: usize) -> usize {
+        l.plain_off + p
+    }
+    fn bit(mask: usize, b: usize) -> bool {
+        mask & (1 << b) != 0
+    }
+
+    /// A minimal `LowerCoverMember`: `ipf_rescale_sparse` only reads `.ratio` (and uses the
+    /// member's position as its bit), so the rest is dummy.
+    fn member(idx: usize, ratio: f64) -> LowerCoverMember {
+        LowerCoverMember {
+            path: PathBuf::from(format!("m{idx}")),
+            dataset: SyntheticDataset {
+                name: format!("m{idx}"),
+                format: Format::Parquet,
+                locale: None,
+                rows: None,
+                output: None,
+                outputs: vec![],
+                include: None,
+                import: None,
+                links: vec![],
+                data: vec![],
+                variants: vec![],
+            },
+            ratio,
+            cardinality: None,
+            reference: "p".to_string(),
+            is_witness_source: false,
+        }
+    }
+
+    fn members(cfg: &Config) -> Vec<LowerCoverMember> {
+        let mut v = Vec::new();
+        for u in &cfg.unions {
+            for &r in u {
+                v.push(member(v.len(), r));
+            }
+        }
+        for &r in &cfg.plain {
+            v.push(member(v.len(), r));
+        }
+        v
+    }
+
+    /// Enumerate the segments the discriminant leaves feasible (≤ 1 case per union, plus the
+    /// declared cross-conflicts), and assign **both** prior weightings to each:
+    ///
+    ///   - `cat`   — the synthesis's categorical factor (`vᵢ` for the chosen case,
+    ///     `1 − Σvᵢ = 0` for a mandatory union with no case);
+    ///   - `naive` — the product-Bernoulli prior (each case an independent trial).
+    ///
+    /// Returns the `feasible` map (keys only matter to IPF), the two weight maps, and the list
+    /// of *illegal* masks (some mandatory union took no case).
+    #[allow(clippy::type_complexity)]
+    fn enumerate(
+        cfg: &Config,
+        l: &Layout,
+    ) -> (
+        HashMap<usize, HashMap<String, FieldConstraints>>,
+        HashMap<usize, f64>,
+        HashMap<usize, f64>,
+        Vec<usize>,
+    ) {
+        let mut feasible = HashMap::new();
+        let mut cat = HashMap::new();
+        let mut naive = HashMap::new();
+        let mut illegal = Vec::new();
+
+        for mask in 0..(1usize << l.total) {
+            // Discriminant: at most one case per union.
+            let multi_case = cfg
+                .unions
+                .iter()
+                .enumerate()
+                .any(|(u, cases)| (0..cases.len()).filter(|&c| bit(mask, case_bit(l, u, c))).count() > 1);
+            if multi_case {
+                continue;
+            }
+            // Cross-union (specialisation) conflicts.
+            let conflicts = cfg
+                .conflicts
+                .iter()
+                .any(|&((ua, ca), (ub, cb))| bit(mask, case_bit(l, ua, ca)) && bit(mask, case_bit(l, ub, cb)));
+            if conflicts {
+                continue;
+            }
+
+            let mut w_cat = 1.0;
+            let mut w_naive = 1.0;
+            let mut is_illegal = false;
+            for (u, cases) in cfg.unions.iter().enumerate() {
+                match (0..cases.len()).find(|&c| bit(mask, case_bit(l, u, c))) {
+                    Some(c) => w_cat *= cases[c],
+                    None => {
+                        w_cat *= 1.0 - cases.iter().sum::<f64>(); // 0 for a mandatory union
+                        is_illegal = true;
+                    }
+                }
+                for (c, &v) in cases.iter().enumerate() {
+                    w_naive *= if bit(mask, case_bit(l, u, c)) { v } else { 1.0 - v };
+                }
+            }
+            for (p, &r) in cfg.plain.iter().enumerate() {
+                let s = bit(mask, plain_bit(l, p));
+                let f = if s { r } else { 1.0 - r };
+                w_cat *= f;
+                w_naive *= f;
+            }
+
+            feasible.insert(mask, HashMap::new());
+            cat.insert(mask, w_cat);
+            naive.insert(mask, w_naive);
+            if is_illegal {
+                illegal.push(mask);
+            }
+        }
+        (feasible, cat, naive, illegal)
+    }
+
+    fn normalize(w: &mut HashMap<usize, f64>) {
+        let s: f64 = w.values().sum();
+        if s > 0.0 {
+            for v in w.values_mut() {
+                *v /= s;
+            }
+        }
+    }
+
+    fn illegal_mass(w: &HashMap<usize, f64>, illegal: &[usize]) -> f64 {
+        illegal.iter().map(|m| w[m]).sum()
+    }
+
+    /// Marginal mass of member `i` (sum of weights over masks where bit `i` is set).
+    fn marginal(w: &HashMap<usize, f64>, i: usize) -> f64 {
+        let mut s = 0.0;
+        for (&m, &x) in w.iter() {
+            if bit(m, i) {
+                s += x;
+            }
+        }
+        s
+    }
+
+    /// Faithful mirror of `ipf_rescale_sparse`'s loop, returning the sweep count at which it
+    /// converged (== `max_iter` if it did not). Used to *measure* convergence and to run a
+    /// deliberately low cap for the leak demonstration. Correctness is asserted against the
+    /// real `ipf_rescale_sparse` elsewhere.
+    fn ipf_mirror(
+        weights: &mut HashMap<usize, f64>,
+        members: &[LowerCoverMember],
+        feasible: &HashMap<usize, HashMap<String, FieldConstraints>>,
+        max_iter: usize,
+    ) -> usize {
+        for iter in 0..max_iter {
+            let mut converged = true;
+            for (i, m) in members.iter().enumerate() {
+                let target = m.ratio;
+                let mass_in: f64 = feasible.keys().filter(|&&k| bit(k, i)).map(|k| weights[k]).sum();
+                let mass_out: f64 = feasible.keys().filter(|&&k| !bit(k, i)).map(|k| weights[k]).sum();
+                if mass_in <= EPS || mass_out <= EPS {
+                    continue;
+                }
+                if (mass_in - target).abs() > TOL {
+                    converged = false;
+                    let si = target / mass_in;
+                    let so = (1.0 - target) / mass_out;
+                    for (&k, w) in weights.iter_mut() {
+                        *w *= if bit(k, i) { si } else { so };
+                    }
+                }
+            }
+            if converged {
+                return iter;
+            }
+        }
+        max_iter
+    }
+
+    fn uniform(k: usize) -> Vec<f64> {
+        vec![1.0 / k as f64; k]
+    }
+
+    /// Claim 1 + 2 (no conflicts): across stacked mandatory unions of varying arity and
+    /// ratio skew, the categorical prior has zero illegal mass, the *real*
+    /// `ipf_rescale_sparse` preserves it, and every case marginal equals `vᵢ`.
+    #[test]
+    fn categorical_prior_zeroes_illegal_mass_and_restores_marginals() {
+        let profiles: Vec<Vec<f64>> = vec![
+            uniform(2),
+            uniform(3),
+            uniform(5),
+            vec![0.9, 0.1],            // skewed
+            vec![0.97, 0.02, 0.01],    // extreme: min vᵢ = 0.01
+        ];
+
+        for n_unions in 1..=4 {
+            for prof in &profiles {
+                let cfg = Config {
+                    unions: vec![prof.clone(); n_unions],
+                    plain: vec![0.5], // one independent plain member
+                    conflicts: vec![],
+                };
+                let l = layout(&cfg);
+                let mem = members(&cfg);
+                let (feasible, mut cat, _naive, illegal) = enumerate(&cfg, &l);
+                normalize(&mut cat);
+
+                // M₀ = 0 by construction (mandatory "no case" factor is 0).
+                assert!(
+                    illegal_mass(&cat, &illegal) <= TOL,
+                    "categorical prior should start with zero illegal mass (n_unions={n_unions}, prof={prof:?})"
+                );
+
+                ipf_rescale_sparse(&mut cat, &mem, &feasible);
+
+                // I-projection preserves the structural zero.
+                assert!(
+                    illegal_mass(&cat, &illegal) <= 1e-9,
+                    "illegal mass must remain zero after IPF (n_unions={n_unions}, prof={prof:?})"
+                );
+                // Every member (case) marginal is restored to its declared ratio.
+                for (i, m) in mem.iter().enumerate() {
+                    assert!(
+                        (marginal(&cat, i) - m.ratio).abs() < 1e-6,
+                        "member {i} marginal {} != ratio {} (n_unions={n_unions}, prof={prof:?})",
+                        marginal(&cat, i),
+                        m.ratio
+                    );
+                }
+            }
+        }
+    }
+
+    /// Claim 2 (with conflicts): stacked mandatory unions plus cross-union
+    /// (specialisation-style) conflicts force genuine IPF redistribution. Assert the zero is
+    /// preserved, all marginals are restored, and interior IPF converges in few sweeps.
+    #[test]
+    fn stacked_mandatory_unions_with_conflicts_converge_fast() {
+        let cfg = Config {
+            unions: vec![uniform(3), uniform(3), uniform(3)],
+            plain: vec![0.5, 0.3],
+            // (u0,c0) excludes (u1,c0); (u1,c1) excludes (u2,c2).
+            conflicts: vec![((0, 0), (1, 0)), ((1, 1), (2, 2))],
+        };
+        let l = layout(&cfg);
+        let mem = members(&cfg);
+        let (feasible, mut cat, _naive, illegal) = enumerate(&cfg, &l);
+        normalize(&mut cat);
+
+        // Measure convergence with the mirror (real function asserts correctness below).
+        let mut probe = cat.clone();
+        let sweeps = ipf_mirror(&mut probe, &mem, &feasible, 200);
+        eprintln!("stacked-unions+conflicts: converged in {sweeps} sweeps");
+        assert!(sweeps < 50, "interior IPF should converge fast; took {sweeps} sweeps");
+
+        // Correctness via the production function.
+        ipf_rescale_sparse(&mut cat, &mem, &feasible);
+        assert!(illegal_mass(&cat, &illegal) <= 1e-9, "illegal mass must stay zero under conflicts");
+        for (i, m) in mem.iter().enumerate() {
+            assert!(
+                (marginal(&cat, i) - m.ratio).abs() < 1e-6,
+                "member {i} marginal {} != ratio {} after conflict redistribution",
+                marginal(&cat, i),
+                m.ratio
+            );
+        }
+    }
+
+    /// Why the categorical factor is needed: the naive product-Bernoulli prior puts real
+    /// illegal mass on "no case of a mandatory union", and under a low iteration cap it does
+    /// *not* vanish — i.e. it leaks bad rows. The categorical prior is at zero from sweep 0.
+    /// (Models the worked example: a mandatory 0.6/0.4 union + one 0.5 plain member.)
+    #[test]
+    fn naive_prior_leaks_under_low_iteration_cap() {
+        let cfg = Config {
+            unions: vec![vec![0.6, 0.4]],
+            plain: vec![0.5],
+            conflicts: vec![],
+        };
+        let l = layout(&cfg);
+        let mem = members(&cfg);
+        let (feasible, mut cat, mut naive, illegal) = enumerate(&cfg, &l);
+        normalize(&mut cat);
+        normalize(&mut naive);
+
+        // Naive prior starts with substantial illegal mass (≈ 0.24 here).
+        let naive_prior_leak = illegal_mass(&naive, &illegal);
+        assert!(naive_prior_leak > 0.2, "naive prior should leak (got {naive_prior_leak})");
+        assert!(illegal_mass(&cat, &illegal) <= TOL, "categorical prior must not leak");
+
+        // Under a deliberately low cap the naive leak does not clear.
+        let leaked = ipf_mirror(&mut naive, &mem, &feasible, 4);
+        eprintln!(
+            "naive leak after 4 sweeps: {:.4} (converged flag sweeps={leaked})",
+            illegal_mass(&naive, &illegal)
+        );
+        assert!(
+            illegal_mass(&naive, &illegal) > 1e-3,
+            "naive illegal mass should still be material under a low cap — this is the leak the \
+             categorical factor removes"
+        );
+
+        // Categorical prior stays exactly zero regardless of cap (I-projection).
+        let _ = ipf_mirror(&mut cat, &mem, &feasible, 4);
+        assert!(illegal_mass(&cat, &illegal) <= 1e-9, "categorical illegal mass stays zero");
+    }
+}

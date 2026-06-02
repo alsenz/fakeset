@@ -10,7 +10,6 @@
 //!
 //! | Column | Type | Produced by | Consumed by | Stripped by |
 //! |--------|------|-------------|-------------|-------------|
-//! | `_row_idx` | `UInt32` | `grow_parent_from_children` | same (JOIN key) | same (never leaves the function) |
 //! | `_slot_idx` | `UInt32` | `execute_lower_cover_group_core` (member batches) | `AssembleFromWitness` (fold into lists) | `strip_slot_idx` before member emit |
 //! | `_staging_refs` | `List<UInt32>` | `execute_witness` | `execute_assemble_from_witness` (fold) | stripped during assembly |
 //! | `_linked_idx` | `UInt32` | `inject_linked_idx` (junction) / `execute_witness` | `execute_accumulate_to_linked` | `strip_linked_idx` before junction emit |
@@ -22,13 +21,11 @@ use arrow::array::{
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::{concat, concat_batches, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use arrow::record_batch::RecordBatch;
-use datafusion::common::Column;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::functions_aggregate::expr_fn::{
     array_agg, first_value as df_first_value, max as df_max, min as df_min, sum as df_sum,
 };
-use datafusion::logical_expr::JoinType;
-use datafusion::prelude::{Expr, SessionContext, col};
+use datafusion::prelude::{SessionContext, col};
 use fake::Fake;
 use parquet::arrow::ArrowWriter;
 use serde_yaml::Value as YamlValue;
@@ -501,60 +498,68 @@ async fn execute_lower_cover_group_core(
             .any(|mp| witness_source_paths.contains(mp));
 
         let parent_seg = if seg.members.is_empty() {
-            // Parent-only segment: no child rows to inherit.
-            if let Some(ref ib) = opt_import_batch {
-                generate_batch_with_import(&dataset.data, &HashMap::new(), &seg.field_constraints, ib)?
-            } else {
-                generate_fresh_batch(&dataset.data, n_rows, &seg.field_constraints)?
-            }
+            generate_remainder_parent_batch(
+                &dataset.data,
+                n_rows,
+                &seg.field_constraints,
+                opt_import_batch.as_ref(),
+            )?
         } else {
-            // Witness-source members contribute constraints but produce no standalone batches.
-            // Separate them from real (flat) members before generating children.
-            let real_member_paths: Vec<&PathBuf> = seg
+            let real_members: Vec<&LowerCoverMember> = seg
                 .members
                 .iter()
-                .filter(|mp| !witness_source_paths.contains(*mp))
+                .filter_map(|mp| {
+                    if witness_source_paths.contains(mp) {
+                        return None;
+                    }
+                    members.iter().find(|m| &m.path == mp)
+                })
                 .collect();
 
-            // Children are preceding: generate each real member first, then grow the
-            // parent outward from those already-solved rows (UNION ALL semantics).
-            let mut child_batches: Vec<(&LowerCoverMember, RecordBatch)> = Vec::new();
-            for member_path in &real_member_paths {
-                let m = members.iter().find(|m| &m.path == *member_path).unwrap();
-                // If the member was itself a parent in a prior step it is already in `computed`.
-                let precomputed = parent_computed
-                    .contains(&m.path)
-                    .then(|| computed.get(&m.path))
-                    .flatten();
-                let (canonical, buffer_batch) = generate_segment_member_batches(
-                    m,
-                    n_rows,
-                    &seg.field_constraints,
-                    acc.slot_offset,
-                    precomputed,
-                )?;
-                if let Some(buf) = buffer_batch {
-                    acc.push_member_batch(m.path.clone(), buf);
-                }
-                child_batches.push((m, canonical));
-            }
-
-            if child_batches.is_empty() {
-                // Witness-source-only segment: all members are witness sources; no real children.
-                if let Some(ref ib) = opt_import_batch {
-                    generate_batch_with_import(&dataset.data, &HashMap::new(), &seg.field_constraints, ib)?
-                } else {
-                    generate_fresh_batch(&dataset.data, n_rows, &seg.field_constraints)?
-                }
-            } else {
-                grow_parent_from_children(
+            if real_members.is_empty() {
+                // Witness-source-only segment: parent is generated as a remainder.
+                generate_remainder_parent_batch(
                     &dataset.data,
                     n_rows,
-                    &child_batches,
                     &seg.field_constraints,
                     opt_import_batch.as_ref(),
-                )
-                .await?
+                )?
+            } else {
+                let atom_batch = generate_segment_atom_batch(
+                    &dataset.data,
+                    &real_members,
+                    n_rows,
+                    &seg.field_constraints,
+                    opt_import_batch.as_ref(),
+                    computed,
+                    parent_computed,
+                )?;
+
+                // Project each member from the atom batch (order does not matter —
+                // the atom is already final).
+                for m in &real_members {
+                    let pre = parent_computed
+                        .contains(&m.path)
+                        .then(|| computed.get(&m.path))
+                        .flatten();
+                    project_member_columns(
+                        &atom_batch,
+                        m,
+                        acc.slot_offset,
+                        n_rows,
+                        &seg.field_constraints,
+                        pre,
+                        &mut acc,
+                    )?;
+                }
+
+                project_parent_columns_from_atom(
+                    &dataset.data,
+                    &atom_batch,
+                    n_rows,
+                    &seg.field_constraints,
+                    opt_import_batch.as_ref(),
+                )?
             }
         };
 
@@ -624,164 +629,6 @@ async fn execute_lower_cover_group_core(
     }
 
     Ok(())
-}
-
-/// Resolve which child batch provides each parent field (inherited-field wiring).
-///
-/// Returns a map from parent-field-name → (child-alias "c0"/"c1"/…, child-column-name)
-/// for fields satisfied by:
-/// - Rule 1: child's `ref:` points back to a parent field by name (cross-schema ref)
-/// - Rule 2: child has a same-name field with no cross-ref pointing elsewhere
-///
-/// Fields absent from the result fall through to Rule 3: generated fresh into the skeleton.
-/// `or_insert_with` preserves first-child-wins order — consistent with atoms preceding parents.
-fn resolve_inherited_source_columns(
-    parent_schema: &Schema,
-    child_batches: &[(&LowerCoverMember, RecordBatch)],
-) -> HashMap<String, (String, String)> {
-    let mut sources: HashMap<String, (String, String)> = HashMap::new();
-    for (ci, (m, child_batch)) in child_batches.iter().enumerate() {
-        let alias = format!("c{ci}");
-        let prefix = format!("{}.", m.reference);
-        for child_field in &m.dataset.data {
-            if child_batch.schema().index_of(&child_field.name).is_err() {
-                continue;
-            }
-            // Rule 1: cross-schema ref — child's ref points back to a parent field by name.
-            if let Some(ref_str) = child_field.simple_ref()
-                && let Some(parent_col) = ref_str.strip_prefix(prefix.as_str())
-            {
-                sources
-                    .entry(parent_col.to_string())
-                    .or_insert_with(|| (alias.clone(), child_field.name.clone()));
-                continue;
-            }
-            // Rule 2: same-name field, not a cross-ref pointing elsewhere.
-            // Skip when the parent field has a constant `value`: it belongs in Rule 3
-            // (skeleton), which correctly emits the constant regardless of child values.
-            let is_cross_ref = child_field
-                .simple_ref()
-                .is_some_and(|r| r.starts_with(prefix.as_str()));
-            if !is_cross_ref
-                && parent_schema
-                    .iter()
-                    .any(|pf| pf.name == child_field.name && pf.value.is_none())
-            {
-                sources
-                    .entry(child_field.name.clone())
-                    .or_insert_with(|| (alias.clone(), child_field.name.clone()));
-            }
-        }
-    }
-    sources
-}
-
-/// Accumulate-up step for include relationships: inherit child column values into parent rows.
-///
-/// In semi-lattice terms, this is the upward propagation step — child (more-constrained)
-/// values flow into the parent (less-constrained) batch so they are never re-generated.
-///
-/// Expressed as a DataFusion JOIN: a skeleton batch (fresh-generated Rule-3 columns +
-/// `_row_idx`) is LEFT-JOINed with each child batch (also prepended with `_row_idx`).
-/// The SELECT clause names exactly which source each parent field comes from.
-///
-/// Per parent field, first match across children wins (see `resolve_inherited_source_columns`):
-/// 1. Child has `ref: <include_ref>.<parent_field>` → child column aliased to parent name.
-/// 2. Child has a field of the same name as the parent field (no cross-schema ref) →
-///    child column taken directly.
-/// 3. Neither → generated fresh into the skeleton and pulled from there.
-async fn grow_parent_from_children(
-    parent_schema: &Schema,
-    n: usize,
-    child_batches: &[(&LowerCoverMember, RecordBatch)],
-    field_constraints: &HashMap<String, FieldConstraints>,
-    import_batch: Option<&RecordBatch>,
-) -> Result<RecordBatch> {
-    let sources = resolve_inherited_source_columns(parent_schema, child_batches);
-
-    // Active parent fields (skip expressions and nested-include placeholders).
-    let active: Vec<&Field> = parent_schema
-        .iter()
-        .filter(|f| f.expression.is_none() && !f.is_list_link())
-        .collect();
-
-    // Build skeleton batch: _row_idx column + all rule-3 (fresh) columns.
-    let idx: ArrayRef = Arc::new(UInt32Array::from_iter_values(0..n as u32));
-    let mut skel_fields = vec![ArrowField::new("_row_idx", DataType::UInt32, false)];
-    let mut skel_cols: Vec<ArrayRef> = vec![idx];
-    for f in &active {
-        if sources.contains_key(f.name.as_str()) {
-            continue;
-        }
-        // Tainted fields come from the import batch rather than being generated fresh.
-        if let Some(col) = f
-            .imported_taint
-            .then_some(import_batch)
-            .flatten()
-            .and_then(|ib| ib.schema().index_of(&f.name).ok().map(|i| ib.column(i).clone()))
-        {
-            skel_cols.push(col);
-            skel_fields.push(field_to_arrow(f));
-            continue;
-        }
-        let effective = field_constraints
-            .get(f.name.as_str())
-            .map(|fc| apply_constraints(f, fc));
-        skel_cols.push(generate_column(effective.as_ref().unwrap_or(f), n, &[])?);
-        skel_fields.push(field_to_arrow(f));
-    }
-    let skel = RecordBatch::try_new(Arc::new(ArrowSchema::new(skel_fields)), skel_cols)?;
-
-    if active.is_empty() {
-        return Ok(skel);
-    }
-
-    // Register all batches in a fresh context.
-    let ctx = SessionContext::new();
-    ctx.register_batch("skel", skel)?;
-    for (ci, (_, child_batch)) in child_batches.iter().enumerate() {
-        ctx.register_batch(&format!("c{ci}"), prepend_row_index(child_batch)?)?;
-    }
-
-    // LEFT JOIN skeleton with each child on skel._row_idx = c{i}._row_idx.
-    // join_on with qualified Column::new refs avoids ambiguity when chained joins
-    // accumulate multiple _row_idx columns in the left-side schema.
-    let skel_row_idx = Expr::Column(Column::new(Some("skel"), "_row_idx"));
-    let mut df = ctx.table("skel").await?;
-    for ci in 0..child_batches.len() {
-        let alias = format!("c{ci}");
-        let rhs = ctx.table(&alias).await?;
-        let on_expr = skel_row_idx
-            .clone()
-            .eq(Expr::Column(Column::new(Some(alias.as_str()), "_row_idx")));
-        df = df.join_on(rhs, JoinType::Left, [on_expr])?;
-    }
-
-    // Project to exactly the active parent fields, qualified by table to preserve case.
-    let select_exprs: Vec<Expr> = active
-        .iter()
-        .map(|f| {
-            if let Some((alias, child_col)) = sources.get(f.name.as_str()) {
-                Expr::Column(Column::new(Some(alias.as_str()), child_col.as_str()))
-                    .alias(f.name.as_str())
-            } else {
-                Expr::Column(Column::new(Some("skel"), f.name.as_str())).alias(f.name.as_str())
-            }
-        })
-        .collect();
-
-    let batches = df.select(select_exprs)?.collect().await?;
-    let schema = batches
-        .first()
-        .map(|b| b.schema())
-        .unwrap_or_else(|| Arc::new(schema_to_arrow(parent_schema)));
-    Ok(concat_batches(&schema, &batches)?)
-}
-
-/// Prepend a `_row_idx` column (0..n) to a batch so it can be JOIN-keyed positionally.
-fn prepend_row_index(batch: &RecordBatch) -> Result<RecordBatch> {
-    let idx: ArrayRef = Arc::new(UInt32Array::from_iter_values(0..batch.num_rows() as u32));
-    prepend_column(batch, "_row_idx", idx)
 }
 
 fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<RecordBatch> {
@@ -1861,6 +1708,412 @@ fn generate_batch_with_import(
     Ok(RecordBatch::try_new(arrow_schema, columns)?)
 }
 
+/// Generate the parent batch for a remainder segment (no members) — extracted from
+/// the legacy `seg.members.is_empty()` branch so all three segment shapes
+/// (remainder, singleton atom, joint atom) call into the same per-segment dispatcher.
+fn generate_remainder_parent_batch(
+    parent_schema: &Schema,
+    n_rows: usize,
+    seg_constraints: &HashMap<String, FieldConstraints>,
+    opt_import_batch: Option<&RecordBatch>,
+) -> Result<RecordBatch> {
+    if let Some(ib) = opt_import_batch {
+        generate_batch_with_import(parent_schema, &HashMap::new(), seg_constraints, ib)
+    } else {
+        generate_fresh_batch(parent_schema, n_rows, seg_constraints)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Segment atom batch generation (SEG-ATOM-1)
+//
+// The unified atom batch contains *only* the parent-ref columns shared across
+// one or more real (non-witness-source) members in a segment. Member-specific
+// non-ref columns are generated inside `project_member_columns`; the parent's
+// non-shared fields are generated inside `project_parent_columns_from_atom`.
+// Referential integrity for shared ref columns is therefore structural: every
+// member and the parent draw from the same atom column for a given segment slot.
+// ---------------------------------------------------------------------------
+
+/// Build the unified shared-ref schema for a segment atom.
+///
+/// Walks `parent_schema` in declaration order so the atom-batch column ordering is
+/// deterministic. A parent field becomes an atom column iff at least one real
+/// member declares a `ref:` pointing at it. Per-segment constraint overrides from
+/// `seg_constraints` are applied to each entry.
+///
+/// Returns `(atom_fields, providing_members)` where `providing_members[X]` is the
+/// ordered list of member indices (into `members`) that ref parent column `X`.
+fn build_segment_atom_schema(
+    parent_schema: &Schema,
+    members: &[&LowerCoverMember],
+    seg_constraints: &HashMap<String, FieldConstraints>,
+) -> (Vec<Field>, HashMap<String, Vec<usize>>) {
+    let per_member_refs: Vec<HashMap<String, String>> =
+        members.iter().map(|m| member_ref_to_parent_map(m)).collect();
+
+    let mut atom_fields: Vec<Field> = Vec::new();
+    let mut providing_members: HashMap<String, Vec<usize>> = HashMap::new();
+    for pf in parent_schema {
+        if pf.expression.is_some() || pf.is_list_link() {
+            continue;
+        }
+        let providers: Vec<usize> = per_member_refs
+            .iter()
+            .enumerate()
+            .filter(|(_, refs)| refs.values().any(|p| p == &pf.name))
+            .map(|(i, _)| i)
+            .collect();
+        if providers.is_empty() {
+            continue;
+        }
+        let entry = seg_constraints
+            .get(&pf.name)
+            .map(|fc| apply_constraints(pf, fc))
+            .unwrap_or_else(|| pf.clone());
+        atom_fields.push(entry);
+        providing_members.insert(pf.name.clone(), providers);
+    }
+    (atom_fields, providing_members)
+}
+
+/// Effective output field list for a member: `m.dataset.data` unioned with any
+/// variant-added fields. Variant fields override same-named base fields (taking
+/// the *last* variant's declaration for overlapping field shapes — matching
+/// `merge_variant_fields` semantics). Output column ordering follows base
+/// declaration order, then variant-added fields in declaration order.
+fn member_effective_fields(m: &LowerCoverMember) -> Vec<Field> {
+    if m.dataset.variants.is_empty() {
+        return m.dataset.data.clone();
+    }
+    let mut fields = m.dataset.data.clone();
+    for v in &m.dataset.variants {
+        for vf in &v.data {
+            crate::expand_variants::merge_delta_into(&mut fields, vf.clone());
+        }
+    }
+    fields
+}
+
+/// Map a member's local field name → parent field name, for every field whose
+/// `ref:` points at a column of the member's include parent (matched by
+/// `member.reference`).
+fn member_ref_to_parent_map(m: &LowerCoverMember) -> HashMap<String, String> {
+    let prefix = format!("{}.", m.reference);
+    let mut map = HashMap::new();
+    for f in &m.dataset.data {
+        if let Some(rs) = f.simple_ref()
+            && let Some(parent_name) = rs.strip_prefix(prefix.as_str())
+        {
+            map.insert(f.name.clone(), parent_name.to_string());
+        }
+    }
+    map
+}
+
+/// Generate the unified atom batch — `n_rows` rows, one column per shared
+/// parent-ref entry. Column source priority per entry:
+/// 1. Import taint: take from `opt_import_batch` if parent's field is tainted.
+/// 2. Precomputed member: take from `computed[member.path]` when the first
+///    providing member (in declaration order) is in `parent_computed` AND has no
+///    cardinality (cardinality precomputed batches are at expanded shape).
+/// 3. Fresh: generate via the atom-schema entry (which already has `seg_constraints`
+///    applied).
+///
+/// When `members` provide no parent-ref columns, returns a zero-column batch with
+/// `n_rows` rows (callers that index columns will simply produce empty selections).
+fn generate_segment_atom_batch(
+    parent_schema: &Schema,
+    members: &[&LowerCoverMember],
+    n_rows: usize,
+    seg_constraints: &HashMap<String, FieldConstraints>,
+    opt_import_batch: Option<&RecordBatch>,
+    computed: &HashMap<PathBuf, RecordBatch>,
+    parent_computed: &HashSet<PathBuf>,
+) -> Result<RecordBatch> {
+    let (atom_fields, providing_members) =
+        build_segment_atom_schema(parent_schema, members, seg_constraints);
+
+    if atom_fields.is_empty() {
+        let opts = RecordBatchOptions::new().with_row_count(Some(n_rows));
+        return Ok(RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            vec![],
+            &opts,
+        )?);
+    }
+
+    let arrow_fields: Vec<ArrowField> = atom_fields.iter().map(field_to_arrow).collect();
+    let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(atom_fields.len());
+
+    for atom_f in &atom_fields {
+        let parent_f = parent_schema
+            .iter()
+            .find(|f| f.name == atom_f.name)
+            .expect("atom field name is taken from parent_schema");
+
+        // (1) Import taint
+        if parent_f.imported_taint
+            && let Some(ib) = opt_import_batch
+            && let Ok(idx) = ib.schema().index_of(&atom_f.name)
+        {
+            cols.push(ib.column(idx).clone());
+            continue;
+        }
+
+        // (2) Precomputed member (skip cardinality members — their batches are at
+        //     expanded shape, not one-row-per-slot).
+        let providers = providing_members
+            .get(&atom_f.name)
+            .expect("providing_members populated for every atom field");
+        let mut taken: Option<ArrayRef> = None;
+        for &mi in providers {
+            let m = members[mi];
+            if m.cardinality.is_some() || !parent_computed.contains(&m.path) {
+                continue;
+            }
+            let Some(pre) = computed.get(&m.path) else {
+                continue;
+            };
+            let prefix = format!("{}.", m.reference);
+            let local_name = m.dataset.data.iter().find_map(|f| {
+                f.simple_ref()
+                    .and_then(|rs| rs.strip_prefix(prefix.as_str()))
+                    .filter(|p| *p == atom_f.name.as_str())
+                    .map(|_| f.name.as_str())
+            });
+            let Some(local_name) = local_name else {
+                continue;
+            };
+            let Ok(col_idx) = pre.schema().index_of(local_name) else {
+                continue;
+            };
+            taken = Some(pad_or_generate_tail(
+                atom_f,
+                pre.column(col_idx).clone(),
+                n_rows,
+            )?);
+            break;
+        }
+        if let Some(col) = taken {
+            cols.push(col);
+            continue;
+        }
+
+        // (3) Fresh generate.
+        cols.push(generate_column(atom_f, n_rows, &[])?);
+    }
+
+    Ok(RecordBatch::try_new(arrow_schema, cols)?)
+}
+
+/// Adjust a precomputed column to length `target_n`:
+/// - Equal: return as-is.
+/// - Longer: truncate via `take[0..target_n]`.
+/// - Shorter: generate `target_n - len` fresh values from `field` and concatenate.
+///
+/// The short case matches the stochastic-rounding tolerance previously provided
+/// by the LEFT JOIN in the pre-SEG-ATOM-1 parent assembly.
+fn pad_or_generate_tail(
+    field: &Field,
+    base: ArrayRef,
+    target_n: usize,
+) -> Result<ArrayRef> {
+    let base_n = base.len();
+    if base_n == target_n {
+        return Ok(base);
+    }
+    if base_n > target_n {
+        let indices = UInt32Array::from_iter_values(0..target_n as u32);
+        return Ok(take(base.as_ref(), &indices, None)?);
+    }
+    let tail_n = target_n - base_n;
+    let tail = generate_column(field, tail_n, &[])?;
+    Ok(concat(&[base.as_ref(), tail.as_ref()])?)
+}
+
+/// Build the parent batch for this segment from the unified atom batch.
+///
+/// For each active parent field (no expression, not a list-link): take the column
+/// from `atom_batch` if it's a shared ref column; else from `opt_import_batch` if
+/// tainted; else generate fresh under `seg_constraints[X]`.
+fn project_parent_columns_from_atom(
+    parent_schema: &Schema,
+    atom_batch: &RecordBatch,
+    n_rows: usize,
+    seg_constraints: &HashMap<String, FieldConstraints>,
+    opt_import_batch: Option<&RecordBatch>,
+) -> Result<RecordBatch> {
+    let active: Vec<&Field> = parent_schema
+        .iter()
+        .filter(|f| f.expression.is_none() && !f.is_list_link())
+        .collect();
+    let arrow_schema = Arc::new(ArrowSchema::new(
+        active.iter().map(|f| field_to_arrow(f)).collect::<Vec<_>>(),
+    ));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(active.len());
+    for f in &active {
+        let col = if let Ok(idx) = atom_batch.schema().index_of(&f.name) {
+            atom_batch.column(idx).clone()
+        } else if f.imported_taint
+            && let Some(ib) = opt_import_batch
+            && let Ok(idx) = ib.schema().index_of(&f.name)
+        {
+            ib.column(idx).clone()
+        } else {
+            let effective = seg_constraints
+                .get(&f.name)
+                .map(|fc| apply_constraints(f, fc));
+            generate_column(effective.as_ref().unwrap_or(f), n_rows, &[])?
+        };
+        cols.push(col);
+    }
+    Ok(RecordBatch::try_new(arrow_schema, cols)?)
+}
+
+/// Build this member's output batch by composing two sources:
+/// (a) ref columns projected from the unified atom batch, looked up by the parent
+///     column name each ref points at, and
+/// (b) non-ref columns generated via `generate_member_nonref_fields` (preserving
+///     VAR-2 sub-distribution).
+///
+/// **Precomputed without cardinality**: use the precomputed batch directly (it was
+/// already emitted by the prior plan step); the post-loop in
+/// `execute_lower_cover_group_core` skips re-emission for `parent_computed` paths.
+///
+/// **Cardinality**: each slot expands to `m_n = sample_count(card).max(1)` rows.
+/// Ref columns are replicated via Arrow `take` over per-row indices; non-ref
+/// columns are freshly generated per slot via the variant-aware path and
+/// concatenated. `_slot_idx = slot_offset + i` is prepended.
+fn project_member_columns(
+    atom_batch: &RecordBatch,
+    m: &LowerCoverMember,
+    slot_offset: usize,
+    n_rows: usize,
+    seg_constraints: &HashMap<String, FieldConstraints>,
+    precomputed: Option<&RecordBatch>,
+    acc: &mut SegmentBatchAccumulator,
+) -> Result<()> {
+    // (a) Precomputed, no cardinality: reuse the prior step's batch verbatim.
+    if m.cardinality.is_none()
+        && let Some(pre) = precomputed
+    {
+        acc.push_member_batch(m.path.clone(), pre.clone());
+        return Ok(());
+    }
+
+    let prefix = format!("{}.", m.reference);
+
+    if let Some(card) = &m.cardinality {
+        // Sample m_n per slot; build per-row slot_idx and the source-row indices
+        // used to replicate atom rows.
+        let mut row_indices: Vec<u32> = Vec::new();
+        let mut slot_tags: Vec<u32> = Vec::new();
+        let mut nonref_slot_batches: Vec<RecordBatch> = Vec::new();
+        let mut emitted_any_nonref = false;
+        for i in 0..n_rows {
+            let m_n = sample_count(card).max(1);
+            row_indices.extend(std::iter::repeat_n(i as u32, m_n));
+            slot_tags.extend(std::iter::repeat_n((slot_offset + i) as u32, m_n));
+            let nonref = generate_member_nonref_fields(m, m_n, seg_constraints)?;
+            if nonref.num_columns() > 0 {
+                emitted_any_nonref = true;
+            }
+            nonref_slot_batches.push(nonref);
+        }
+        let nonref_combined = if emitted_any_nonref {
+            let s = nonref_slot_batches
+                .iter()
+                .find(|b| b.num_columns() > 0)
+                .map(|b| b.schema())
+                .expect("emitted_any_nonref implies at least one batch with columns");
+            Some(concat_batches(&s, &nonref_slot_batches)?)
+        } else {
+            None
+        };
+
+        let take_indices = UInt32Array::from(row_indices);
+        let mut out_fields: Vec<ArrowField> =
+            vec![ArrowField::new("_slot_idx", DataType::UInt32, false)];
+        let mut out_cols: Vec<ArrayRef> = vec![Arc::new(UInt32Array::from(slot_tags))];
+        for f in &member_effective_fields(m) {
+            if f.expression.is_some() || f.is_list_link() {
+                continue;
+            }
+            let col = if let Some(parent_name) = f
+                .simple_ref()
+                .and_then(|rs| rs.strip_prefix(prefix.as_str()))
+            {
+                let atom_idx = atom_batch.schema().index_of(parent_name).map_err(|_| {
+                    anyhow!(
+                        "atom batch missing shared ref column '{parent_name}' for member '{}'",
+                        m.dataset.name
+                    )
+                })?;
+                take(atom_batch.column(atom_idx), &take_indices, None)?
+            } else if let Some(comb) = &nonref_combined {
+                let idx = comb.schema().index_of(&f.name).map_err(|_| {
+                    anyhow!(
+                        "nonref batch missing '{}' for member '{}'",
+                        f.name,
+                        m.dataset.name
+                    )
+                })?;
+                comb.column(idx).clone()
+            } else {
+                generate_column(f, take_indices.len(), &[])?
+            };
+            out_cols.push(col);
+            out_fields.push(field_to_arrow(f));
+        }
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(out_fields)), out_cols)?;
+        acc.push_member_batch(m.path.clone(), batch);
+        return Ok(());
+    }
+
+    // No cardinality, not precomputed: one row per slot.
+    let nonref_batch = {
+        let nonref = generate_member_nonref_fields(m, n_rows, seg_constraints)?;
+        (nonref.num_columns() > 0).then_some(nonref)
+    };
+    let mut out_fields: Vec<ArrowField> = Vec::new();
+    let mut out_cols: Vec<ArrayRef> = Vec::new();
+    for f in &member_effective_fields(m) {
+        if f.expression.is_some() || f.is_list_link() {
+            continue;
+        }
+        let col = if let Some(parent_name) = f
+            .simple_ref()
+            .and_then(|rs| rs.strip_prefix(prefix.as_str()))
+        {
+            let atom_idx = atom_batch.schema().index_of(parent_name).map_err(|_| {
+                anyhow!(
+                    "atom batch missing shared ref column '{parent_name}' for member '{}'",
+                    m.dataset.name
+                )
+            })?;
+            atom_batch.column(atom_idx).clone()
+        } else if let Some(b) = &nonref_batch {
+            let idx = b.schema().index_of(&f.name).map_err(|_| {
+                anyhow!(
+                    "nonref batch missing '{}' for member '{}'",
+                    f.name,
+                    m.dataset.name
+                )
+            })?;
+            b.column(idx).clone()
+        } else {
+            generate_column(f, n_rows, &[])?
+        };
+        out_cols.push(col);
+        out_fields.push(field_to_arrow(f));
+    }
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(out_fields)), out_cols)?;
+    acc.push_member_batch(m.path.clone(), batch);
+    Ok(())
+}
+
 /// Get a cached `ImportIndex` or load it from disk if this is the first access.
 fn get_or_load_import(
     dataset_path: &Path,
@@ -1877,52 +2130,60 @@ fn get_or_load_import(
     Ok(idx)
 }
 
-/// Generate M_n rows per parent-row slot, tagging each with `_slot_idx = slot_offset + i`.
-/// The canonical (one-row-per-slot) batch is handled separately by `grow_parent_from_children`;
-/// this function produces the expanded output batch for the lower cover member's output file.
-fn generate_expanded_batch(
-    fields: &Schema,
-    slot_count: usize,
-    constraints: &HashMap<String, FieldConstraints>,
-    cardinality: &CountSpec,
-    slot_offset: usize,
-) -> Result<RecordBatch> {
-    let mut slot_tags: Vec<u32> = Vec::new();
-    let mut slot_batches: Vec<RecordBatch> = Vec::new();
-
-    for i in 0..slot_count {
-        let m_n = sample_count(cardinality).max(1);
-        let batch = generate_fresh_batch(fields, m_n, constraints)?;
-        let slot = (slot_offset + i) as u32;
-        slot_tags.extend(std::iter::repeat_n(slot, m_n));
-        slot_batches.push(batch);
-    }
-
-    let inner_schema = slot_batches
-        .first()
-        .map(|b| b.schema())
-        .unwrap_or_else(|| Arc::new(schema_to_arrow(fields)));
-    let combined = concat_batches(&inner_schema, &slot_batches)?;
-    let slot_col: ArrayRef = Arc::new(UInt32Array::from(slot_tags));
-    prepend_column(&combined, "_slot_idx", slot_col)
-}
-
-/// Generate a canonical batch (one row per segment slot) for a lower cover member,
-/// applying Level 2 variant sub-distribution when the member has `variants:`.
+/// Generate a member's **non-ref** field columns only, applying Level 2 variant
+/// sub-distribution when the member has `variants:`. Ref fields (whose values flow
+/// from the segment atom batch) are excluded.
 ///
-/// Without variants: delegates to `generate_fresh_batch` unchanged.
-/// With variants: distributes `rows` across compatible variant schemas proportionally,
-/// generates one sub-batch per surviving variant, and concatenates them.
-fn generate_member_batch(
+/// Without variants: delegates to `generate_fresh_batch` over the non-ref subset.
+/// With variants: distributes `rows` across compatible variant schemas
+/// proportionally, generates one sub-batch per surviving variant (restricted to its
+/// non-ref subset), and concatenates them.
+///
+/// Variant compatibility against `seg_constraints` is checked using the **full**
+/// variant schema (including its ref fields) so that variants whose ref-bound
+/// values conflict with the segment are correctly pruned.
+fn generate_member_nonref_fields(
     m: &LowerCoverMember,
     rows: usize,
     seg_constraints: &HashMap<String, FieldConstraints>,
 ) -> Result<RecordBatch> {
-    if m.dataset.variants.is_empty() {
-        return generate_fresh_batch(&m.dataset.data, rows, seg_constraints);
+    let prefix = format!("{}.", m.reference);
+    let is_nonref = |f: &Field| {
+        f.simple_ref()
+            .and_then(|rs| rs.strip_prefix(prefix.as_str()))
+            .is_none()
+    };
+    let nonref_base: Vec<Field> = m
+        .dataset
+        .data
+        .iter()
+        .filter(|f| {
+            is_nonref(f) && f.expression.is_none() && !f.is_list_link()
+        })
+        .cloned()
+        .collect();
+
+    let any_variant_has_nonref = m
+        .dataset
+        .variants
+        .iter()
+        .any(|v| v.data.iter().any(|f| is_nonref(f) && f.expression.is_none() && !f.is_list_link()));
+
+    if nonref_base.is_empty() && !any_variant_has_nonref {
+        let opts = RecordBatchOptions::new().with_row_count(Some(rows));
+        return Ok(RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            vec![],
+            &opts,
+        )?);
     }
 
-    // Build concrete schemas and extract their parent-ref constraints.
+    if m.dataset.variants.is_empty() {
+        return generate_fresh_batch(&nonref_base, rows, seg_constraints);
+    }
+
+    // Build full variant schemas (with ref fields) so variant-pruning sees the
+    // ref-bound constraints. Then generate only the non-ref subset per variant.
     let variant_schemas: Vec<_> = m
         .dataset
         .variants
@@ -1957,18 +2218,14 @@ fn generate_member_batch(
         })
         .collect();
 
-    // Filter to variants whose ref constraints are compatible with this segment.
     let surviving: Vec<usize> = (0..m.dataset.variants.len())
         .filter(|&i| !constraints_conflict(&variant_ref_constraints[i], seg_constraints))
         .collect();
 
     if surviving.is_empty() {
-        return generate_fresh_batch(&m.dataset.data, rows, seg_constraints);
+        return generate_fresh_batch(&nonref_base, rows, seg_constraints);
     }
 
-    // Distribute rows across surviving variants, normalising their ratios.
-    // resolve_distributions fills free (None) shares but does not normalise fixed ratios —
-    // we must renormalise explicitly so pruned variants' weight is redistributed correctly.
     let surviving_option_ratios: Vec<Option<f64>> = surviving
         .iter()
         .map(|&i| m.dataset.variants[i].ratio)
@@ -1982,7 +2239,6 @@ fn generate_member_batch(
     };
     let row_counts = distribute_rows(rows, &dists);
 
-    // Generate one sub-batch per surviving variant with >0 rows.
     let mut sub_batches: Vec<RecordBatch> = Vec::new();
     for (pos, &vi) in surviving.iter().enumerate() {
         let r = row_counts[pos];
@@ -1992,97 +2248,24 @@ fn generate_member_batch(
         let merged_constraints =
             try_merge_incremental(seg_constraints.clone(), &variant_ref_constraints[vi])
                 .unwrap_or_else(|| seg_constraints.clone());
+        let nonref_variant: Vec<Field> = variant_schemas[vi]
+            .iter()
+            .filter(|f| is_nonref(f))
+            .cloned()
+            .collect();
         sub_batches.push(generate_fresh_batch(
-            &variant_schemas[vi],
+            &nonref_variant,
             r,
             &merged_constraints,
         )?);
     }
 
     if sub_batches.is_empty() {
-        return generate_fresh_batch(&m.dataset.data, rows, seg_constraints);
+        return generate_fresh_batch(&nonref_base, rows, seg_constraints);
     }
 
     let schema = sub_batches[0].schema();
     Ok(concat_batches(&schema, &sub_batches)?)
-}
-
-/// Generate an expanded batch (M_n rows per slot, tagged with `_slot_idx`) for a lower
-/// cover member with cardinality, applying Level 2 variant sub-distribution per slot.
-fn generate_member_expanded_batch(
-    m: &LowerCoverMember,
-    slot_count: usize,
-    seg_constraints: &HashMap<String, FieldConstraints>,
-    cardinality: &CountSpec,
-    slot_offset: usize,
-) -> Result<RecordBatch> {
-    if m.dataset.variants.is_empty() {
-        return generate_expanded_batch(
-            &m.dataset.data,
-            slot_count,
-            seg_constraints,
-            cardinality,
-            slot_offset,
-        );
-    }
-
-    let mut slot_tags: Vec<u32> = Vec::new();
-    let mut slot_batches: Vec<RecordBatch> = Vec::new();
-
-    for i in 0..slot_count {
-        let m_n = sample_count(cardinality).max(1);
-        let batch = generate_member_batch(m, m_n, seg_constraints)?;
-        let slot = (slot_offset + i) as u32;
-        slot_tags.extend(std::iter::repeat_n(slot, m_n));
-        slot_batches.push(batch);
-    }
-
-    let inner_schema = slot_batches
-        .first()
-        .map(|b| b.schema())
-        .unwrap_or_else(|| Arc::new(schema_to_arrow(&m.dataset.data)));
-    let combined = concat_batches(&inner_schema, &slot_batches)?;
-    let slot_col: ArrayRef = Arc::new(UInt32Array::from(slot_tags));
-    prepend_column(&combined, "_slot_idx", slot_col)
-}
-
-/// Generate the canonical (one-row-per-slot) and optionally expanded (M_n-rows-per-slot)
-/// batches for one lower cover member within a segment, implementing the "children are
-/// preceding" lattice rule.
-///
-/// Returns `(canonical, buffer_batch)` where:
-/// - `canonical`: one row per segment slot; passed to `grow_parent_from_children` for assembly.
-/// - `buffer_batch`: when `Some`, pushed to `member_buffers` for later emission — either an
-///   expanded batch (when `m.cardinality` is set) or the canonical batch itself (otherwise).
-///
-/// When `precomputed` is `Some` and there is no cardinality, the member was itself a parent
-/// in a prior step and its batch is used directly; nothing is added to `member_buffers`
-/// (the prior step already handled emission for this member).
-fn generate_segment_member_batches(
-    m: &LowerCoverMember,
-    n_rows: usize,
-    field_constraints: &HashMap<String, FieldConstraints>,
-    slot_offset: usize,
-    precomputed: Option<&RecordBatch>,
-) -> Result<(RecordBatch, Option<RecordBatch>)> {
-    if let Some(card) = &m.cardinality {
-        // With cardinality: always regenerate canonical fresh (precomputed has total_member_rows,
-        // not n_rows canonical rows). Generate expanded batch for member output.
-        let canonical = generate_member_batch(m, n_rows, field_constraints)?;
-        let expanded =
-            generate_member_expanded_batch(m, n_rows, field_constraints, card, slot_offset)?;
-        Ok((canonical, Some(expanded)))
-    } else if let Some(pre) = precomputed {
-        // Precomputed, no cardinality: row count equals seg.rows — reuse directly.
-        // Member was already emitted by its own prior step; nothing to buffer here.
-        Ok((pre.clone(), None))
-    } else {
-        // Fresh generate, no cardinality: canonical serves as both the assembly input and
-        // the member output batch.
-        let canonical = generate_member_batch(m, n_rows, field_constraints)?;
-        let buf = canonical.clone();
-        Ok((canonical, Some(buf)))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2468,4 +2651,64 @@ fn write_output(batch: &RecordBatch, name: &str, format: &Format, output_dir: &P
 
     println!("  wrote {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::FieldType;
+    use arrow::array::StringArray;
+    use serde_yaml::Value as YamlValue;
+
+    /// Build a string Field with a constant `value:` — `generate_column` then emits the
+    /// constant for every requested row, making the tail-generation deterministic.
+    fn constant_field(name: &str, value: &str) -> Field {
+        Field {
+            name: name.to_string(),
+            field_type: Some(FieldType::String),
+            value: Some(YamlValue::String(value.to_string())),
+            ..Default::default()
+        }
+    }
+
+    fn string_col(values: &[&str]) -> ArrayRef {
+        Arc::new(StringArray::from(
+            values.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        ))
+    }
+
+    fn read_strings(arr: &ArrayRef) -> Vec<String> {
+        let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
+        (0..sa.len()).map(|i| sa.value(i).to_string()).collect()
+    }
+
+    #[test]
+    fn pad_or_generate_tail_returns_base_when_lengths_match() {
+        let field = constant_field("c", "pad");
+        let base = string_col(&["a", "b", "c"]);
+        let out = pad_or_generate_tail(&field, base, 3).unwrap();
+        assert_eq!(read_strings(&out), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn pad_or_generate_tail_truncates_when_base_is_longer() {
+        let field = constant_field("c", "pad");
+        let base = string_col(&["a", "b", "c", "d", "e"]);
+        let out = pad_or_generate_tail(&field, base, 3).unwrap();
+        // Truncated via take to exactly the first `target_n` rows.
+        assert_eq!(read_strings(&out), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn pad_or_generate_tail_pads_when_base_is_shorter() {
+        // Mirrors the stochastic-rounding tolerance for precomputed members in
+        // `generate_segment_atom_batch`: the precomputed batch may be a row or two
+        // short of `seg.rows`, so the tail is freshly generated and concatenated.
+        let field = constant_field("c", "pad");
+        let base = string_col(&["a", "b"]);
+        let out = pad_or_generate_tail(&field, base, 5).unwrap();
+        // First two rows from the precomputed batch; the remaining three are the
+        // freshly generated constant from the field definition.
+        assert_eq!(read_strings(&out), vec!["a", "b", "pad", "pad", "pad"]);
+    }
 }

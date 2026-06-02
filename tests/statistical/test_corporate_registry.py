@@ -123,8 +123,9 @@ def test_smes_org_id_refs(corporate):
     org_ids = set(corporate["organisations"]["org_id"].to_list())
     orphans = ~corporate["smes"]["org_id"].is_in(org_ids)
     # Bernoulli rounding in the lower-cover segmentation can produce one fewer
-    # child row than the parent planned, leaving grow_parent_from_children to
-    # emit at most one row with a freshly generated (non-inherited) org_id.
+    # child row than the parent planned, leaving pad_or_generate_tail in the
+    # segment-atom pipeline to emit at most one row with a freshly generated
+    # (non-inherited) org_id.
     assert orphans.sum() <= 1, f"{orphans.sum()} SME rows have org_id not in organisations"
 
 

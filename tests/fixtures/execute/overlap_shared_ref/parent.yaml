@@ -6,3 +6,6 @@ data:
   - name: id
     type: string
     generator: uuid
+  - name: code
+    type: string
+    generator: word

@@ -14,23 +14,6 @@ from scipy.stats import binomtest, chisquare, kstest, uniform
 
 ALPHA = 0.001
 
-# ---------------------------------------------------------------------------
-# Known bugs that cause test failures — mark xfail so the suite stays green
-# while documenting what should eventually be fixed.
-#
-# BUG-REF (partial — first-child-wins): For overlap segments where both premiums
-#   and claims appear as lower cover members, grow_parent_from_children assigns
-#   contracts.contract_id / contracts.customer_id from whichever child is first in
-#   child_batches (HashMap iteration order).  The other child's ref columns don't
-#   match the value the parent was given, breaking referential integrity for those rows.
-#   Affects: claims.contract_id and claims.customer_id in the {premiums ∩ claims}
-#   overlap segment (~34% of contract rows).  Non-deterministic: the test may pass
-#   or fail depending on HashMap iteration order.
-# ---------------------------------------------------------------------------
-# strict=False: which member wins the first-child-wins race in grow_parent_from_children
-# depends on HashMap iteration order, so the test may pass or fail non-deterministically.
-_BUG_REF = pytest.mark.xfail(reason="BUG-REF: first-child-wins in overlap segment breaks ref integrity for losing child", strict=False)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -153,31 +136,24 @@ def test_contract_customer_id_refs(insurance):
     assert not orphans.any(), f"{orphans.sum()} contract rows have unknown customer_id"
 
 
-@_BUG_REF
 def test_premium_contract_id_refs(insurance):
     contract_ids = set(insurance["contracts"]["contract_id"].to_list())
     orphans = ~insurance["premiums"]["contract_id"].is_in(contract_ids)
     assert not orphans.any(), f"{orphans.sum()} premium rows have unknown contract_id"
 
 
-@_BUG_REF
 def test_premium_customer_id_refs(insurance):
     customer_ids = set(insurance["customers"]["customer_id"].to_list())
     orphans = ~insurance["premiums"]["customer_id"].is_in(customer_ids)
     assert not orphans.any(), f"{orphans.sum()} premium rows have unknown customer_id"
 
 
-@_BUG_REF
 def test_claim_contract_id_refs(insurance):
-    # Claims in the {premiums, claims} overlap segment get contract_ids that are
-    # overwritten by premiums (first-child-wins in grow_parent_from_children), so
-    # the claims on disk have different contract_ids than the contracts table.
     contract_ids = set(insurance["contracts"]["contract_id"].to_list())
     orphans = ~insurance["claims"]["contract_id"].is_in(contract_ids)
     assert not orphans.any(), f"{orphans.sum()} claim rows have unknown contract_id"
 
 
-@_BUG_REF
 def test_claim_customer_id_refs(insurance):
     customer_ids = set(insurance["customers"]["customer_id"].to_list())
     orphans = ~insurance["claims"]["customer_id"].is_in(customer_ids)
