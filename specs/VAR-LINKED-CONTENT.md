@@ -2,7 +2,7 @@
 
 ## Status
 
-**Future — stub.** Not designed. Deferred out of [`VAR-EXPAND`](VAR-EXPAND.md)
+**Future — stub.** Not designed. Deferred out of [`VAR-EXPAND`](done/VAR-EXPAND.md)
 (open question Q4). Until this lands, variants on linked-content-list item fields
 are **rejected at validation** (see VAR-EXPAND §Validation).
 

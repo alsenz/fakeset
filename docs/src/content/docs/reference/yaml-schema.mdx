@@ -366,7 +366,7 @@ Defines one column in a dataset's schema.
       type: string
       generator: city_name
 
-# Variant field
+# Variant field (a tagged union: exactly one case per row)
 - name: tier
   type: variant
   variants:
@@ -374,8 +374,13 @@ Defines one column in a dataset's schema.
       ratio: 0.1
     - value: "silver"
       ratio: 0.3
-    - value: "bronze"
+    - value: "bronze"        # no ratio → takes the remainder (0.6)
 ```
+
+A `type: variant` field is a **tagged union** — each row takes exactly one case.
+On a dataset that includes another, the cases are *lowered* into the lattice and
+distributed by the same segmentation as lower-cover members, so the declared
+`ratio`s are honoured. See [Variants as Tagged Unions](/concepts/variant-lowering/).
 
 ### Generator args
 

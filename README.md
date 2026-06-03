@@ -77,6 +77,11 @@ include:
   ratio: 0.05   # marginal row-membership probability (Bernoulli)
 ```
 
+`type: variant` fields are **tagged unions** lowered into this same machinery: a
+lower-cover member's union becomes one case per value, factored as a mutually
+exclusive group, so variant ratios are honoured by the same segmentation (no
+separate code path). See the docs' *Variants as Tagged Unions* page.
+
 ## YAML schema
 
 ```yaml
@@ -212,7 +217,7 @@ The binary is placed at `target/release/fakeset`.
 ### Rust unit and integration tests
 
 ```bash
-cargo test          # ~234 tests
+cargo test          # ~248 tests
 ```
 
 ### Statistical regression tests

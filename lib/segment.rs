@@ -2,7 +2,7 @@
 //! feasible membership subsets for a lower cover group via branch-and-bound DFS,
 //! then applies Iterative Proportional Fitting to restore declared marginal ratios.
 use anyhow::{Result, bail};
-use fake::Fake;
+use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -13,6 +13,13 @@ use crate::models::{CountSpec, RingBounds, SyntheticDataset};
 /// For tightly constrained groups (e.g. mutually exclusive tiers) K = N+1.
 /// Only fully-compatible groups with no conflicting constraints approach 2^N.
 pub const MAX_FEASIBLE_SEGMENTS: usize = 1_000_000;
+
+/// A segment's membership mask: bit `i` ⟺ member `i` is included. A `FixedBitSet`
+/// (rather than a fixed-width integer) imposes **no member-count ceiling** — the
+/// variant cross-products VAR-EXPAND lowering can produce are unbounded. It costs a
+/// small heap clone per DFS branch, but the DFS runs once per group at *plan* time
+/// (not per row), so it is off the hot path; `Hash + Eq` let it key the feasible map.
+pub(crate) type SegMask = FixedBitSet;
 
 /// A lower cover member: a dataset that directly includes a common parent, along with its
 /// include metadata needed for constraint extraction.
@@ -112,11 +119,6 @@ pub fn assign_ring_slices(segments: &mut [Segment], parent_ring: &RingBounds) {
     }
 }
 
-#[inline]
-fn in_subset(mask: usize, i: usize) -> bool {
-    mask & (1 << i) != 0
-}
-
 /// Plan the product-Bernoulli segments for a parent dataset given its lower cover.
 ///
 /// Algorithm:
@@ -152,11 +154,11 @@ pub fn plan_segments(
     // entry is a lone member, in member order — byte-identical to the pre-VAR-EXPAND DFS.
     let entries = build_dfs_entries(n, groups);
 
-    let mut feasible: HashMap<usize, HashMap<String, FieldConstraints>> = HashMap::new();
-    let mut weights: HashMap<usize, f64> = HashMap::new();
+    let mut feasible: HashMap<SegMask, HashMap<String, FieldConstraints>> = HashMap::new();
+    let mut weights: HashMap<SegMask, f64> = HashMap::new();
     enumerate_segments_dfs(
         0,
-        0,
+        FixedBitSet::with_capacity(n),
         HashMap::new(),
         1.0,
         &entries,
@@ -188,27 +190,51 @@ pub fn plan_segments(
         ipf_rescale_sparse(&mut weights, members, &feasible);
     }
 
-    // --- Bernoulli rounding ---
+    // --- Largest-remainder (Hamilton) rounding ---
+    // Floor every cell, then hand the leftover `parent_rows − Σfloor` rows to the cells
+    // with the largest fractional parts. This is unbiased per cell (each gets floor or
+    // floor+1) *and* conserves the grand total exactly — both properties matter:
+    //   - unbiased + minimal per-cell error keeps marginal distributions faithful (the
+    //     old `raw.round()` branch was biased toward common cells; many small cells in a
+    //     variant cross-product turned that bias into χ² failures);
+    //   - exact total conservation keeps a member-that-is-also-a-parent's row count equal
+    //     to the count its own step produced — independent stochastic rounding drifts that
+    //     count and the precomputed-reuse path then pad-generates rows with mismatched refs.
     let total_weight: f64 = weights.values().copied().sum();
-    let segments: Vec<Segment> = feasible
+    // `(included member indices, floor, frac)` per feasible cell. The ones-vec doubles
+    // as the member-path source and a deterministic tie-break key (HashMap iteration
+    // order is not stable).
+    let mut cells: Vec<(Vec<usize>, usize, f64)> = feasible
         .keys()
-        .filter_map(|&mask| {
-            let raw = (weights[&mask] / total_weight) * parent_rows as f64;
-            let rows = if raw >= 1.0 {
-                raw.round() as usize
-            } else {
-                if (0.0f64..1.0f64).fake::<f64>() < raw {
-                    1
-                } else {
-                    0
-                }
-            };
+        .map(|mask| {
+            let raw = (weights[mask] / total_weight) * parent_rows as f64;
+            let fl = raw.floor();
+            (mask.ones().collect(), fl as usize, raw - fl)
+        })
+        .collect();
+    let assigned: usize = cells.iter().map(|(_, fl, _)| *fl).sum();
+    let leftover = parent_rows.saturating_sub(assigned);
+    // Largest fractional remainders win the leftover rows; ties break by member list.
+    cells.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let segments: Vec<Segment> = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, (ones, fl, _))| {
+            let rows = fl + usize::from(rank < leftover);
             if rows == 0 {
                 return None;
             }
-            let member_paths: Vec<PathBuf> = (0..n)
-                .filter(|&i| in_subset(mask, i))
-                .map(|i| members[i].path.clone())
+            let mut mask = FixedBitSet::with_capacity(n);
+            let member_paths: Vec<PathBuf> = ones
+                .iter()
+                .map(|&idx| {
+                    mask.insert(idx);
+                    members[idx].path.clone()
+                })
                 .collect();
             Some(Segment {
                 members: member_paths,
@@ -280,16 +306,16 @@ fn build_dfs_entries(n: usize, groups: &[ExclusionGroup]) -> Vec<DfsEntry> {
 #[allow(clippy::too_many_arguments)]
 fn enumerate_segments_dfs(
     entry_idx: usize,
-    mask: usize,
+    mask: SegMask,
     merged: HashMap<String, FieldConstraints>,
     weight: f64,
     entries: &[DfsEntry],
     members: &[LowerCoverMember],
     groups: &[ExclusionGroup],
-    conflict_masks: &[usize],
+    conflict_masks: &[SegMask],
     member_constraints: &[HashMap<String, FieldConstraints>],
-    feasible: &mut HashMap<usize, HashMap<String, FieldConstraints>>,
-    weights: &mut HashMap<usize, f64>,
+    feasible: &mut HashMap<SegMask, HashMap<String, FieldConstraints>>,
+    weights: &mut HashMap<SegMask, f64>,
 ) -> Result<()> {
     if entry_idx == entries.len() {
         if feasible.len() >= MAX_FEASIBLE_SEGMENTS {
@@ -299,7 +325,7 @@ fn enumerate_segments_dfs(
                 MAX_FEASIBLE_SEGMENTS
             );
         }
-        feasible.insert(mask, merged);
+        feasible.insert(mask.clone(), merged);
         weights.insert(mask, weight);
         return Ok(());
     }
@@ -313,7 +339,7 @@ fn enumerate_segments_dfs(
             // Branch A: exclude member i (clone merged — still needed for Branch B).
             enumerate_segments_dfs(
                 next,
-                mask,
+                mask.clone(),
                 merged.clone(),
                 weight * (1.0 - ratio),
                 entries,
@@ -326,12 +352,14 @@ fn enumerate_segments_dfs(
             )?;
 
             // Branch B: include member i — prune on conflict / unmergeable constraints.
-            if (mask & conflict_masks[i]) == 0
+            if mask.is_disjoint(&conflict_masks[i])
                 && let Some(new_merged) = try_merge_incremental(merged, &member_constraints[i])
             {
+                let mut inc = mask;
+                inc.insert(i);
                 enumerate_segments_dfs(
                     next,
-                    mask | (1 << i),
+                    inc,
                     new_merged,
                     weight * ratio,
                     entries,
@@ -353,7 +381,7 @@ fn enumerate_segments_dfs(
             if none_factor > f64::EPSILON {
                 enumerate_segments_dfs(
                     next,
-                    mask,
+                    mask.clone(),
                     merged.clone(),
                     weight * none_factor,
                     entries,
@@ -369,15 +397,17 @@ fn enumerate_segments_dfs(
             // Branch: pick exactly one case. Structural mutual exclusion — at most one
             // case member's bit is ever set across these branches.
             for (k, &ci) in grp.members.iter().enumerate() {
-                if (mask & conflict_masks[ci]) != 0 {
+                if !mask.is_disjoint(&conflict_masks[ci]) {
                     continue;
                 }
                 if let Some(new_merged) =
                     try_merge_incremental(merged.clone(), &member_constraints[ci])
                 {
+                    let mut inc = mask.clone();
+                    inc.insert(ci);
                     enumerate_segments_dfs(
                         next,
-                        mask | (1 << ci),
+                        inc,
                         new_merged,
                         weight * categorical_prior_factor(grp, Some(k)),
                         entries,
@@ -419,16 +449,16 @@ pub(crate) fn try_merge_incremental(
 /// For each lower cover member i, build a bitmask of all members j that are pairwise
 /// incompatible with i (their merged constraints are infeasible). Any mask containing
 /// such a pair can be eliminated without further constraint computation.
-fn precompute_conflicts(members: &[LowerCoverMember]) -> Vec<usize> {
+fn precompute_conflicts(members: &[LowerCoverMember]) -> Vec<SegMask> {
     let n = members.len();
     let constraints: Vec<HashMap<String, FieldConstraints>> =
         members.iter().map(lower_cover_field_constraints).collect();
-    let mut conflict_masks = vec![0usize; n];
+    let mut conflict_masks = vec![FixedBitSet::with_capacity(n); n];
     for i in 0..n {
         for j in (i + 1)..n {
             if constraints_conflict(&constraints[i], &constraints[j]) {
-                conflict_masks[i] |= 1 << j;
-                conflict_masks[j] |= 1 << i;
+                conflict_masks[i].insert(j);
+                conflict_masks[j].insert(i);
             }
         }
     }
@@ -446,9 +476,9 @@ pub(crate) fn constraints_conflict(
 /// IPF over the sparse feasible set. Iterates only feasible mask keys rather than
 /// all 2^N entries, making each round O(K) where K = |feasible|.
 fn ipf_rescale_sparse(
-    weights: &mut HashMap<usize, f64>,
+    weights: &mut HashMap<SegMask, f64>,
     members: &[LowerCoverMember],
-    feasible: &HashMap<usize, HashMap<String, FieldConstraints>>,
+    feasible: &HashMap<SegMask, HashMap<String, FieldConstraints>>,
 ) {
     let n = members.len();
     const EPS: f64 = 1e-12;
@@ -460,13 +490,13 @@ fn ipf_rescale_sparse(
             let target = member.ratio;
             let mass_in: f64 = feasible
                 .keys()
-                .filter(|&&m| in_subset(m, i))
-                .map(|&m| weights[&m])
+                .filter(|m| m.contains(i))
+                .map(|m| weights[m])
                 .sum();
             let mass_out: f64 = feasible
                 .keys()
-                .filter(|&&m| !in_subset(m, i))
-                .map(|&m| weights[&m])
+                .filter(|m| !m.contains(i))
+                .map(|m| weights[m])
                 .sum();
 
             if mass_in <= EPS || mass_out <= EPS {
@@ -476,15 +506,13 @@ fn ipf_rescale_sparse(
                 converged = false;
                 let scale_in = target / mass_in;
                 let scale_out = (1.0 - target) / mass_out;
-                for &m in feasible.keys() {
-                    if in_subset(m, i) {
-                        if let Some(w) = weights.get_mut(&m) {
-                            *w *= scale_in;
-                        }
-                    } else {
-                        if let Some(w) = weights.get_mut(&m) {
-                            *w *= scale_out;
-                        }
+                // Snapshot keys to satisfy the borrow checker (mutating `weights` while
+                // reading `feasible`'s keys is fine, but keep it explicit and simple).
+                let keys: Vec<SegMask> = feasible.keys().cloned().collect();
+                for m in keys {
+                    let scale = if m.contains(i) { scale_in } else { scale_out };
+                    if let Some(w) = weights.get_mut(&m) {
+                        *w *= scale;
                     }
                 }
             }
@@ -991,7 +1019,7 @@ mod ring_tests {
 /// per-sweep convergence.
 #[cfg(test)]
 mod var_expand_prototype {
-    use super::{LowerCoverMember, ipf_rescale_sparse};
+    use super::{LowerCoverMember, SegMask, ipf_rescale_sparse};
     use crate::constraints::FieldConstraints;
     use crate::models::{Format, SyntheticDataset};
     use std::collections::HashMap;
@@ -1037,8 +1065,20 @@ mod var_expand_prototype {
     fn plain_bit(l: &Layout, p: usize) -> usize {
         l.plain_off + p
     }
-    fn bit(mask: usize, b: usize) -> bool {
-        mask & (1 << b) != 0
+    /// Test bit `b` of the raw `u128` enumeration value (subsets are counted as integers
+    /// here, then converted to `SegMask` keys via `to_mask` for the real IPF).
+    fn bit(raw: u128, b: usize) -> bool {
+        raw & (1 << b) != 0
+    }
+    /// Build the `SegMask` (FixedBitSet) key for raw enumeration value `raw`.
+    fn to_mask(raw: u128, total: usize) -> SegMask {
+        let mut m = SegMask::with_capacity(total);
+        for b in 0..total {
+            if raw & (1 << b) != 0 {
+                m.insert(b);
+            }
+        }
+        m
     }
 
     /// A minimal `LowerCoverMember`: `ipf_rescale_sparse` only reads `.ratio` (and uses the
@@ -1093,23 +1133,23 @@ mod var_expand_prototype {
         cfg: &Config,
         l: &Layout,
     ) -> (
-        HashMap<usize, HashMap<String, FieldConstraints>>,
-        HashMap<usize, f64>,
-        HashMap<usize, f64>,
-        Vec<usize>,
+        HashMap<SegMask, HashMap<String, FieldConstraints>>,
+        HashMap<SegMask, f64>,
+        HashMap<SegMask, f64>,
+        Vec<SegMask>,
     ) {
         let mut feasible = HashMap::new();
         let mut cat = HashMap::new();
         let mut naive = HashMap::new();
         let mut illegal = Vec::new();
 
-        for mask in 0..(1usize << l.total) {
+        for raw in 0..(1u128 << l.total) {
             // Discriminant: at most one case per union.
             let multi_case = cfg
                 .unions
                 .iter()
                 .enumerate()
-                .any(|(u, cases)| (0..cases.len()).filter(|&c| bit(mask, case_bit(l, u, c))).count() > 1);
+                .any(|(u, cases)| (0..cases.len()).filter(|&c| bit(raw, case_bit(l, u, c))).count() > 1);
             if multi_case {
                 continue;
             }
@@ -1117,7 +1157,7 @@ mod var_expand_prototype {
             let conflicts = cfg
                 .conflicts
                 .iter()
-                .any(|&((ua, ca), (ub, cb))| bit(mask, case_bit(l, ua, ca)) && bit(mask, case_bit(l, ub, cb)));
+                .any(|&((ua, ca), (ub, cb))| bit(raw, case_bit(l, ua, ca)) && bit(raw, case_bit(l, ub, cb)));
             if conflicts {
                 continue;
             }
@@ -1126,7 +1166,7 @@ mod var_expand_prototype {
             let mut w_naive = 1.0;
             let mut is_illegal = false;
             for (u, cases) in cfg.unions.iter().enumerate() {
-                match (0..cases.len()).find(|&c| bit(mask, case_bit(l, u, c))) {
+                match (0..cases.len()).find(|&c| bit(raw, case_bit(l, u, c))) {
                     Some(c) => w_cat *= cases[c],
                     None => {
                         w_cat *= 1.0 - cases.iter().sum::<f64>(); // 0 for a mandatory union
@@ -1134,19 +1174,20 @@ mod var_expand_prototype {
                     }
                 }
                 for (c, &v) in cases.iter().enumerate() {
-                    w_naive *= if bit(mask, case_bit(l, u, c)) { v } else { 1.0 - v };
+                    w_naive *= if bit(raw, case_bit(l, u, c)) { v } else { 1.0 - v };
                 }
             }
             for (p, &r) in cfg.plain.iter().enumerate() {
-                let s = bit(mask, plain_bit(l, p));
+                let s = bit(raw, plain_bit(l, p));
                 let f = if s { r } else { 1.0 - r };
                 w_cat *= f;
                 w_naive *= f;
             }
 
-            feasible.insert(mask, HashMap::new());
-            cat.insert(mask, w_cat);
-            naive.insert(mask, w_naive);
+            let mask = to_mask(raw, l.total);
+            feasible.insert(mask.clone(), HashMap::new());
+            cat.insert(mask.clone(), w_cat);
+            naive.insert(mask.clone(), w_naive);
             if is_illegal {
                 illegal.push(mask);
             }
@@ -1154,7 +1195,7 @@ mod var_expand_prototype {
         (feasible, cat, naive, illegal)
     }
 
-    fn normalize(w: &mut HashMap<usize, f64>) {
+    fn normalize(w: &mut HashMap<SegMask, f64>) {
         let s: f64 = w.values().sum();
         if s > 0.0 {
             for v in w.values_mut() {
@@ -1163,15 +1204,15 @@ mod var_expand_prototype {
         }
     }
 
-    fn illegal_mass(w: &HashMap<usize, f64>, illegal: &[usize]) -> f64 {
+    fn illegal_mass(w: &HashMap<SegMask, f64>, illegal: &[SegMask]) -> f64 {
         illegal.iter().map(|m| w[m]).sum()
     }
 
     /// Marginal mass of member `i` (sum of weights over masks where bit `i` is set).
-    fn marginal(w: &HashMap<usize, f64>, i: usize) -> f64 {
+    fn marginal(w: &HashMap<SegMask, f64>, i: usize) -> f64 {
         let mut s = 0.0;
-        for (&m, &x) in w.iter() {
-            if bit(m, i) {
+        for (m, &x) in w.iter() {
+            if m.contains(i) {
                 s += x;
             }
         }
@@ -1183,17 +1224,17 @@ mod var_expand_prototype {
     /// deliberately low cap for the leak demonstration. Correctness is asserted against the
     /// real `ipf_rescale_sparse` elsewhere.
     fn ipf_mirror(
-        weights: &mut HashMap<usize, f64>,
+        weights: &mut HashMap<SegMask, f64>,
         members: &[LowerCoverMember],
-        feasible: &HashMap<usize, HashMap<String, FieldConstraints>>,
+        feasible: &HashMap<SegMask, HashMap<String, FieldConstraints>>,
         max_iter: usize,
     ) -> usize {
         for iter in 0..max_iter {
             let mut converged = true;
             for (i, m) in members.iter().enumerate() {
                 let target = m.ratio;
-                let mass_in: f64 = feasible.keys().filter(|&&k| bit(k, i)).map(|k| weights[k]).sum();
-                let mass_out: f64 = feasible.keys().filter(|&&k| !bit(k, i)).map(|k| weights[k]).sum();
+                let mass_in: f64 = feasible.keys().filter(|k| k.contains(i)).map(|k| weights[k]).sum();
+                let mass_out: f64 = feasible.keys().filter(|k| !k.contains(i)).map(|k| weights[k]).sum();
                 if mass_in <= EPS || mass_out <= EPS {
                     continue;
                 }
@@ -1201,8 +1242,8 @@ mod var_expand_prototype {
                     converged = false;
                     let si = target / mass_in;
                     let so = (1.0 - target) / mass_out;
-                    for (&k, w) in weights.iter_mut() {
-                        *w *= if bit(k, i) { si } else { so };
+                    for (k, w) in weights.iter_mut() {
+                        *w *= if k.contains(i) { si } else { so };
                     }
                 }
             }

@@ -120,7 +120,11 @@ takes precedence.
 `build_plan` produces a flat list of `ExecutionStep` variants. This is where:
 
 - Row counts are resolved (ratios → integers)
-- Lower cover groups are identified and segmented via Bernoulli factoring
+- Lower-cover members carrying `type: variant` fields are **lowered** into one
+  case-member per case plus an exclusion group (`lower_member_variants`) — see
+  [Variants as Tagged Unions](/concepts/variant-lowering/)
+- Lower cover groups are identified and segmented via Bernoulli factoring (variant
+  exclusion groups branch categorically; integer counts via largest-remainder rounding)
 - Inherited field wiring is determined (which parent fields come from which child batch)
 - Collect targets (for `reducer: collect` bindings) are recorded
 
@@ -196,7 +200,7 @@ API rather than SQL strings where possible.
 
 ---
 
-## Import specialisation restrictions {#import-specialisation-restrictions}
+## Import specialisation restrictions
 
 When a dataset carries an `import:` stanza, its imported columns become **tainted** —
 they are marked with `imported_taint: true` during header loading and cannot be

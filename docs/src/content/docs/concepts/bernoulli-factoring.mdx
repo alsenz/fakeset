@@ -73,9 +73,11 @@ After pruning, the surviving segment weights generally no longer have the correc
 marginals (each member's declared `ratio`). IPF rescales the weights iteratively
 until the marginals are exactly restored. This typically converges in a few passes.
 
-Integer row counts are derived by Bernoulli rounding: each segment's fractional
-weight is rounded to an integer, with the fractional remainder converted to a
-Bernoulli trial (one extra row with that probability).
+Integer row counts are derived by **largest-remainder (Hamilton) rounding**: every
+segment is floored, then the leftover rows (`total − Σ floors`) are handed to the
+segments with the largest fractional parts. This is unbiased *and* conserves the
+parent total exactly — the latter matters when a member is also a parent, whose
+in-group row count must match the count its own generation step produced.
 
 ## A concrete example
 
@@ -139,21 +141,25 @@ makes a member-count cap unnecessary: the work is proportional to the number of
 
 ### Step 1 — Precompute pairwise conflict masks
 
-Before the DFS, `precompute_conflicts` builds a compact N-element array
-`conflict_masks`: for member `i`, `conflict_masks[i]` is the bitmask of all
-members `j > i` whose constraints conflict with member `i`. This requires only N×(N−1)/2
-`try_merge_incremental` checks — one per pair — and is O(N²) overall.
+Before the DFS, `precompute_conflicts` builds a per-member `conflict_masks`: for
+member `i`, `conflict_masks[i]` is the set of all members `j` whose constraints
+conflict with member `i`. Each mask is a `FixedBitSet` (so there is no ceiling on the
+number of members in a group). This requires only N×(N−1)/2 `try_merge_incremental`
+checks — one per pair — and is O(N²) overall.
 
 ### Step 2 — Branch-and-bound DFS
 
-`enumerate_segments_dfs` walks the inclusion lattice recursively. At each level
-`idx` (one per lower-cover member), it takes two branches:
+`enumerate_segments_dfs` walks an **entry plan** recursively. Each entry is either a
+plain lower-cover member or an **exclusion group** (a lowered
+[tagged union](/concepts/variant-lowering/) — its cases are mutually exclusive):
 
-- **Exclude branch** — multiply the running weight by `1 − ratio[idx]`; recurse to `idx+1`.
-- **Include branch** — first check `(mask & conflict_masks[idx]) == 0` (any already-included
-  member conflicts with this one?). If not, try `try_merge_incremental` to add
-  member `idx`'s constraints to the running merged set. If that also succeeds,
-  multiply weight by `ratio[idx]` and recurse.
+- **Plain member** — two branches: *exclude* (multiply weight by `1 − ratio`) and
+  *include* (check `mask.is_disjoint(&conflict_masks[i])`, then `try_merge_incremental`;
+  on success multiply by `ratio` and recurse with member `i` added to the mask).
+- **Exclusion group** — `N + 1` categorical branches: *no case* (weight `1 − Σvᵢ`,
+  pruned when that is 0 — a mandatory union) and one branch per case (weight `vᵢ`).
+  Because the search picks at most one case, two cases of a union can never co-occur
+  in a segment — mutual exclusion is structural, needing no constraint or column.
 
 Entire subtrees are pruned immediately when a conflict is detected — no work is
 done for infeasible descendants. For one-of groups (mutually exclusive members),
@@ -169,12 +175,14 @@ The DFS halts with an error if `K > MAX_FEASIBLE_SEGMENTS` (1,000,000).
 ### Step 3 — Sparse IPF and Bernoulli rounding
 
 `ipf_rescale_sparse` iterates only the K feasible segments (stored as
-`HashMap<usize, f64>` of mask → weight). Each pass is O(K·N). For one-of groups,
-K = N+1, making this thousands of times faster than dense O(2^N·N) IPF.
+`HashMap<FixedBitSet, f64>` of membership mask → weight). Each pass is O(K·N). For
+one-of groups, K = N+1, making this thousands of times faster than dense O(2^N·N) IPF.
+IPF only runs when conflict pruning actually removed mass; with no conflicts the
+prior weights are already exact and IPF is skipped.
 
-Integer row counts are derived by Bernoulli rounding: each segment's fractional
-weight is rounded to an integer, with the fractional remainder converted to a
-Bernoulli trial.
+Integer row counts are derived by largest-remainder (Hamilton) rounding: floor every
+segment, then award the leftover rows to the largest fractional parts — unbiased and
+exactly total-conserving.
 
 ### Summary
 

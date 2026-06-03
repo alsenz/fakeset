@@ -32,7 +32,7 @@ immediately:
 | Check | Datasets |
 |---|---|
 | Numeric fields within declared `range` | policies, contracts, claims, micro/small/medium/grants |
-| Variant columns restricted to their declared value set | policies, contracts |
+| Variant columns restricted to their declared value set (every lowered case is a declared value; a mandatory variant member never orphans a row) | policies, contracts, premiums, claims |
 | Referential integrity (`ref:` fields point to valid rows) | contracts→customers, premiums→contracts, claims→contracts, directors→individuals, smes→orgs, micro/small→smes, grants→micro |
 | Expression result = formula (`net_payout = claim_amount - deductible`) | claims |
 | List cardinality within declared `min`/`max` | contracts.covered\_policies, organisations.directors |
@@ -50,7 +50,7 @@ out a random false alarm before investigating.
 | Check | Test | Datasets |
 |---|---|---|
 | Include ratios match declared values | Binomial | contracts, premiums, claims, directors, smes, micro, grants |
-| Variant frequency distributions match declared ratios | χ² goodness-of-fit | contracts.status |
+| Variant (tagged-union) case frequencies match declared ratios | χ² goodness-of-fit | contracts.status; premiums.billing\_period / payment\_method / status; claims.claim\_type / status |
 | Numeric values consistent with Uniform[min, max] | Kolmogorov–Smirnov | annual\_premium, claim\_amount, deductible, base\_premium, grant.amount |
 
 Tests skip automatically when the sample is too small for the chosen statistic

@@ -4,14 +4,15 @@ Companion to [`VAR-EXPAND.md`](VAR-EXPAND.md). The spec covers the design, the
 terminology, and the function-level contracts; this doc covers PR sequencing,
 intermediate test green-points, and risks discovered during planning. It also
 folds in the two remaining "next steps" the spec deferred: the
-[`VAR-LINKED-CONTENT`](VAR-LINKED-CONTENT.md) validation gate (PR 1) and the
+[`VAR-LINKED-CONTENT`](../VAR-LINKED-CONTENT.md) validation gate (PR 1) and the
 celebratory `variant-lowering.mdx` concepts page (PR 4).
 
 ## Status
 
-Planned. The planner-math is already de-risked: the **Q-prototype**
-(`lib/segment.rs::mod var_expand_prototype`) proves `M₀ = 0` is preserved by the
-real `ipf_rescale_sparse` and that interior IPF converges in ≤14 sweeps. That
+**Complete — PR 1–5 implemented and merged.** Full suite green (100 Rust + 74
+statistical). The planner-math was de-risked up front by the **Q-prototype**
+(`lib/segment.rs::mod var_expand_prototype`), which proves `M₀ = 0` is preserved by
+the real `ipf_rescale_sparse` and that interior IPF converges in ≤14 sweeps. That
 test stays as the planner-math regression guard for the life of the feature.
 
 ## The one correctness invariant to hold throughout
@@ -41,9 +42,9 @@ behaviour is byte-identical), so PR 3 is a focused flip.
 |----|---------|-------|
 | 1 ✅ | Lock target behaviour + `VAR-LINKED-CONTENT` gate | Lock-in fixtures/tests (regression guards — pure non-ref lowering is behaviour-preserving) + validation rejection of variants on linked content lists |
 | 2 ✅ | Dormant machinery | `models.rs` discriminant helper; `segment.rs` `ExclusionGroup` + categorical factor + entry-based DFS; `plan_segments` signature change (all callers pass `&[]`) — behaviour-neutral |
-| 3 | The lowering switchover | `plan.rs` `lower_variant_unions`; executor discriminant handling; delete VAR-2 variant sub-distribution; remove `#[ignore]` |
-| 4 | Docs + terminology adoption | `variant-lowering.mdx` (celebratory), CLAUDE.md glossary/module-map/sentinels, README, testing.mdx, docgen |
-| 5 | Close-out | Mark specs complete, move to `specs/done/`, re-point VAR-SPECIALIZE |
+| 3 ✅ | The lowering switchover | **Implemented, validated, green.** `lower_member_variants` lowers leaf-member tagged unions; `segment.rs` mask→`SegMask = FixedBitSet` (no ceiling) and **largest-remainder rounding**; skip member-also-parents. Full suite passes. Earlier "reverted/broken" diagnosis was wrong — see §PR 3 finding |
+| 4 ✅ | Docs + terminology adoption | New `concepts/variant-lowering.mdx` + sidebar; corrected `bernoulli-factoring.mdx` (largest-remainder, `FixedBitSet`, entry-DFS) and `execution-pipeline.mdx`; CLAUDE.md glossary/module-map; README; testing.mdx; yaml-schema.mdx. **Written to the as-built system** — no `_disc_` column, per-member cross-product group, leaf-only lowering, largest-remainder rounding |
+| 5 ✅ | Close-out | Specs marked complete + moved to `specs/done/`; feature table flipped; VAR-SPECIALIZE re-pointed (substrate now exists); `var_expand_prototype` kept as a permanent planner-math regression guard; VAR-LINKED-CONTENT remains the open future stub (gate lives in `validate.rs`) |
 
 **Revert safety (a convention worth keeping).** The dormant/flip split is chosen so
 that exactly one commit changes behaviour. PRs 1–2 are behaviour-neutral (new
@@ -130,7 +131,44 @@ zero groups equals today's product-Bernoulli prior. Landed:
 Green-point (met): full `cargo test` (100 lib + integration) and `pytest` (74)
 unchanged from pre-PR counts; 3 new exclusion-group unit tests added.
 
-### PR 3 — The lowering switchover (atomic)
+### PR 3 — The lowering switchover (atomic) — ✅ VALIDATED
+
+**Status: implemented, full suite green (100 Rust + 74 statistical, 0 ref orphans).**
+
+#### PR 3 finding (a false alarm, then the real fixes)
+
+The first cut failed seven statistical tests and I wrote an elaborate theory —
+fragmentation shatters marginals, IPF is destroyed, controlled-rounding is NP-hard,
+lower only ref-bound variants. **That theory was wrong** (IPF wasn't even running;
+per-marginal the rounding is unbiased with variance ≈ multinomial). The real defects
+were mundane and are now fixed:
+
+- **Bitmask overflow:** segment masks were `usize` (64-member ceiling); `premiums`'
+  3×4×4=48 cases + `claims` exceed 64 → `1 << i` wrapped *silently in release* →
+  corrupted segments → all 7 failures. **Fix:** `SegMask = FixedBitSet` (`fixedbitset`,
+  already a transitive dep via petgraph) — no member-count ceiling, no meaningful cost
+  (the planner runs once per group, not per row). (A `u128`+`>128`-guard stopgap came
+  first; the bitset superseded it.)
+- **Biased rounding:** `if raw≥1 {round()} else {Bernoulli}` biased the *common*
+  cells only → differential cross-category bias → χ². **Fix:** **largest-remainder
+  (Hamilton)** rounding — unbiased + exact total conservation.
+- **Member-also-parent double-lowering:** `contracts` (member of `customers`, parent
+  of `premiums`/`claims`, own `status` variant) was lowered again as a member,
+  regenerating it with random `customer_id` (600 orphans). **Fix:**
+  `lower_member_variants` skips members that are keys in `lower_cover_groups`.
+
+Total conservation (largest-remainder) is what stops a member-also-parent's in-group
+count from drifting off its own-step count and triggering `pad_or_generate_tail`
+fresh-gen with mismatched refs.
+
+**Remaining concern = performance at scale, not correctness:** the ∏ segment count.
+Insurance is small and fine; a large multi-variant schema could approach
+`MAX_FEASIBLE_SEGMENTS`. The **conflict-graph component factoring** (enumerate joint
+segments only within a connected conflict component; combine independents
+multiplicatively at generation, à la VAR-2 Level 2) is the scale fix — a future
+optimization, not a blocker.
+
+The original step-by-step plan follows, retained for reference:
 
 1. **`lib/plan.rs` — `lower_variant_unions`.** The lowering pass. For every node
    with `variants:` (top-level *and* leaf member), produce one lowered case per
@@ -163,10 +201,37 @@ Green-point: `cargo test` (Rust) + `pytest` (statistical). Insurance variant
 membership/distribution tests hold; the new no-orphan and IPF-exact joint-count
 tests now pass.
 
-### PR 4 — Docs + terminology adoption
+### PR 4 — Docs + terminology adoption ✅
 
-Ships with PR 3's behaviour (per the CLAUDE.md "docs in the same change" rule);
-keep it a separate PR only for review clarity, landing together.
+**Written to the as-built system, not the original sketch.** Key corrections that
+landed in the docs (the original plan below assumed mechanisms we did not build):
+no `_disc_<union>` sentinel column (exclusion is *structural* in the DFS; a
+discriminant column is reserved for VAR-SPECIALIZE); **one `ExclusionGroup` per
+member's variant cross-product** (not per-field); lowering applies to **leaf members
+only** (`lower_member_variants`, not `lower_variant_unions`; members that are also
+parents are reused); **largest-remainder** rounding; `SegMask = FixedBitSet`.
+
+Landed:
+
+- **`docs/.../concepts/variant-lowering.mdx`** (new) + sidebar entry — "Variants as
+  Tagged Unions": tagged union / case / lowering / exclusion group; structural
+  exclusion (no column); mandatory-union no-orphan via the categorical `1−Σvᵢ`
+  factor; largest-remainder rounding; scale note → independent-group decomposition.
+- **`docs/.../concepts/bernoulli-factoring.mdx`** — corrected to largest-remainder
+  rounding, `HashMap<FixedBitSet, …>`, `is_disjoint` conflict checks, and the
+  entry-based DFS (plain member = 2 branches; exclusion group = N+1 categorical).
+- **`docs/.../concepts/execution-pipeline.mdx`** — `build_plan` step notes lowering.
+- **`CLAUDE.md`** — glossary (tagged union, case, lowering, exclusion group,
+  discriminant *as conceptual tag, not a column*, illegal mass, linked content list);
+  module map (`lower_member_variants`, `ExclusionGroup`, `SegMask = FixedBitSet`,
+  largest-remainder); Bernoulli-factoring section; spec-table row; removed the
+  now-fixed `conflicting_constants` flaky-test note (largest-remainder is deterministic).
+- **`README.md`** + **`reference/yaml-schema.mdx`** — tagged-union framing in prose.
+- **`reference/testing.mdx`** — variant value-membership + no-orphan (hard) and
+  per-case χ² distributions for premiums/claims (soft).
+- **`src/docgen.rs`** — unchanged; the `variants:` YAML stanza is unchanged.
+
+The original (idealized) checklist follows for reference:
 
 - **`docs/src/content/docs/concepts/variant-lowering.mdx`** — "Variants as tagged
   unions." Explains, for users: a `type: variant` field *is* a tagged union; the
@@ -186,16 +251,21 @@ keep it a separate PR only for review clarity, landing together.
 - **`src/docgen.rs` / `reference/yaml-schema.mdx`** — no new YAML; note the
   tagged-union model in prose.
 
-### PR 5 — Close-out
+### PR 5 — Close-out ✅
 
-- Mark `specs/VAR-EXPAND.md` and `specs/VAR-EXPAND-impl.md` **Complete**, move to
-  `specs/done/`; update the feature-spec table in `CLAUDE.md`.
-- Move `mod var_expand_prototype` note from "Q-prototype" to a permanent
-  "planner-math regression guard" mention.
-- Re-point `specs/VAR-SPECIALIZE.md`: its substrate (lowering + discriminant) now
-  exists; update its status from "depends on (unbuilt) VAR-EXPAND".
-- Leave `specs/VAR-LINKED-CONTENT.md` as the open future stub (its gate now lives
-  in `validate.rs`).
+- `VAR-EXPAND.md` and `VAR-EXPAND-impl.md` marked **Complete** and moved to
+  `specs/done/`; `CLAUDE.md` feature-spec table flipped and re-pathed.
+- `mod var_expand_prototype` (`lib/segment.rs`) retained as a permanent
+  planner-math regression guard.
+- `specs/VAR-SPECIALIZE.md` re-pointed: its substrate (lowering + the reserved
+  discriminant) now exists; status notes VAR-EXPAND is complete.
+- `specs/VAR-LINKED-CONTENT.md` remains the open future stub (its validation gate
+  lives in `validate.rs`).
+
+**Note on the discriminant:** PR 5 confirms what the implementation settled — the
+discriminant is *not* a materialised column in the shipped VAR-EXPAND (exclusion is
+structural in the DFS). VAR-SPECIALIZE is where a materialised discriminant /
+`allowed_values` constraint becomes necessary, for child subset-restriction.
 
 ## Traceability matrix
 

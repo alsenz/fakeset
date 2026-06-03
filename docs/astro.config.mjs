@@ -45,6 +45,7 @@ export default defineConfig({
             { label: 'The Semi-Lattice Model', link: '/concepts/semi-lattice/' },
             { label: 'Execution Pipeline', link: '/concepts/execution-pipeline/' },
             { label: 'Bernoulli Factoring', link: '/concepts/bernoulli-factoring/' },
+            { label: 'Variants as Tagged Unions', link: '/concepts/variant-lowering/' },
             { label: 'List Links & Witness Assembly', link: '/concepts/list-links/' },
           ],
         },

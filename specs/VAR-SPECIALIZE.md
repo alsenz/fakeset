@@ -2,11 +2,35 @@
 
 ## Status
 
-**Proposed — design exploration.** Depends on [`VAR-EXPAND`](VAR-EXPAND.md);
-this spec assumes variants are already **lowered** into the lattice per
-VAR-EXPAND — each `type: variant` field is a **tagged union** lowered into
-**cases** that are ordinary lower-cover members, with a **discriminant**
-sentinel (`_disc_<union>`) enforcing one case per row.
+**Proposed — design exploration.** Builds on [`VAR-EXPAND`](done/VAR-EXPAND.md),
+which is **complete**. Two as-built facts from VAR-EXPAND reshape this spec and must
+be kept front of mind:
+
+1. **No discriminant column is materialised.** A lower-cover member's `type: variant`
+   field is lowered (`lower_member_variants`, `plan.rs`) into one **case-member** per
+   case; mutual exclusion is enforced **structurally** in the DFS (an `ExclusionGroup`
+   branches categorically — "no case" ∪ "exactly one case"). `ExclusionGroup.discriminant`
+   is only a *label* (`_disc_<name>`) carried to the executor — it is never written to a
+   batch. The earlier sketch's "`allowed_values` constraint on a real `_disc_<union>`
+   column" therefore describes machinery that **does not exist yet**.
+2. **A lowered case-member pins the parent field's *value*, not a discriminant.** Via
+   `merge_variant_fields`, each case-member carries the variant's field overrides; when a
+   case fixes the unioned field to a constant it surfaces as an ordinary `value`
+   `FieldConstraint` (`lower_cover_field_constraints`) and already participates in the
+   pairwise conflict pruning the DFS performs.
+
+This splits VAR-SPECIALIZE into **two largely independent halves**:
+
+- **Generator-domain specialisation (case 2 below)** — pure `FieldConstraints::Merge` /
+  `satisfiable` / validation change. **No VAR-EXPAND machinery, no column, no DFS change.**
+  Resolves the CLAUDE.md "Generator-plus-value constraint should specialise, not conflict"
+  known limitation. Self-contained and shippable on its own.
+- **Variant-subset specialisation (case 1 below)** — restricting a parent union to a
+  subset of its cases. This is the half with a genuine **open design fork** (see
+  §Variant-subset: how the planner sees the restriction): whether subset pruning can fall
+  out of the same pairwise `value`/`allowed_values` merge that case-members already feed,
+  or whether it forces materialising the discriminant column for the first time. That fork
+  is the main thing to decide before an implementation plan.
 
 ## What this is
 
@@ -42,39 +66,90 @@ Level-2 sub-distribution). The VAR-SPECIALIZE drafts that predate VAR-EXPAND
 had to add a *third* Level-2 IPF pass to handle specialisation correctly when
 sibling members in a joint segment further constrain a variant set.
 
-Under VAR-EXPAND every tagged union is **lowered** into cases that are ordinary
-lower-cover members, and the union's **discriminant** makes the cases mutually
-exclusive (`caseᵢ ∧ caseⱼ = ⊥`). Specialisation then needs no new mechanism — it
-is just a constraint that prunes cases during ordinary Bernoulli factoring:
+Under VAR-EXPAND a lower-cover member's tagged union is **lowered** into cases that
+are ordinary lower-cover members, mutually exclusive by **structural** DFS branching
+(`caseᵢ ∧ caseⱼ = ⊥` because at most one case-member's bit is ever set). What
+VAR-SPECIALIZE adds in each case:
 
-- A child's **variant-subset restriction** is an `allowed_values` constraint on
-  the union's discriminant `_disc_<union>`. During factoring, any segment that
-  pairs the child with an out-of-subset case pins the discriminant to two
-  incompatible values → `⊥` → dropped. (Pinning a single value, as in
-  VAR-EXPAND's per-case discriminant, is just the singleton case of the same
-  `allowed_values` machinery — the two specs share it.)
-- A child's **`value: "constant"`** specialisation propagates as a
-  `FieldConstraints` whose `value` pins the parent column. Lowered cases whose
-  ref-bound value `!=` constant are pruned; pure-generator parent fields merge
-  cleanly (see §Generalised merge semantics).
+- A child's **`value: "constant"`** specialisation (case 2) propagates as a
+  `FieldConstraints` whose `value` pins the parent column. Lowered case-members whose
+  pinned value `!=` the constant are pruned by *existing* pairwise conflict checking;
+  pure-generator parent fields merge cleanly once `Merge` stops treating
+  `value + generator` as a conflict (see §Generalised merge semantics). This half
+  genuinely "needs no new mechanism."
+- A child's **variant-subset restriction** (case 1) is the half that needs a real
+  decision. The clean story — "it's an `allowed_values` constraint on a `_disc_<union>`
+  column that conflict pruning sees for free" — assumed a materialised discriminant,
+  which VAR-EXPAND deliberately did **not** build. Whether subset restriction can still
+  be expressed purely as pairwise `value`/`allowed_values` merges between the child and
+  each lowered case-member, or whether it forces materialising the discriminant, depends
+  on a subtlety the original draft glossed over: **the union being restricted sits on the
+  *parent*, but VAR-EXPAND only lowers *member* unions** (and explicitly skips members
+  that are also parents). See §Variant-subset: how the planner sees the restriction.
 
-Both forms reduce to "narrow the parent's allowed set, then let factoring + IPF
-do the work". **No separate Level-2 IPF pass is needed — and, under VAR-EXPAND's
-synthesis, no IPF extension either:** because lowered cases are ordinary members,
-*vanilla* per-member `ipf_rescale_sparse` already restores each case's marginal
-and redistributes mass pruned by specialisation. VAR-SPECIALIZE contributes only
-the constraints that cause the pruning.
+For both halves, the IPF story is unchanged and favourable: because lowered cases are
+ordinary members, **no separate Level-2 IPF pass and no IPF extension is needed** —
+*vanilla* per-member `ipf_rescale_sparse` already restores each case's marginal and
+redistributes mass pruned by specialisation. VAR-SPECIALIZE contributes only the
+constraints that cause the pruning.
+
+## Variant-subset: how the planner sees the restriction
+
+This is the central open fork for case 1. Restating the scenario precisely against
+as-built code: `animals.yaml` (the **parent**) declares `eats: type: variant
+[birds, mice, grass, fish]`; `cats.yaml` (a **child**, i.e. a lower-cover member of
+`animals`) wants `eats ∈ {birds, mice}`.
+
+The catch: VAR-EXPAND's `lower_member_variants` lowers the union of a **lower-cover
+member** into case-members. The union here lives on the **parent** `animals`, so at the
+position where `cats` restricts it there may be **no `ExclusionGroup` and no
+case-members at all** — the parent's `eats` is just a field generated by the
+segment-atom pipeline. Two candidate designs:
+
+- **Option A — pairwise merge, no column.** Lower the *parent's* union too (or recognise
+  that, where the child co-segments with the parent's lowered cases, each case-member
+  pins `eats = <case>` as a `value` constraint). The child carries
+  `allowed_values: [birds, mice]` on its `eats` ref; `merge(value="grass",
+  allowed_values=[birds,mice]) = None` prunes the out-of-subset joints via the existing
+  conflict machinery. **No discriminant column is ever materialised.** Cost: parent-union
+  lowering must run at the right lattice position, and we must confirm a child and the
+  parent's lowered cases actually share a segment.
+- **Option B — materialise the discriminant.** Give the union a real `_disc_<union>`
+  `UInt32`/string column (stripped from output like `_slot_idx`), have each case-member
+  pin it, and carry the child's restriction as an `allowed_values` constraint on that
+  column. This is the original sketch; it is heavier (a new sentinel through the
+  segment-atom pipeline) but decouples subset restriction from whether/where the union
+  was lowered.
+
+Picking between A and B — and resolving the parent-vs-member-position question that
+drives it — is the prerequisite for an implementation plan for case 1. Case 2 does not
+wait on this.
 
 ## Generalised merge semantics
 
 The bigger change VAR-SPECIALIZE forces is to broaden
 `FieldConstraints::Merge`. Current behaviour (`lib/constraints.rs:99-115`)
-treats `value + generator` as unsatisfiable. The right model:
+treats `value + generator` as unsatisfiable. The unifying model that dissolves
+that:
 
-A parent `generator:` declares an **open domain** of values the field could
-produce. A child specialising the same field with a constant or an
-`allowed_values` set is *selecting a subset* of that domain — by definition
-compatible.
+**A field's value-source is a single spectrum of generators ordered by how much
+of the domain they pin down — not a set of competing fields.** Having a `type`
+already gives the field its *default generator* (random-for-the-type); everything
+else is a *narrower generator over the same domain*:
+
+- **type default** — widest (any value of the type)
+- **explicit `generator:`** — a narrower domain (`email`, a gaussian, …)
+- **`allowed_values:`** — a *finite-set generator* (uniform over a known set)
+- **`value:`** — a **static (const) generator**: a singleton the planner knows
+  ahead of time. `value` *is* a generator — the maximally specialised one.
+
+Seen this way, a child specialising a field just **replaces the inherited
+generator with a more specialised one further down the same spectrum** — never a
+conflict. The old `value + generator` "conflict" was a category error: `value`
+doesn't fight the generator, it *is* a tighter (static) generator that supersedes
+it. Two specialisations conflict only when they pick *incompatible* points on the
+spectrum — two different constants, disjoint sets, or a value outside an allowed
+set.
 
 Concretely, extend `FieldConstraints`:
 
@@ -101,8 +176,23 @@ And rewrite `Merge`:
 | `allowed_values=S₁` | `allowed_values=S₂` | `allowed_values=S₁∩S₂` (or `None` if empty) | intersection |
 | `min`/`max` ranges | | intersected | unchanged |
 
-A `value` (constant) is always strictly tighter than a `generator` or a
-non-empty `allowed_values` set. The merge picks the tightest of the inputs.
+The merge always **picks the tightest point on the spectrum**: `value` (static
+generator) ≺ `allowed_values` (finite set) ≺ `generator` (domain) ≺ type default.
+
+### Per-case generators (mirrors VAR-1)
+
+The same spectrum applies *inside* a tagged union: a variant **case is a field**, so
+it has a generator by construction (its type default, an explicit `generator:`, or a
+`value:` static generator — the last being *terribly common*, especially for same-type
+unions). Two consequences VAR-SPECIALIZE must plan for from the start:
+
+- A child can **specialise a single case's generator** (e.g. restrict one case from an
+  open generator to a `value`, or swap a case's gaussian for a tighter one) — the exact
+  same merge, applied per case.
+- This is the same machinery VAR-1 needs for **generator-bearing heterogeneous cases**
+  (the salary two-gaussian shape). VAR-1 and VAR-SPECIALIZE's generator-domain half
+  therefore share *one* `FieldConstraints::Merge` — they must be designed against it
+  together, not as two separate notions of "specialise a generator."
 
 **Notable non-goal:** we deliberately do *not* implement per-generator
 "is `v` in this domain?" feasibility checks. Generators are treated as
@@ -180,14 +270,15 @@ data:
    `Merge::merge` impl resolves the value-with-generator and
    allowed-values-with-generator cases naturally.
 
-3. **Bernoulli factoring (per VAR-EXPAND).** Each lowered case is an ordinary
-   member carrying its own ref-bound `FieldConstraints` (including its
-   discriminant pin). If a case's constraints are incompatible with the merged
-   constraints arriving from a sibling member on the same segment — e.g. a
-   child's `allowed_values` discriminant restriction, or a sibling's `value`
-   pin — that segment is `⊥` and is dropped. This is the *same* conflict
-   pruning VAR-EXPAND already performs; specialisation just adds constraints to
-   it.
+3. **Bernoulli factoring (per VAR-EXPAND).** Each lowered case-member carries its
+   own ref-bound `FieldConstraints` — a `value` pin on the unioned parent field
+   (there is no discriminant pin; see §Status). If a case-member's constraints are
+   incompatible with the merged constraints arriving from a sibling member on the
+   same segment — e.g. a child's `allowed_values` restriction, or a sibling's
+   `value` pin — that segment is `⊥` and is dropped. This is the *same* pairwise
+   conflict pruning VAR-EXPAND already performs; specialisation just adds
+   constraints to it. (Whether the parent union's cases are present to be pruned at
+   the child's position is the Option A/B question in §Variant-subset.)
 
 4. **IPF (vanilla — no extension).** Because lowered cases are ordinary members,
    the existing per-member `ipf_rescale_sparse` already restores each case's
@@ -197,10 +288,16 @@ data:
    under VAR-EXPAND's synthesis: the marginals are per-member, and cases *are*
    members. VAR-SPECIALIZE owns no IPF change.
 
-5. **Executor.** No changes beyond VAR-EXPAND's. Each lowered case is generated
-   per-member from its concrete schema; the merged `value` / `allowed_values`
-   arrive in `seg.field_constraints` and are applied to the shared atom column
-   via `apply_constraints` in `generate_segment_atom_batch`.
+5. **Executor.** Each lowered case is generated per-member from its concrete
+   schema; the merged constraints arrive in `seg.field_constraints` and are applied
+   to the shared atom column via `apply_constraints` in `generate_segment_atom_batch`
+   (`executor.rs`). One concrete change is required here: `apply_constraints` today
+   handles `value` / `generator` / `min` / `max` only — it must learn an
+   `allowed_values` arm, and `generate_column` must honour it (sample uniformly from
+   the set when no single `value` is set). So "no executor changes" is **not** true —
+   the generator/atom path gains `allowed_values` support. Under Option B it would also
+   need to thread the `_disc_<union>` sentinel through the atom pipeline and strip it on
+   emit.
 
 ## Validation
 
@@ -219,17 +316,22 @@ Add to `lib/validate.rs`:
 
 ## Files (preliminary)
 
-| File | Expected change |
-|------|----------------|
-| `lib/models.rs` | Add `allowed_values: Option<Vec<YamlValue>>` to `Field`; propagate to `FieldConstraints` |
-| `lib/constraints.rs` | New merge table per §Generalised merge semantics; revise `satisfiable`; drop `value + generator` rejection from `validate_field_constraints` |
-| `lib/validate.rs` | `allowed_values` checks per §Validation |
-| `lib/segment.rs` | DFS conflict-pruning already uses `Merge` — picks up new behaviour for free |
-| `lib/rewrite.rs` | `resolve_refs` propagates child's `value`/`allowed_values` through the parent column's constraint map |
-| `lib/generator.rs` | `generate_column` learns to honour `allowed_values` (pick uniformly from the set when no `value` is set) |
-| `src/docgen.rs` | Document `allowed_values` in the YAML schema |
-| `docs/src/content/docs/reference/yaml-schema.mdx` | New YAML field entry |
-| `CLAUDE.md` | Remove "Generator-plus-value constraint should specialise, not conflict" from Known limitations once the merge change lands |
+Half-1 = generator-domain specialisation (self-contained); Half-2 = variant-subset
+(gated on the Option A/B decision).
+
+| File | Expected change | Half |
+|------|----------------|------|
+| `lib/constraints.rs` | New merge table per §Generalised merge semantics; revise `satisfiable` **and** `validate_field_constraints` (both currently reject `value + generator`, constraints.rs:31-71) | 1 |
+| `lib/segment.rs` | DFS conflict-pruning already uses `Merge` — picks up new `value/generator` behaviour for free | 1 |
+| `lib/models.rs` | Add `allowed_values: Option<Vec<YamlValue>>` to `Field` and `FieldConstraints` | 2 |
+| `lib/validate.rs` | `allowed_values` checks per §Validation | 2 |
+| `lib/rewrite.rs` | `resolve_refs` propagates child's `value`/`allowed_values` through the parent column's constraint map | 2 |
+| `lib/generator.rs` | `generate_column` learns to honour `allowed_values` (pick uniformly from the set when no `value` is set) | 2 |
+| `lib/executor.rs` | `apply_constraints` (executor.rs:2338) gains an `allowed_values` arm so it reaches the shared atom column; Option B additionally threads `_disc_<union>` through `generate_segment_atom_batch` and strips it on emit | 2 |
+| `lib/plan.rs` | Option A only: lower the *parent's* union at the child's position (counterpart to `lower_member_variants`' member-only lowering) — resolves §open-question-2 | 2 |
+| `src/docgen.rs` | Document `allowed_values` in the YAML schema | 2 |
+| `docs/src/content/docs/reference/yaml-schema.mdx` | New YAML field entry | 2 |
+| `CLAUDE.md` | Remove "Generator-plus-value constraint should specialise, not conflict" from Known limitations once Half-1 lands | 1 |
 
 ## Test plan
 
@@ -255,29 +357,47 @@ Unit / integration:
 
 ## Open questions
 
-1. **Closed-enumeration generators.** `boolean` is a closed enumeration
-   (`true` / `false`). Should `merge(generator=boolean, value="hello")`
-   be a conflict? Likely yes — but we deliberately keep this list small
-   (probably just `boolean` and any future closed-set generators). All
-   other generators are treated as open domains.
+The first two are **load-bearing** — an implementation plan cannot start for the
+variant-subset half until they are answered. The rest are smaller policy calls.
 
-2. **`allowed_values` on numeric fields.** `value: [10, 20, 30]` in a
-   `range: {min: 0, max: 100}` is reasonable. Should the executor sample
-   uniformly from the set? Probably yes — same machinery as the variant-
-   value case, just over numeric values.
+1. **Variant-subset mechanism: Option A (pairwise merge, no column) vs Option B
+   (materialise `_disc_<union>`).** See §Variant-subset. This is the decision that
+   shapes the whole case-1 implementation.
 
-3. **Validating `allowed_values` against the parent's generator.** If
-   parent has `generator: first_name` and child specialises
-   `allowed_values: [1, 2, 3]`, we have a type mismatch but not a domain
-   mismatch (since we don't enumerate). Catch this at validation via the
-   parent's `field_type`?
+2. **Parent-vs-member union position.** VAR-EXPAND lowers a *lower-cover member's*
+   union and **skips members that are also parents**. The fields a child restricts
+   live on the *parent*. So: does the parent's union get lowered into case-members at
+   the position the child co-segments, or not? If not, Option A is unavailable and
+   Option B is forced. Confirming the exact planner position (and whether
+   `lower_member_variants`' skip rule needs a counterpart for parent unions) is a
+   prerequisite. This wasn't a question in the original draft because it assumed a
+   pre-materialised discriminant.
 
-4. **Ordering with VAR-EXPAND.** This spec assumes VAR-EXPAND (variant
-   lowering) is implemented first. Could VAR-SPECIALIZE land without it if
-   only the generator-domain part is implemented (no variant-subset)?
-   Possibly — the merge table change is self-contained. The variant-subset
-   half genuinely needs lowering: there is no discriminant to constrain
-   until the tagged union has been lowered into cases.
+3. **Split the deliverable?** The generator-domain half (case 2) is self-contained:
+   the `Merge`/`satisfiable`/validation change plus the `allowed_values`
+   generator support, with no dependency on the Option A/B decision. It also clears a
+   standing CLAUDE.md known limitation. Strong candidate to land **first**, as its own
+   PR, before the variant-subset half is even designed. (Reframes the original Q4.)
+
+4. **Closed-enumeration generators — none exist today.** The merge model treats
+   every generator as an **open domain**: a child's `value:`/`allowed_values:` selects
+   within it and is never a domain conflict. The only real gates are **type**
+   compatibility (already enforced by `Generator::valid_for`, models.rs:348) and
+   numeric range. Surveying the `Generator` enum (models.rs:282), *no* variant is a
+   closed enumeration — names, words, emails, uuids, currency/state codes are all
+   open or "pin any valid member" sets — and `boolean` is a `FieldType`, not a
+   generator. So there is nothing to denylist now; if a genuinely closed-set generator
+   is ever added, revisit then. (Earlier drafts used a fictional
+   `merge(generator=boolean, value=…)` example — removed.)
+
+5. **`allowed_values` on numeric fields.** `value: [10, 20, 30]` in a
+   `range: {min: 0, max: 100}` is reasonable. Sample uniformly from the set?
+   Probably yes — same machinery as the variant-value case, over numeric values.
+
+6. **Validating `allowed_values` against the parent's generator.** If parent has
+   `generator: first_name` and child specialises `allowed_values: [1, 2, 3]`, we
+   have a type mismatch but not a domain mismatch (we don't enumerate). Catch this at
+   validation via the parent's `field_type`?
 
 ## Dependencies
 

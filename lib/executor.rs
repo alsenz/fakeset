@@ -40,16 +40,11 @@ use crate::generator::{generate_column, sample_count};
 use crate::import::{ImportIndex, filter_ring, load_import_index, resolve_import_path};
 use crate::models::{
     CountSpec, Field, Format, Include, Range, Reducer, RingBounds, Schema, SeedConfig,
-    SyntheticDataset, eligible_linked_rows, resolve_distributions, resolve_include, split_ref,
+    SyntheticDataset, eligible_linked_rows, resolve_include, split_ref,
 };
-use crate::plan::{
-    ExecutionPlan, ExecutionStep, InheritedField, distribute_rows, merge_variant_fields,
-};
+use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField};
 use crate::schema::{field_to_arrow, schema_to_arrow};
-use crate::segment::{
-    LowerCoverMember, Segment, constraints_conflict, lower_cover_field_constraints,
-    try_merge_incremental,
-};
+use crate::segment::{LowerCoverMember, Segment};
 
 /// Execute the plan produced by `plan::build_plan`, writing outputs to `output_dir`.
 ///
@@ -2147,6 +2142,10 @@ fn generate_member_nonref_fields(
     rows: usize,
     seg_constraints: &HashMap<String, FieldConstraints>,
 ) -> Result<RecordBatch> {
+    // After VAR-EXPAND lowering, a member carries a concrete schema with no `variants:`
+    // (tagged unions are lowered into separate case-members in the planner), so this
+    // generates exactly the member's non-ref fields. Ref columns come from the shared
+    // segment-atom batch; expression and list-link fields are handled elsewhere.
     let prefix = format!("{}.", m.reference);
     let is_nonref = |f: &Field| {
         f.simple_ref()
@@ -2157,19 +2156,11 @@ fn generate_member_nonref_fields(
         .dataset
         .data
         .iter()
-        .filter(|f| {
-            is_nonref(f) && f.expression.is_none() && !f.is_list_link()
-        })
+        .filter(|f| is_nonref(f) && f.expression.is_none() && !f.is_list_link())
         .cloned()
         .collect();
 
-    let any_variant_has_nonref = m
-        .dataset
-        .variants
-        .iter()
-        .any(|v| v.data.iter().any(|f| is_nonref(f) && f.expression.is_none() && !f.is_list_link()));
-
-    if nonref_base.is_empty() && !any_variant_has_nonref {
+    if nonref_base.is_empty() {
         let opts = RecordBatchOptions::new().with_row_count(Some(rows));
         return Ok(RecordBatch::try_new_with_options(
             Arc::new(ArrowSchema::empty()),
@@ -2178,94 +2169,7 @@ fn generate_member_nonref_fields(
         )?);
     }
 
-    if m.dataset.variants.is_empty() {
-        return generate_fresh_batch(&nonref_base, rows, seg_constraints);
-    }
-
-    // Build full variant schemas (with ref fields) so variant-pruning sees the
-    // ref-bound constraints. Then generate only the non-ref subset per variant.
-    let variant_schemas: Vec<_> = m
-        .dataset
-        .variants
-        .iter()
-        .map(|v| merge_variant_fields(&m.dataset.data, &v.data))
-        .collect();
-
-    let variant_ref_constraints: Vec<HashMap<String, FieldConstraints>> = variant_schemas
-        .iter()
-        .map(|schema| {
-            let tmp = LowerCoverMember {
-                path: m.path.clone(),
-                dataset: crate::models::SyntheticDataset {
-                    name: m.dataset.name.clone(),
-                    format: m.dataset.format.clone(),
-                    rows: None,
-                    output: None,
-                    outputs: vec![],
-                    locale: None,
-                    include: None,
-                    import: None,
-                    links: vec![],
-                    data: schema.clone(),
-                    variants: vec![],
-                },
-                ratio: m.ratio,
-                cardinality: None,
-                reference: m.reference.clone(),
-                is_witness_source: false,
-            };
-            lower_cover_field_constraints(&tmp)
-        })
-        .collect();
-
-    let surviving: Vec<usize> = (0..m.dataset.variants.len())
-        .filter(|&i| !constraints_conflict(&variant_ref_constraints[i], seg_constraints))
-        .collect();
-
-    if surviving.is_empty() {
-        return generate_fresh_batch(&nonref_base, rows, seg_constraints);
-    }
-
-    let surviving_option_ratios: Vec<Option<f64>> = surviving
-        .iter()
-        .map(|&i| m.dataset.variants[i].ratio)
-        .collect();
-    let raw_dists = resolve_distributions(&surviving_option_ratios);
-    let total: f64 = raw_dists.iter().sum();
-    let dists: Vec<f64> = if total > 0.0 {
-        raw_dists.iter().map(|d| d / total).collect()
-    } else {
-        vec![1.0 / surviving.len() as f64; surviving.len()]
-    };
-    let row_counts = distribute_rows(rows, &dists);
-
-    let mut sub_batches: Vec<RecordBatch> = Vec::new();
-    for (pos, &vi) in surviving.iter().enumerate() {
-        let r = row_counts[pos];
-        if r == 0 {
-            continue;
-        }
-        let merged_constraints =
-            try_merge_incremental(seg_constraints.clone(), &variant_ref_constraints[vi])
-                .unwrap_or_else(|| seg_constraints.clone());
-        let nonref_variant: Vec<Field> = variant_schemas[vi]
-            .iter()
-            .filter(|f| is_nonref(f))
-            .cloned()
-            .collect();
-        sub_batches.push(generate_fresh_batch(
-            &nonref_variant,
-            r,
-            &merged_constraints,
-        )?);
-    }
-
-    if sub_batches.is_empty() {
-        return generate_fresh_batch(&nonref_base, rows, seg_constraints);
-    }
-
-    let schema = sub_batches[0].schema();
-    Ok(concat_batches(&schema, &sub_batches)?)
+    generate_fresh_batch(&nonref_base, rows, seg_constraints)
 }
 
 // ---------------------------------------------------------------------------
