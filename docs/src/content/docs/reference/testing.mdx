@@ -50,7 +50,7 @@ out a random false alarm before investigating.
 | Check | Test | Datasets |
 |---|---|---|
 | Include ratios match declared values | Binomial | contracts, premiums, claims, directors, smes, micro, grants |
-| Variant (tagged-union) case frequencies match declared ratios | χ² goodness-of-fit | contracts.status; premiums.billing\_period / payment\_method / status; claims.claim\_type / status |
+| Variant (tagged-union) case frequencies match declared ratios | χ² goodness-of-fit | contracts.status; premiums.billing\_period / payment\_method / status; claims.claim\_detail (heterogeneous-union case) / status |
 | Numeric values consistent with Uniform[min, max] | Kolmogorov–Smirnov | annual\_premium, claim\_amount, deductible, base\_premium, grant.amount |
 
 Tests skip automatically when the sample is too small for the chosen statistic

@@ -1,0 +1,13 @@
+name: accounts
+format: csv
+output_file: accounts
+rows: 400
+data:
+  - { name: id, type: string, generator: uuid }
+  # Parent variant named `status` (an account tier).
+  - name: status
+    type: variant
+    variants:
+      - { value: gold,   ratio: 0.5 }
+      - { value: silver, ratio: 0.3 }
+      - { value: bronze }

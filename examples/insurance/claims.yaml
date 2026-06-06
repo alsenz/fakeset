@@ -1,5 +1,6 @@
 name: claims
 format: parquet
+output_file: claims
 include:
   file: contracts.yaml
   ref: contract
@@ -12,18 +13,67 @@ data:
     ref: contract.contract_id
   - name: customer_id
     ref: contract.customer_id
-  - name: claim_type
+  # A claim is only ever filed on an active or lapsed contract — never a cancelled one.
+  # This restricts the inherited contract `status` variant to a subset (VAR-SPECIALIZE S4b);
+  # contracts pins the global status marginal (preserve_marginal) so the cut is compensated.
+  - name: contract_status
+    ref: contract.status
+    one_of: ["active", "lapsed"]
+  # Heterogeneous tagged union (VAR-1): each claim type carries its own detail schema.
+  # The claim type is recoverable from which sub-struct is populated — no separate
+  # claim_type column needed. Generated as an Arrow DenseUnion; written as a
+  # nullable-superset struct (one populated case per row).
+  - name: claim_detail
     type: variant
     variants:
-      - value: "property_damage"
+      - name: property_damage
+        type: object
         ratio: 0.3
-      - value: "theft"
+        fields:
+          - name: property_address
+            type: string
+            generator: street_name
+          - name: postcode
+            type: string
+            generator: zip_code
+      - name: theft
+        type: object
         ratio: 0.2
-      - value: "liability"
+        fields:
+          - name: stolen_item
+            type: string
+            generator: word
+          - name: police_reference
+            type: string
+            generator: uuid
+      - name: liability
+        type: object
         ratio: 0.2
-      - value: "medical"
+        fields:
+          - name: third_party
+            type: string
+            generator: name
+          - name: summary
+            type: string
+            generator: sentence
+      - name: medical
+        type: object
         ratio: 0.2
-      - value: "accident"
+        fields:
+          - name: provider
+            type: string
+            generator: company_name
+          - name: diagnosis_code
+            type: string
+            generator: uuid
+      - name: accident          # no ratio → remainder (0.1)
+        type: object
+        fields:
+          - name: location
+            type: string
+            generator: city_name
+          - name: vehicle_involved
+            type: boolean
   - name: incident_date
     type: date
     generator: date

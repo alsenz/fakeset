@@ -8,18 +8,12 @@ include:
 data:
   - name: id
     ref: p.id
+  # Case 3 (VAR-SPECIALIZE): a ref field carrying `variants:` — a value-distribution that
+  # specialises the inherited `category` per case. Each case lowers to a ref-bound,
+  # value-pinned case-member, so the `basic` case conflicts with the sibling's
+  # `category=premium` pin and its segment is pruned.
   - name: category
     ref: p.category
-variants:
-  - ratio: 0.5
-    data:
-      - name: category
-        type: string
-        ref: p.category
-        value: "premium"
-  - ratio: 0.5
-    data:
-      - name: category
-        type: string
-        ref: p.category
-        value: "basic"
+    variants:
+      - { value: "premium", ratio: 0.5 }
+      - { value: "basic", ratio: 0.5 }

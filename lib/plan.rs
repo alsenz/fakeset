@@ -1,7 +1,7 @@
 //! Execution plan builder. `build_plan` resolves row counts, lower cover groups,
 //! inherited-field wiring, and collect targets into a flat list of `ExecutionStep`s
 //! that `executor::execute` interprets in order.
-use anyhow::Result;
+use anyhow::{Result, bail};
 use petgraph::visit::Topo;
 use serde_yaml::Value as YamlValue;
 use std::collections::{HashMap, HashSet};
@@ -11,12 +11,13 @@ use std::sync::Arc;
 use crate::constraints::FieldConstraints;
 use crate::graph::DatasetGraph;
 use crate::models::{
-    CountSpec, DataQuality, Field, Format, Include, Locale, Output, Reducer, RefBinding,
-    RingBounds, Schema, SyntheticDataset, VariantSchema, discriminant_column, eligible_linked_rows,
-    expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref,
+    CountSpec, DataQuality, Field, Format, Include, Output, Reducer, RefBinding, RingBounds,
+    Schema, SyntheticDataset, eligible_linked_rows, expected_cardinality, for_each_list_link,
+    resolve_distributions, resolve_include, split_ref,
 };
-use crate::rewrite::apply_locale_to_schema;
-use crate::segment::{ExclusionGroup, LowerCoverMember, Segment, assign_ring_slices, plan_segments};
+use crate::segment::{
+    ExclusionGroup, LowerCoverMember, Segment, assign_ring_slices, largest_remainder, plan_segments,
+};
 
 const DEFAULT_ROWS: usize = 100;
 
@@ -148,14 +149,6 @@ pub enum ExecutionStep {
         quality: Option<DataQuality>,
         schema: Vec<Field>,
     },
-    /// Concatenate all variant batches for a dataset into a single combined batch at
-    /// `original_path` in `computed`. Emitted after the N variant generation steps for any
-    /// dataset with `variants:`, so downstream witness steps can find a single linked batch
-    /// at the canonical path regardless of how many variants the linked dataset has.
-    CombineVariantBatches {
-        original_path: PathBuf,
-        variant_paths: Vec<PathBuf>,
-    },
 }
 
 /// A fully-resolved, ordered list of steps for the executor to interpret linearly.
@@ -172,26 +165,140 @@ fn internal_path(base: &Path, label: &str) -> PathBuf {
     base.with_file_name(format!("{stem}___{label}.internal"))
 }
 
-fn variant_key(path: &Path, i: usize) -> PathBuf {
-    internal_path(path, &format!("variant_{i}"))
+/// VAR-SPECIALIZE S4c — opt-in marginal pinning. For each parent variant field flagged
+/// `preserve_marginal`, subdivide every segment by the variant's cases so the parent's declared
+/// case marginal is preserved even when children restrict subsets. Each sub-segment pins the
+/// variant to one case (singleton `one_of`). Single-group scope: only restrictions visible in
+/// these segments' `field_constraints` are honoured (a restriction nested in a deeper include
+/// level isn't seen here — that's a deferred extension).
+fn subdivide_for_pinned_variants(
+    dataset: &SyntheticDataset,
+    segments: Vec<Segment>,
+    parent_rows: usize,
+) -> Result<Vec<Segment>> {
+    let mut segs = segments;
+    for vf in dataset
+        .data
+        .iter()
+        .filter(|f| f.preserve_marginal && !f.variants.is_empty())
+    {
+        segs = subdivide_one_pinned(vf, segs, parent_rows)?;
+    }
+    Ok(segs)
 }
 
-/// Split `parent_rows` into `dists.len()` integer counts that sum exactly to `parent_rows`.
-/// Uses largest-remainder (Hamilton) rounding.
-pub(crate) fn distribute_rows(parent_rows: usize, dists: &[f64]) -> Vec<usize> {
-    let raw: Vec<f64> = dists.iter().map(|d| d * parent_rows as f64).collect();
-    let mut counts: Vec<usize> = raw.iter().map(|r| r.floor() as usize).collect();
-    let remainder = parent_rows - counts.iter().sum::<usize>();
-    let mut fracs: Vec<(usize, f64)> = raw
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (i, r - r.floor()))
-        .collect();
-    fracs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    for k in 0..remainder {
-        counts[fracs[k].0] += 1;
+fn subdivide_one_pinned(
+    vf: &Field,
+    segments: Vec<Segment>,
+    parent_rows: usize,
+) -> Result<Vec<Segment>> {
+    let name = &vf.name;
+    let case_vals: Vec<YamlValue> = vf.variants.iter().filter_map(|c| c.value.clone()).collect();
+    if case_vals.len() != vf.variants.len() {
+        bail!(
+            "field '{name}': `preserve_marginal` requires every variant case to declare a `value`"
+        );
     }
-    counts
+    let p = resolve_distributions(&vf.variants.iter().map(|c| c.ratio).collect::<Vec<_>>());
+    let k = case_vals.len();
+    let m = segments.len();
+    if m == 0 {
+        return Ok(segments);
+    }
+
+    // allowed[j][c] — can case c appear in segment j (per any `one_of` restriction on the field)?
+    let allowed: Vec<Vec<bool>> = segments
+        .iter()
+        .map(|seg| {
+            match seg
+                .field_constraints
+                .get(name)
+                .and_then(|fc| fc.one_of.as_ref())
+            {
+                Some(set) => case_vals.iter().map(|v| set.contains(v)).collect(),
+                None => vec![true; k],
+            }
+        })
+        .collect();
+
+    let row_tot: Vec<f64> = segments.iter().map(|s| s.rows as f64).collect();
+    let col_tot: Vec<f64> = p.iter().map(|pc| pc * parent_rows as f64).collect();
+
+    // Feasibility (Gale–Hoffman cut, single-set directions — the common infeasibilities):
+    //  (a) sink side: each case's target ≤ supply of segments that allow it;
+    //  (b) source side: each (restricted) segment's rows ≤ capacity of the cases it allows.
+    for c in 0..k {
+        let cap: f64 = (0..m).filter(|&j| allowed[j][c]).map(|j| row_tot[j]).sum();
+        if col_tot[c] > cap + 1e-6 {
+            bail!(
+                "field '{name}': `preserve_marginal` is infeasible — case {:?} needs ~{:.0} rows \
+                 but only ~{:.0} are reachable under the child restrictions. Loosen the \
+                 restriction, or leave the case ratio unset (free-by-default).",
+                case_vals[c],
+                col_tot[c],
+                cap
+            );
+        }
+    }
+    for (j, allow_j) in allowed.iter().enumerate() {
+        let cap: f64 = (0..k).filter(|&c| allow_j[c]).map(|c| col_tot[c]).sum();
+        if row_tot[j] > cap + 1e-6 {
+            bail!(
+                "field '{name}': `preserve_marginal` is infeasible — a restricted segment needs \
+                 ~{:.0} rows but its allowed cases only total ~{:.0} of the pinned marginal. \
+                 Loosen the restriction, widen the pinned ratios, or unset them (free-by-default).",
+                row_tot[j],
+                cap
+            );
+        }
+    }
+
+    // 2-D IPF (raking) over x[j][c] with structural zeros where !allowed: match segment row
+    // totals and case column totals. Within feasibility this converges to the max-entropy table.
+    let mut x = vec![vec![0.0f64; k]; m];
+    for (j, row) in x.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            if allowed[j][c] {
+                *cell = 1.0;
+            }
+        }
+    }
+    for _ in 0..100 {
+        for (j, row) in x.iter_mut().enumerate() {
+            let s: f64 = row.iter().sum();
+            if s > 0.0 {
+                let f = row_tot[j] / s;
+                row.iter_mut().for_each(|v| *v *= f);
+            }
+        }
+        for c in 0..k {
+            let s: f64 = (0..m).map(|j| x[j][c]).sum();
+            if s > 0.0 {
+                let f = col_tot[c] / s;
+                (0..m).for_each(|j| x[j][c] *= f);
+            }
+        }
+    }
+
+    // Round each segment's row across cases to integers summing to that segment's rows, then
+    // emit one sub-segment per non-empty (segment, case) cell, pinning the variant to the case.
+    let mut out: Vec<Segment> = Vec::new();
+    for (j, seg) in segments.into_iter().enumerate() {
+        let counts = largest_remainder(&x[j], seg.rows);
+        for (c, &cnt) in counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let mut sub = seg.clone();
+            sub.rows = cnt;
+            sub.field_constraints
+                .entry(name.clone())
+                .or_default()
+                .one_of = Some(vec![case_vals[c].clone()]);
+            out.push(sub);
+        }
+    }
+    Ok(out)
 }
 
 /// Merge base schema with variant schema: variant fields override same-named base fields.
@@ -225,14 +332,18 @@ fn lower_member_variants(
     for m in members {
         // Only lower members generated *in this group step* — i.e. pure leaf members.
         // A member that is itself a parent (a key in `lower_cover_groups`) is generated by
-        // its own step (its variants handled there by `plan_variant_steps`) and reused here
-        // via `parent_computed`; lowering it would regenerate it with mismatched refs.
+        // its own group step (which lowers its own case-3 variants) and reused here via
+        // `parent_computed`; lowering it again would regenerate it with mismatched refs.
         if m.dataset.variants.is_empty() || lower_cover_groups.contains_key(&m.path) {
             lowered.push(m.clone());
             continue;
         }
         let within = resolve_distributions(
-            &m.dataset.variants.iter().map(|v| v.ratio).collect::<Vec<_>>(),
+            &m.dataset
+                .variants
+                .iter()
+                .map(|v| v.ratio)
+                .collect::<Vec<_>>(),
         );
         let start = lowered.len();
         let mut idxs = Vec::with_capacity(m.dataset.variants.len());
@@ -253,50 +364,12 @@ fn lower_member_variants(
         }
         let mandatory = (ratios.iter().sum::<f64>() - 1.0).abs() < 1e-9;
         groups.push(ExclusionGroup {
-            discriminant: discriminant_column(&m.dataset.name),
             members: idxs,
             ratios,
             mandatory,
         });
     }
     (lowered, groups)
-}
-
-/// Produce the concrete `SyntheticDataset` for one variant.
-///
-/// Base fields are merged with the variant's own data (variant wins on name collisions).
-/// The effective locale (variant > dataset) is stamped onto any unstamped variant fields.
-/// `output_key` is used as the output file so all variants accumulate into the same shared
-/// output and are shuffled together by `WriteSharedOutput`.
-fn expand_variant_dataset(
-    base: &SyntheticDataset,
-    variant: &VariantSchema,
-    variant_index: usize,
-    rows: usize,
-    output_key: &str,
-) -> SyntheticDataset {
-    let effective_locale: Option<Locale> = variant.locale.clone().or_else(|| base.locale.clone());
-
-    // Stamp locale onto variant-specific fields (base fields were already stamped by
-    // apply_global_locales; variant fields are new and need the same treatment).
-    let mut variant_fields = variant.data.clone();
-    if let Some(ref loc) = effective_locale {
-        apply_locale_to_schema(&mut variant_fields, loc);
-    }
-
-    SyntheticDataset {
-        name: format!("{}__v{}", base.name, variant_index),
-        format: base.format.clone(),
-        locale: effective_locale,
-        rows: Some(rows),
-        output: Some(crate::models::OutputSpec::Shorthand(output_key.to_string())),
-        outputs: vec![],
-        include: base.include.clone(),
-        import: base.import.clone(),
-        links: base.links.clone(),
-        data: merge_variant_fields(&base.data, &variant_fields),
-        variants: vec![],
-    }
 }
 
 /// Validate Case 2 v1 restriction: a linked dataset targeted by a nested-include collect
@@ -585,182 +658,6 @@ fn linked_field_default(
 // Per-dataset-shape planning functions (called from the topo-sort loop)
 // ---------------------------------------------------------------------------
 
-/// Plan steps for a variant-factored dataset: replace it with N concrete variant datasets,
-/// each writing to the same shared output file (shuffled together by `WriteSharedOutput`).
-/// Finishes with `CombineVariantBatches` so downstream witnesses find a single linked batch.
-///
-/// Note: inherited fields into a variant parent are not wired in v1 — they require a single
-/// stable batch to pull columns from; variants produce N separate batches.
-#[allow(clippy::too_many_arguments)]
-fn plan_variant_steps(
-    path: &Path,
-    dataset: &SyntheticDataset,
-    lower_cover_groups: &HashMap<PathBuf, Vec<LowerCoverMember>>,
-    datasets: &HashMap<PathBuf, SyntheticDataset>,
-    row_counts: &HashMap<PathBuf, usize>,
-    shared_outputs: &mut Vec<(String, Format, Option<DataQuality>, Vec<Field>)>,
-    seen_shared: &mut HashSet<String>,
-    steps: &mut Vec<ExecutionStep>,
-) -> Result<()> {
-    let output_key = dataset
-        .resolved_outputs()
-        .into_iter()
-        .next()
-        .map(|o| o.file)
-        .unwrap_or_else(|| dataset.name.clone());
-    let variant_dists: Vec<Option<f64>> = dataset.variants.iter().map(|v| v.ratio).collect();
-    let dists = resolve_distributions(&variant_dists);
-    let row_counts_v = distribute_rows(row_counts[path], &dists);
-
-    // For imported datasets, pre-tile the parent ring across variants proportional to row
-    // counts. Each expanded variant dataset carries its own ring slice so the executor
-    // loads the correct file segment.
-    let variant_rings: Vec<Option<RingBounds>> = if let Some(spec) = &dataset.import {
-        let parent_ring = spec
-            .ring
-            .clone()
-            .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
-        let total: usize = row_counts_v.iter().sum();
-        let span = parent_ring.end - parent_ring.start;
-        let mut cursor = parent_ring.start;
-        row_counts_v
-            .iter()
-            .enumerate()
-            .map(|(i, &vrows)| {
-                let frac = if total > 0 { vrows as f64 / total as f64 } else { 0.0 };
-                // Clamp the last slice to the exact parent end to absorb f64 drift.
-                let end = if i + 1 == row_counts_v.len() {
-                    parent_ring.end
-                } else {
-                    cursor + span * frac
-                };
-                let ring = RingBounds { start: cursor, end };
-                cursor = end;
-                Some(ring)
-            })
-            .collect()
-    } else {
-        vec![None; row_counts_v.len()]
-    };
-
-    for (i, (variant, &variant_rows)) in
-        dataset.variants.iter().zip(row_counts_v.iter()).enumerate()
-    {
-        let virtual_path = variant_key(path, i);
-        let mut concrete = expand_variant_dataset(dataset, variant, i, variant_rows, &output_key);
-        // Narrow the variant's import ring to its pre-computed slice.
-        if let (Some(spec), Some(ring)) = (&mut concrete.import, &variant_rings[i]) {
-            spec.ring = Some(ring.clone());
-        }
-
-        if let Some(members) = lower_cover_groups.get(path) {
-            // Each flat lower cover member accumulates rows from N variant groups; ensure it has
-            // an output so WriteSharedOutput fires once for the combined output.
-            // Witness-source members (is_witness_source=true) have no standalone output.
-            let members_with_output: Vec<LowerCoverMember> = members
-                .iter()
-                .map(|m| {
-                    let mut s = m.clone();
-                    if s.dataset.resolved_outputs().is_empty() && !s.is_witness_source {
-                        s.dataset.output =
-                            Some(crate::models::OutputSpec::Shorthand(m.dataset.name.clone()));
-                    }
-                    s
-                })
-                .collect();
-            // Lower any tagged-union members into case-members + exclusion groups.
-            let (members_with_output, groups) =
-                lower_member_variants(&members_with_output, lower_cover_groups);
-            let mut segments = plan_segments(variant_rows, &members_with_output, &groups)?;
-            if let Some(spec) = &concrete.import {
-                let vring = spec
-                    .ring
-                    .clone()
-                    .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
-                assign_ring_slices(&mut segments, &vring);
-            }
-            for m in &members_with_output {
-                track_shared(&m.dataset, shared_outputs, seen_shared);
-            }
-            track_shared(&concrete, shared_outputs, seen_shared);
-            let vpath = virtual_path.clone();
-            let c = Arc::new(concrete.clone());
-            let (s_vpath, s_c) = (vpath.clone(), c.clone());
-            let segs_for_witness = segments.clone();
-            let (s_segs, s_mbrs) = (segments.clone(), members_with_output.clone());
-            push_with_list_link_steps(
-                steps,
-                &concrete,
-                &virtual_path,
-                false,
-                datasets,
-                row_counts,
-                &segs_for_witness,
-                || ExecutionStep::GenerateStagingLowerCoverGroup {
-                    parent_path: s_vpath,
-                    parent: s_c,
-                    segments: s_segs,
-                    members: s_mbrs,
-                },
-                |defer| ExecutionStep::GenerateLowerCoverGroup {
-                    parent_path: vpath,
-                    parent: c,
-                    segments,
-                    members: members_with_output,
-                    defer_emit: defer,
-                },
-            );
-        } else {
-            track_shared(&concrete, shared_outputs, seen_shared);
-            let vpath = virtual_path.clone();
-            let c = Arc::new(concrete.clone());
-            let (s_vpath, s_c) = (vpath.clone(), c.clone());
-            let single_seg = vec![Segment {
-                members: vec![],
-                rows: variant_rows,
-                field_constraints: HashMap::new(),
-                ring: concrete
-                    .import
-                    .as_ref()
-                    .map(|s| s.ring.clone().unwrap_or(RingBounds { start: 0.0, end: 1.0 })),
-            }];
-            push_with_list_link_steps(
-                steps,
-                &concrete,
-                &virtual_path,
-                false,
-                datasets,
-                row_counts,
-                &single_seg,
-                || ExecutionStep::GenerateStagingNode {
-                    path: s_vpath,
-                    dataset: s_c,
-                    rows: variant_rows,
-                    inherited: vec![],
-                },
-                |_| ExecutionStep::GenerateDataset {
-                    path: vpath,
-                    dataset: c,
-                    rows: variant_rows,
-                    inherited: vec![],
-                    defer_emit: false,
-                },
-            );
-        }
-    }
-
-    // Merge all variant batches into the original path in `computed` so downstream
-    // witnesses that link to this dataset can find a single combined batch.
-    let variant_keys: Vec<PathBuf> = (0..dataset.variants.len())
-        .map(|i| variant_key(path, i))
-        .collect();
-    steps.push(ExecutionStep::CombineVariantBatches {
-        original_path: path.to_path_buf(),
-        variant_paths: variant_keys,
-    });
-    Ok(())
-}
-
 /// Plan steps for a lower cover group: segment the parent, generate member batches inside
 /// the group step, and append collect steps for any junction-link members.
 #[allow(clippy::too_many_arguments)]
@@ -779,12 +676,15 @@ fn plan_lower_cover_group_steps(
     // Lower any tagged-union members into case-members + exclusion groups before factoring.
     let (members, groups) = lower_member_variants(members, lower_cover_groups);
     let members = members.as_slice();
-    let mut segments = plan_segments(row_counts[path], members, &groups)?;
+    let segments = plan_segments(row_counts[path], members, &groups)?;
+    // VAR-SPECIALIZE S4c: opt-in marginal pinning — subdivide segments by a `preserve_marginal`
+    // variant's cases so the parent's declared marginal survives child restrictions.
+    let mut segments = subdivide_for_pinned_variants(dataset, segments, row_counts[path])?;
     if let Some(spec) = &dataset.import {
-        let parent_ring = spec
-            .ring
-            .clone()
-            .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+        let parent_ring = spec.ring.clone().unwrap_or(RingBounds {
+            start: 0.0,
+            end: 1.0,
+        });
         assign_ring_slices(&mut segments, &parent_ring);
     }
     for m in members.iter() {
@@ -855,10 +755,12 @@ fn plan_standalone_steps(
         members: vec![],
         rows,
         field_constraints: HashMap::new(),
-        ring: dataset
-            .import
-            .as_ref()
-            .map(|s| s.ring.clone().unwrap_or(RingBounds { start: 0.0, end: 1.0 })),
+        ring: dataset.import.as_ref().map(|s| {
+            s.ring.clone().unwrap_or(RingBounds {
+                start: 0.0,
+                end: 1.0,
+            })
+        }),
     }];
     push_with_list_link_steps(
         steps,
@@ -923,18 +825,18 @@ pub fn build_plan(
             continue;
         }
 
+        // After VAR-UNIFY Phase 2, `dataset.variants` is populated only by case-3
+        // (`ref` + `variants`) cross-product, which is lowered via the lower-cover path. A pure
+        // member is skipped above and lowered in its parent's group; the only way to reach
+        // here with variants is a dataset that is *both* an include-member and a parent — an
+        // unsupported combination (the old top-level `plan_variant_steps` path is gone).
         if !dataset.variants.is_empty() {
-            plan_variant_steps(
-                path,
-                dataset,
-                &lower_cover_groups,
-                datasets,
-                &row_counts,
-                &mut shared_outputs,
-                &mut seen_shared,
-                &mut steps,
-            )?;
-            continue;
+            bail!(
+                "dataset '{}': a `ref` + `variants` (per-case specialisation) field on a dataset \
+                 that is itself both an include-member and a parent of another dataset is not yet \
+                 supported",
+                dataset.name
+            );
         }
 
         if let Some(members) = lower_cover_groups.get(path) {
@@ -1390,10 +1292,10 @@ pub fn apply_scale(
     if scale > 1.0 {
         for ds in datasets.values() {
             let Some(spec) = &ds.import else { continue };
-            let ring = spec
-                .ring
-                .clone()
-                .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+            let ring = spec.ring.clone().unwrap_or(RingBounds {
+                start: 0.0,
+                end: 1.0,
+            });
             let span = ring.end - ring.start;
             // Max scale is how much this ring segment can grow before hitting 1.0.
             let max_scale = (1.0 - ring.start) / span;
@@ -1413,10 +1315,10 @@ pub fn apply_scale(
 
     for ds in datasets.values_mut() {
         if let Some(spec) = &mut ds.import {
-            let ring = spec
-                .ring
-                .clone()
-                .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+            let ring = spec.ring.clone().unwrap_or(RingBounds {
+                start: 0.0,
+                end: 1.0,
+            });
             let span = ring.end - ring.start;
             let new_end = (ring.start + span * scale).min(1.0);
             spec.ring = Some(RingBounds {
@@ -1592,7 +1494,10 @@ mod tests {
     #[test]
     fn imported_dataset_ring_fraction_applied() {
         let path = PathBuf::from("/a/data.yaml");
-        let ring = Some(RingBounds { start: 0.0, end: 0.25 });
+        let ring = Some(RingBounds {
+            start: 0.0,
+            end: 0.25,
+        });
         let mut datasets = HashMap::new();
         datasets.insert(path.clone(), imported_dataset(400, ring));
         // 400 * 0.25 = 100
@@ -1602,7 +1507,10 @@ mod tests {
     #[test]
     fn imported_dataset_partial_ring_rounds() {
         let path = PathBuf::from("/a/data.yaml");
-        let ring = Some(RingBounds { start: 0.1, end: 0.4 });
+        let ring = Some(RingBounds {
+            start: 0.1,
+            end: 0.4,
+        });
         let mut datasets = HashMap::new();
         datasets.insert(path.clone(), imported_dataset(100, ring));
         // 100 * 0.3 = 30

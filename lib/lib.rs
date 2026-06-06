@@ -13,6 +13,7 @@ pub mod generator;
 pub mod graph;
 pub mod import;
 pub mod models;
+pub mod output;
 pub mod plan;
 pub mod rewrite;
 pub mod schema;

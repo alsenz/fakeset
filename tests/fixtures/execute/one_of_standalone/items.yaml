@@ -1,0 +1,13 @@
+name: items
+format: csv
+output_file: items
+rows: 300
+data:
+  - { name: id, type: string, generator: uuid }
+  # Standalone one_of: a uniform finite-set generator (string + numeric).
+  - name: colour
+    type: string
+    one_of: ["red", "green", "blue"]
+  - name: size
+    type: number
+    one_of: [10, 20, 30]

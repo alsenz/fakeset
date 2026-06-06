@@ -380,21 +380,6 @@ fn print_plan(plan: &ExecutionPlan) {
             } => {
                 println!("[{}] write shared: {} ({})", i + 1, output_file, format);
             }
-            ExecutionStep::CombineVariantBatches {
-                original_path,
-                variant_paths,
-            } => {
-                let name = original_path
-                    .file_stem()
-                    .and_then(|s: &std::ffi::OsStr| s.to_str())
-                    .unwrap_or("?");
-                println!(
-                    "[{}] combine variant batches: {} ({} variants)",
-                    i + 1,
-                    name,
-                    variant_paths.len()
-                );
-            }
         }
         println!();
     }

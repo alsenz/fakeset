@@ -18,17 +18,16 @@ Every YAML file defines one `SyntheticDataset`.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | ✓ | Dataset name; used as the default output filename. |
+| `name` | string | ✓ | Dataset name / identifier (used in `ref`s and `include`s). **Not** an output filename. |
 | `format` | [`Format`](#format) | ✓ | Output format: `parquet`, `csv`, `json`, or `jsonl`. |
 | `rows` | integer | — | Explicit row count. Mutually exclusive with `ratio` on `include`. |
 | `locale` | [`Locale`](#locale) | — | Default locale for locale-capable generators. Field-level `locale` takes precedence. |
-| `output` | string \| [`Output`](#output) | — | Output file: plain path string or `Output` block. Sugar for a single-entry `outputs` list. Accepts `output_file` as an alias. |
+| `output` | string \| [`Output`](#output) | — | Output file: plain path string or `Output` block. Sugar for a single-entry `outputs` list. Accepts `output_file` as an alias. **A dataset is written to disk only if it declares `output`/`outputs`** — there is no default output. A dataset with neither is generated but not emitted (a *pool* or intermediate drawn from via `include`/`links`/`import` but not itself written). |
 | `outputs` | [`Output[]`](#output) | — | Multiple output files (e.g. one clean, one degraded). If both `output` and `outputs` are set, `outputs` wins. |
 | `include` | [`Include`](#include) | — | Declares this dataset as a constrained subset of another. |
 | `import` | [`ImportSpec`](#import) | — | Load rows from a pre-existing external file instead of generating them. Mutually exclusive with `rows`. |
 | `links` | [`Include[]`](#include) | — | Linked datasets for list-link sampling. Each entry names a dataset from which list items are drawn. |
 | `data` | [`Field[]`](#field) | — | Field definitions. Evaluated in declaration order for expressions. |
-| `variants` | [`VariantSchema[]`](#variantschema) | — | When non-empty, virtually splits the dataset into N concrete variants. Each variant inherits `data` fields and overrides/extends them. |
 
 ### Example
 
@@ -308,10 +307,15 @@ Defines one column in a dataset's schema.
 | `locale` | [`Locale`](#locale) | — | Locale for this field's generator. Overrides the dataset-level locale. |
 | `range` | [`Range`](#range) | — | Inclusive numeric bounds for `number` fields. |
 | `value` | any | — | Emit this constant for every row. Incompatible with `generator`, `range`. |
+| `one_of` | any[] | — | Finite-set generator: draw each row uniformly from this set. On a `ref` field it *restricts* the inherited domain (e.g. narrows a parent `generator:` to these values). Mutually exclusive with `value`; entries must match the field type. |
+| `preserve_marginal` | boolean | — | On a `type: variant` field only. Pin the declared case `ratio`s as a **global** marginal: when children restrict the variant, unrestricted rows compensate so the parent's overall case mix still holds. Default false (free-by-default). Errors if the pin is infeasible. |
+| `constrain_cases` | `CaseDelta[]` | — | On a field that `ref`s a parent variant: tighten named cases' value-sources (`value` / `generator` / `range`) without dropping any. Each entry is `{ name: <parent case>, … }`. Non-restrictive (cf. `one_of`, which drops cases). |
 | `fields` | [`Field[]`](#field) | — | Nested fields for `object` type. |
 | `content` | [`ListContent`](#listcontent) | — | Element spec for `list` type. |
 | `variants` | [`FieldVariant[]`](#fieldvariant) | — | Alternatives for `type: variant` fields. |
 | `parquet` | [`ParquetConfig`](#parquetconfig) | — | Arrow/Parquet type override. Overrides the default Arrow type inferred from `type`. |
+| `flatten` | boolean | — | Output-only. Elide this field's nesting at write time, pulling its sub-columns up to the parent level (serde `#[serde(flatten)]` analogue). Valid only on `object` and `variant` fields; requires a `name`. See [Flatten](#flatten) below. |
+| `flatten_strategy` | [`FlattenStrategy`](#flattenstrategy) | — | Layout for a flattened **variant**'s case fields in flat columnar output (Parquet/CSV): `superset` (default), `prefixed`, or `discriminant`. Ignored for JSON/JSONL. |
 | `expression` | string | — | SQL expression evaluated after all other fields are generated. Must reference only fields declared above this one. Mutually exclusive with `type`, `ref`, `generator`, `range`, `value`. |
 | `hidden` | boolean | — | Present in the internal batch but excluded from output. Set automatically for expression dependency pull-down. |
 | `count` | [`CountSpec`](#countspec) | — | Items per row for `list` fields. Ignored on other types. |
@@ -381,6 +385,70 @@ A `type: variant` field is a **tagged union** — each row takes exactly one cas
 On a dataset that includes another, the cases are *lowered* into the lattice and
 distributed by the same segmentation as lower-cover members, so the declared
 `ratio`s are honoured. See [Variants as Tagged Unions](/concepts/variant-lowering/).
+
+**`ref` + `variants` (per-case specialisation of an inherited field).** A `ref` field may
+carry `variants:` instead of `type:` — a value-distribution that specialises the *inherited*
+field per case. Each case must be value-source-only (`value` / `generator` / `range`, no
+nested `fields`). Every case inherits the ref (so it stays the same column as the parent's)
+and pins its own value, entering lower-cover segmentation — so a case that conflicts with a
+sibling's pin is pruned:
+
+```yaml
+- name: category
+  ref: p.category              # inherited column (drives segmentation)
+  variants:                    # value-distribution specialising it per case
+    - { value: premium, ratio: 0.5 }
+    - { value: basic,   ratio: 0.5 }
+```
+
+When the cases span **more than one type** — or carry **different object schemas** via
+`fields:` on a choice — the field is a *heterogeneous* union: it generates as an Arrow
+`DenseUnion` and is written as a nullable-superset struct (one nullable sub-field per
+case, exactly one populated per row). Supported for `parquet`, `json`, and `jsonl`;
+**not `csv`** (a flat format that can't hold the nested struct — rejected at validation).
+
+### Flatten
+
+`flatten: true` is an **output-only** instruction — the direct analogue of serde's
+`#[serde(flatten)]`. It elides a field's nesting at write time, pulling its sub-columns up
+to the parent level. The internal model, refs, and generation are untouched, so a `flatten`
+field **must have a `name`** (refs resolve against the named, nested model before output).
+
+- **On an `object` field** — the struct's fields are pulled up into the parent.
+- **On a `variant` field** — the active case's fields are pulled up. JSON/JSONL emit per-row
+  keys (only the active case's fields appear); Parquet emits a nullable superset (one column
+  per case field, exactly the active case's populated). Pulled-up names must not collide with
+  sibling fields, nor — for the Parquet superset — across cases; collisions are rejected at
+  validation (use `flatten_strategy: prefixed`).
+
+For flat columnar output (Parquet/CSV), `flatten_strategy` controls how a variant's case
+fields are laid out — `superset` (default), `prefixed` (namespace each field by its case name,
+resolving cross-case collisions), or `discriminant` (superset plus a `<field>_case` tag column
+naming the active case per row). JSON/JSONL ignore it (per-row keys).
+
+```yaml
+# Whole-row variation expressed as a flattened variant field: each row's columns
+# are the active case's fields, sitting alongside the common fields.
+- name: claim_id
+  type: string
+  generator: uuid
+- name: claim_detail
+  type: variant
+  flatten: true
+  variants:
+    - name: property_damage
+      type: object
+      ratio: 0.6
+      fields:
+        - { name: address, type: string, generator: street_name }
+        - { name: estimate, type: number, range: { min: 100, max: 50000 } }
+    - name: theft
+      type: object
+      ratio: 0.4
+      fields:
+        - { name: police_reference, type: string, generator: uuid }
+        - { name: items_stolen, type: number, range: { min: 1, max: 20 } }
+```
 
 ### Generator args
 
@@ -469,29 +537,22 @@ Specifies the element type for a `list` field.
 
 ## FieldVariant
 
-One alternative within a `type: variant` field.
+One alternative (case) within a `type: variant` field. Each case generates through its
+own type/generator (a `value:` case is a constant). Cases that span more than one type —
+or carry different object schemas via `fields:` — make the field a heterogeneous union
+(see [Variants as Tagged Unions](/concepts/variant-lowering/#heterogeneous-unions-multi-type-cases)).
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | [`FieldType`](#fieldtype) | Type for this variant. |
-| `generator` | [`Generator`](#generator) | Generator for this variant. |
-| `locale` | [`Locale`](#locale) | Locale for this variant. |
-| `range` | [`Range`](#range) | Numeric range for this variant. |
-| `value` | any | Constant value for this variant. |
-| `parquet` | [`ParquetConfig`](#parquetconfig) | Type override for this variant. Falls back to the parent field's `parquet`. |
-| `ratio` | float | Fraction of the parent field's population allocated to this choice. Unset choices share the remainder equally. |
-
----
-
-## VariantSchema
-
-One concrete variant of a dataset (used in `variants:`).
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `data` | [`Field[]`](#field) | Fields that override or extend the dataset's base `data`. Same-named base fields are replaced; new names are appended. |
-| `locale` | [`Locale`](#locale) | Locale override for this variant's fields. |
-| `ratio` | float | Fraction of the parent dataset's rows allocated to this variant. Unset variants share the remainder equally. |
+| `name` | string | Case label for a **heterogeneous union** — names the output sub-field. Without it, cases are named positionally (`<field>_<i>`). Ignored for same-type variants. |
+| `type` | [`FieldType`](#fieldtype) | Type for this case. |
+| `generator` | [`Generator`](#generator) | Generator for this case. |
+| `locale` | [`Locale`](#locale) | Locale for this case. |
+| `range` | [`Range`](#range) | Numeric range for this case. |
+| `value` | any | Constant value for this case. |
+| `fields` | [`Field[]`](#field) | Nested fields for an **object case** of a heterogeneous union. |
+| `parquet` | [`ParquetConfig`](#parquetconfig) | Type override for this case. Falls back to the parent field's `parquet`. |
+| `ratio` | float | Fraction of the parent field's population allocated to this case. Unset cases share the remainder equally. |
 
 ---
 
@@ -578,7 +639,7 @@ parquet:
 | `list` | Array of items. Requires `content:` to define the element spec. |
 | `date` | Calendar date (Arrow `Date32`). |
 | `date_time` | Timestamp with microsecond precision (Arrow `TimestampMicrosecond`). |
-| `variant` | Multi-alternative field expanded into global dataset variants before execution. Requires `variants:` list. |
+| `variant` | Tagged union: exactly one of N cases per row. Requires `variants:` list. Heterogeneous cases lower to an Arrow union (VAR-1); on a ref'd field, specialises the inherited column per case (VAR-SPECIALIZE). |
 
 ---
 
@@ -590,6 +651,19 @@ parquet:
 | `csv` | Comma-separated values. |
 | `json` | JSON array of objects. |
 | `jsonl` | Newline-delimited JSON (one object per line). |
+
+---
+
+## FlattenStrategy
+
+Layout for a `flatten`ed **variant**'s case fields in flat columnar output (Parquet/CSV).
+Ignored for JSON/JSONL, which always emit per-row keys.
+
+| Value | Description |
+|-------|-------------|
+| `superset` | Default. Case fields side by side as a nullable superset; the populated set is the case tag. Cross-case name collisions are rejected at validation. |
+| `prefixed` | Prefix each pulled-up field by its case name (`<case>_<field>`), avoiding cross-case collisions. |
+| `discriminant` | Superset layout plus a materialised `<field>_case` string column naming the active case per row. |
 
 ---
 

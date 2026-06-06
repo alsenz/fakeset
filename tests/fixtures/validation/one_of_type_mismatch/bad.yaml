@@ -1,0 +1,7 @@
+name: bad
+format: csv
+rows: 10
+data:
+  - name: n
+    type: number
+    one_of: ["not", "numbers"]

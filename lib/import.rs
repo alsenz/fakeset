@@ -135,8 +135,8 @@ fn load_csv_full(path: &Path) -> Result<RecordBatch> {
 }
 
 fn load_json_full(path: &Path) -> Result<RecordBatch> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| anyhow!("JSON read '{}': {e}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("JSON read '{}': {e}", path.display()))?;
     let arr: Vec<serde_json::Value> = serde_json::from_str(&content)
         .map_err(|e| anyhow!("JSON parse '{}': {e}", path.display()))?;
     if arr.is_empty() {
@@ -226,9 +226,7 @@ fn project_batch(batch: RecordBatch, spec: &ImportSpec) -> Result<RecordBatch> {
 /// 3. Records `total_rows` on `ImportSpec` for planning estimates.
 /// 4. Validates that no `data.fields` entry collides with an imported column name.
 /// 5. Prepends the imported columns (as `imported_taint = true` fields) to `dataset.data`.
-pub fn load_import_headers(
-    datasets: &mut HashMap<PathBuf, SyntheticDataset>,
-) -> Result<()> {
+pub fn load_import_headers(datasets: &mut HashMap<PathBuf, SyntheticDataset>) -> Result<()> {
     let paths: Vec<PathBuf> = datasets.keys().cloned().collect();
     for path in &paths {
         // Clone the spec to release the immutable borrow before we mutate the dataset.
@@ -293,7 +291,13 @@ pub(crate) fn resolve_import_path(dataset_path: &Path, file: &str) -> Result<Pat
         .unwrap_or(Path::new(""))
         .join(file)
         .canonicalize()
-        .map_err(|e| anyhow!("import file '{}' not found (from '{}'): {e}", file, dataset_path.display()))
+        .map_err(|e| {
+            anyhow!(
+                "import file '{}' not found (from '{}'): {e}",
+                file,
+                dataset_path.display()
+            )
+        })
 }
 
 fn detect_format(path: &Path) -> Result<Format> {
@@ -379,8 +383,12 @@ fn read_jsonl_schema(path: &Path) -> Result<(ArrowSchema, usize)> {
     if trimmed.is_empty() {
         bail!("JSONL import file '{}' is empty", path.display());
     }
-    let first: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|e| anyhow!("could not parse first line of JSONL '{}': {e}", path.display()))?;
+    let first: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        anyhow!(
+            "could not parse first line of JSONL '{}': {e}",
+            path.display()
+        )
+    })?;
 
     // Count remaining non-empty lines.
     let rest = reader
@@ -433,9 +441,9 @@ fn json_value_to_arrow_type(v: &serde_json::Value) -> DataType {
                 .first()
                 .map(json_value_to_arrow_type)
                 .unwrap_or(DataType::Utf8);
-            DataType::List(std::sync::Arc::new(
-                arrow::datatypes::Field::new("item", item_dt, true),
-            ))
+            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                "item", item_dt, true,
+            )))
         }
         _ => DataType::Utf8,
     }
@@ -448,11 +456,8 @@ fn project_columns(
     fields: &[String],
     exclude: Option<&[String]>,
 ) -> Result<Vec<Field>> {
-    let exclude_set: std::collections::HashSet<&str> = exclude
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let exclude_set: std::collections::HashSet<&str> =
+        exclude.unwrap_or(&[]).iter().map(|s| s.as_str()).collect();
 
     let all = fields.is_empty() || (fields.len() == 1 && fields[0] == "*");
     let include_set: std::collections::HashSet<&str> = if all {
@@ -549,7 +554,10 @@ mod tests {
     fn hash_row_is_in_unit_interval() {
         for i in 0..1000_usize {
             let h = hash_row(12345, i);
-            assert!(h >= 0.0 && h < 1.0, "hash_row({i}) = {h} outside [0, 1)");
+            assert!(
+                (0.0..1.0).contains(&h),
+                "hash_row({i}) = {h} outside [0, 1)"
+            );
         }
     }
 
@@ -565,7 +573,10 @@ mod tests {
     fn hash_row_different_indices_produce_different_values() {
         let h0 = hash_row(42, 0);
         let h1 = hash_row(42, 1);
-        assert_ne!(h0, h1, "consecutive indices should produce different hashes");
+        assert_ne!(
+            h0, h1,
+            "consecutive indices should produce different hashes"
+        );
     }
 
     #[test]
@@ -583,7 +594,7 @@ mod tests {
         }
         for (b, &c) in counts.iter().enumerate() {
             assert!(
-                c >= 800 && c <= 1200,
+                (800..=1200).contains(&c),
                 "bucket {b} has {c} entries — too far from the expected 1000 (seed 99)"
             );
         }
@@ -599,22 +610,25 @@ mod tests {
             DataType::Utf8,
             true,
         )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).expect("batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).expect("batch");
         ImportIndex { batch, hashes }
     }
 
     #[test]
     fn filter_ring_returns_matching_rows() {
         // Three rows with known hashes.
-        let index = make_index(
-            &["AAPL", "MSFT", "GOOG"],
-            vec![0.1, 0.5, 0.9],
-        );
-        let ring = RingBounds { start: 0.4, end: 0.8 };
+        let index = make_index(&["AAPL", "MSFT", "GOOG"], vec![0.1, 0.5, 0.9]);
+        let ring = RingBounds {
+            start: 0.4,
+            end: 0.8,
+        };
         let result = filter_ring(&index, &ring).expect("filter_ring");
 
-        assert_eq!(result.num_rows(), 1, "only MSFT (hash=0.5) falls in [0.4, 0.8)");
+        assert_eq!(
+            result.num_rows(),
+            1,
+            "only MSFT (hash=0.5) falls in [0.4, 0.8)"
+        );
         let col = result
             .column(0)
             .as_any()
@@ -627,24 +641,41 @@ mod tests {
     fn filter_ring_excludes_exact_end_boundary() {
         // Hash at exactly end=0.5 must be excluded (half-open [start, end)).
         let index = make_index(&["A", "B"], vec![0.3, 0.5]);
-        let ring = RingBounds { start: 0.0, end: 0.5 };
+        let ring = RingBounds {
+            start: 0.0,
+            end: 0.5,
+        };
         let result = filter_ring(&index, &ring).expect("filter_ring");
-        assert_eq!(result.num_rows(), 1, "only A (hash=0.3) falls in [0.0, 0.5)");
+        assert_eq!(
+            result.num_rows(),
+            1,
+            "only A (hash=0.3) falls in [0.0, 0.5)"
+        );
     }
 
     #[test]
     fn filter_ring_full_range_returns_all_rows() {
         let index = make_index(&["A", "B", "C"], vec![0.1, 0.5, 0.9]);
-        let ring = RingBounds { start: 0.0, end: 1.0 };
+        let ring = RingBounds {
+            start: 0.0,
+            end: 1.0,
+        };
         let result = filter_ring(&index, &ring).expect("filter_ring");
-        assert_eq!(result.num_rows(), 3, "full [0.0, 1.0) should include all rows");
+        assert_eq!(
+            result.num_rows(),
+            3,
+            "full [0.0, 1.0) should include all rows"
+        );
     }
 
     #[test]
     fn filter_ring_empty_range_returns_no_rows() {
         let index = make_index(&["A", "B"], vec![0.2, 0.8]);
         // [0.4, 0.6) contains neither 0.2 nor 0.8.
-        let ring = RingBounds { start: 0.4, end: 0.6 };
+        let ring = RingBounds {
+            start: 0.4,
+            end: 0.6,
+        };
         let result = filter_ring(&index, &ring).expect("filter_ring");
         assert_eq!(result.num_rows(), 0);
     }
@@ -660,10 +691,7 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![
-                Arc::new(symbols) as ArrayRef,
-                Arc::new(scores) as ArrayRef,
-            ],
+            vec![Arc::new(symbols) as ArrayRef, Arc::new(scores) as ArrayRef],
         )
         .expect("batch");
         let index = ImportIndex {
@@ -671,7 +699,10 @@ mod tests {
             hashes: vec![0.1, 0.5, 0.9],
         };
         // Keep only X (0.1) and Z (0.9), skipping Y (0.5 is outside [0.7, 1.0) too).
-        let ring = RingBounds { start: 0.0, end: 0.3 };
+        let ring = RingBounds {
+            start: 0.0,
+            end: 0.3,
+        };
         let result = filter_ring(&index, &ring).expect("filter_ring");
         assert_eq!(result.num_rows(), 1);
         let sym = result

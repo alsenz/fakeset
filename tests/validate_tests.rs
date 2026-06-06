@@ -67,7 +67,10 @@ fn test_variant_in_list_link_content_errors() {
     let datasets = load_all_datasets(&paths).expect("should load datasets");
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
-    assert!(msg.contains("variant"), "error should mention `variant`: {msg}");
+    assert!(
+        msg.contains("variant"),
+        "error should mention `variant`: {msg}"
+    );
     assert!(
         msg.contains("list-link content"),
         "error should mention `list-link content`: {msg}"
@@ -199,27 +202,32 @@ fn test_valid_value_passes() {
 }
 
 #[test]
-fn test_value_with_generator_errors() {
+fn test_value_with_generator_specialises() {
+    // VAR-SPECIALIZE S1: `value` + `generator` is no longer a conflict — `value` is the
+    // tightest point on the value-source spectrum and supersedes the generator.
     let paths = vec![PathBuf::from(
         "tests/fixtures/validation/value_with_generator",
     )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
-    let err = validate(&datasets).expect_err("should fail validation");
-    let msg = err.to_string();
-    assert!(msg.contains("value"), "error should mention `value`: {msg}");
-    assert!(
-        msg.contains("generator"),
-        "error should mention `generator`: {msg}"
-    );
+    validate(&datasets).expect("value specialising a generator should pass validation");
 }
 
 #[test]
-fn test_value_with_min_max_errors() {
+fn test_value_within_range_passes() {
+    // VAR-SPECIALIZE S1: `value` + `range` is fine when the constant lies within the bounds.
     let paths = vec![PathBuf::from(
         "tests/fixtures/validation/value_with_min_max",
     )];
     let datasets = load_all_datasets(&paths).expect("should load datasets");
-    let err = validate(&datasets).expect_err("should fail validation");
+    validate(&datasets).expect("a value within its range should pass validation");
+}
+
+#[test]
+fn test_value_outside_range_errors() {
+    // The one real numeric error: a constant `value` outside its declared range.
+    let paths = vec![PathBuf::from("tests/fixtures/validation/value_below_range")];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("a value outside its range should fail");
     let msg = err.to_string();
     assert!(msg.contains("value"), "error should mention `value`: {msg}");
     assert!(msg.contains("range"), "error should mention `range`: {msg}");
@@ -423,41 +431,24 @@ fn test_list_link_expression_in_content_errors() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_variant_distributions_sum_over_one_errors() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/variant_bad_sum")];
-    let datasets = load_all_datasets(&paths).expect("should load");
-    let err = validate(&datasets).expect_err("distributions > 1.0 should error");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("variant"),
-        "error should mention 'variant': {msg}"
-    );
-    assert!(
-        msg.contains("exceeds 1.0") || msg.contains("sum"),
-        "error should mention the sum: {msg}"
-    );
-}
-
-#[test]
-fn test_variant_all_set_not_summing_to_one_errors() {
+fn test_top_level_variants_rejected() {
+    // VAR-UNIFY U4: top-level dataset `variants:` is retired as user input — whole-row
+    // variation is now a `type: variant` field. (Distribution-sum validation is covered by
+    // the `field_variant_*` fixtures below.)
     let paths = vec![PathBuf::from(
-        "tests/fixtures/validation/variant_all_set_wrong",
+        "tests/fixtures/validation/top_level_variants_retired",
     )];
     let datasets = load_all_datasets(&paths).expect("should load");
-    let err =
-        validate(&datasets).expect_err("fully-specified variants not summing to 1.0 should error");
+    let err = validate(&datasets).expect_err("top-level `variants:` should be rejected");
     let msg = err.to_string();
     assert!(
-        msg.contains("variant"),
-        "error should mention 'variant': {msg}"
+        msg.contains("variants"),
+        "error should mention `variants`: {msg}"
     );
-}
-
-#[test]
-fn test_variant_valid_mixed_distributions_passes() {
-    let paths = vec![PathBuf::from("tests/fixtures/validation/variant_valid")];
-    let datasets = load_all_datasets(&paths).expect("should load");
-    validate(&datasets).expect("valid variant distribution should pass");
+    assert!(
+        msg.contains("field") || msg.contains("retired"),
+        "error should point at the field-variant migration: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +503,37 @@ fn test_valid_field_variant_passes() {
     let paths = vec![PathBuf::from("tests/fixtures/execute/field_variants")];
     let datasets = load_all_datasets(&paths).expect("should load");
     validate(&datasets).expect("valid field variant config should pass validation");
+}
+
+// VAR-1: a heterogeneous (multi-type) variant is supported (lowers to a union), EXCEPT
+// for CSV output, which can't hold the resulting nested struct — that's a clean
+// validation error (not a write-time failure). The fixture is `format: csv`.
+#[test]
+fn test_variant_mixed_types_csv_errors() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/variant_mixed_types",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("mixed-type variant to CSV should fail validation");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("csv"),
+        "error should mention the CSV limitation: {msg}"
+    );
+    assert!(
+        msg.contains("VAR-1"),
+        "error should point at the VAR-1 spec: {msg}"
+    );
+}
+
+// VAR-1: the same heterogeneous variant validates fine for a struct-capable format (json).
+#[test]
+fn test_variant_mixed_types_json_passes() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/variant_mixed_types_json",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    validate(&datasets).expect("mixed-type variant to a struct-capable format should validate");
 }
 
 // ---------------------------------------------------------------------------
@@ -769,5 +791,171 @@ fn test_project_field_missing_errors() {
     assert!(
         msg.contains("nonexistent_field"),
         "error should name the missing field: {msg}"
+    );
+}
+
+// --- VAR-UNIFY PR U1: `flatten` validation ---
+
+#[test]
+fn test_flatten_on_scalar_field_errors() {
+    let paths = vec![PathBuf::from("tests/fixtures/validation/flatten_on_scalar")];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("flatten on a scalar should fail validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flatten"),
+        "error should mention `flatten`: {msg}"
+    );
+    assert!(
+        msg.contains("object") && msg.contains("variant"),
+        "error should name the valid field types: {msg}"
+    );
+}
+
+#[test]
+fn test_flatten_sibling_collision_errors() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/flatten_collision_sibling",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("flatten colliding with a sibling should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("city"),
+        "error should name the colliding field: {msg}"
+    );
+    assert!(
+        msg.contains("collides"),
+        "error should mention the collision: {msg}"
+    );
+}
+
+#[test]
+fn test_flatten_cross_case_collision_parquet_errors() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/flatten_collision_parquet",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err =
+        validate(&datasets).expect_err("cross-case flatten collision under parquet should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("amount"),
+        "error should name the colliding field: {msg}"
+    );
+    assert!(
+        msg.contains("variant case") || msg.contains("superset"),
+        "error should explain the cross-case superset collision: {msg}"
+    );
+}
+
+#[test]
+fn test_flatten_json_cross_case_collision_ok() {
+    // The same cross-case `amount` collision is harmless for JSON (per-row keys), and a
+    // collision-free flatten object also passes.
+    let paths = vec![PathBuf::from("tests/fixtures/validation/flatten_ok_json")];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    validate(&datasets).expect("flatten over jsonl with per-row keys should pass validation");
+}
+
+#[test]
+fn test_flatten_nested_not_supported_errors() {
+    // VAR-UNIFY U2 scope: only top-level flatten is implemented; a nested flatten errors
+    // rather than silently emitting nested output.
+    let paths = vec![PathBuf::from("tests/fixtures/validation/flatten_nested")];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("nested flatten should fail validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flatten"),
+        "error should mention `flatten`: {msg}"
+    );
+    assert!(
+        msg.contains("top-level") || msg.contains("nested"),
+        "error should explain the top-level-only scope: {msg}"
+    );
+}
+
+#[test]
+fn test_flatten_prefixed_resolves_cross_case_collision() {
+    // VAR-UNIFY U3: `prefixed` namespaces colliding case fields, so the parquet superset
+    // that would otherwise be rejected now validates.
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/flatten_prefixed_parquet",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    validate(&datasets).expect("prefixed strategy should resolve the cross-case collision");
+}
+
+#[test]
+fn test_flatten_strategy_on_object_errors() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/flatten_strategy_misplaced",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("flatten_strategy on an object should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flatten_strategy"),
+        "error should mention `flatten_strategy`: {msg}"
+    );
+}
+
+#[test]
+fn test_ref_variants_object_case_errors() {
+    // VAR-SPECIALIZE S3: a `ref` + `variants` (case-3) case must be value-source-only;
+    // an object case is rejected.
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/ref_variants_object_case",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("object case in a ref+variants field should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("object case") || msg.contains("scalar inherited"),
+        "error should explain the value-source-only rule: {msg}"
+    );
+}
+
+#[test]
+fn test_value_and_one_of_errors() {
+    // VAR-SPECIALIZE S2: `value` and `one_of` are mutually exclusive.
+    let paths = vec![PathBuf::from("tests/fixtures/validation/value_and_one_of")];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("value + one_of should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("value") && msg.contains("one_of"),
+        "error should mention both: {msg}"
+    );
+}
+
+#[test]
+fn test_one_of_type_mismatch_errors() {
+    // VAR-SPECIALIZE S2: `one_of` entries must match the field type.
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/one_of_type_mismatch",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("type-mismatched one_of should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("one_of"),
+        "error should mention `one_of`: {msg}"
+    );
+}
+
+#[test]
+fn test_constrain_cases_without_ref_errors() {
+    // VAR-SPECIALIZE S5: `constrain_cases` only specialises a ref'd parent variant.
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/constrain_cases_no_ref",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load datasets");
+    let err = validate(&datasets).expect_err("constrain_cases without a ref should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("constrain_cases"),
+        "error should mention `constrain_cases`: {msg}"
     );
 }

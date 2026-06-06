@@ -21,18 +21,17 @@ consistently and referentially-soundly, with no separate code path.
 | **lowering** | The planner-time rewrite that replaces a union with its cases — the literal "expand variants" step of the semi-lattice model, borrowed from the compiler sense of lowering a high-level construct to a simpler form. |
 | **discriminant** | The conceptual tag identifying which case a row took. The cases of one union are mutually exclusive (their meet is ⊥); the planner enforces that **structurally** (see below), so no discriminant *column* is materialised today. |
 
-## Two places variants are lowered
+## How same-type variants generate
 
-### Top-level datasets
+### Per-row (standalone / non-constraint-bearing)
 
-A `type: variant` field on a standalone dataset (or one that is the *parent* of a
-lower-cover group) is expanded into N concrete datasets at the same lattice
-position — one per case — which all write to the same `output_file:` via a union +
-shuffle (`WriteSharedOutput`). Multiple variant fields expand to their
-cross-product. This is the `plan_variant_steps` path and is unchanged from earlier
-versions.
+A same-type `type: variant` field that does **not** specialise an inherited column is
+generated **per row**: each row independently draws a case (weighted by the declared
+`ratio`s) and emits that case's value. Multiple variant fields on one dataset are simply
+independent per-row columns — no Cartesian pre-enumeration. (This replaced the old
+cross-product `plan_variant_steps` path in VAR-UNIFY Phase 2.)
 
-### Lower-cover members
+### Lower-cover members (constraint-bearing)
 
 The interesting case is a `type: variant` field on a dataset that **includes**
 another (a lower-cover member — e.g. `premiums` includes `contracts`, and carries a
@@ -73,6 +72,107 @@ Lowering it twice would regenerate it with mismatched refs. `lower_member_varian
 skips any member that is itself a parent.
 </Aside>
 
+## Specialising a variant in a child
+
+### The value-source spectrum
+
+Specialisation rests on one idea: **a field's value-source is a single spectrum**, ordered by
+how much of the domain it pins down —
+
+> type default  ≻  `generator:`  ≻  `one_of:`  ≻  `value:`
+
+The type's default generator is the widest (any value of the type); an explicit `generator:` is
+narrower (e.g. `email`, a gaussian); `one_of:` is a finite set; and `value:` is the tightest —
+a single constant. A child **specialises** by moving to a tighter point on the *same* spectrum,
+so `value:` on a field whose parent declared a `generator:` is **not a conflict** — the constant
+simply supersedes the generator. Two specialisations only conflict when they pick *incompatible*
+points (two different constants, disjoint sets, a value outside an allowed set).
+
+A `type: variant` is a richer **carrier** on this spectrum — it bundles per-case value-sources
+*and* ratios. Restricting it keeps that structure: **`one_of` on a variant intersects the
+*support* (which cases survive) but keeps the *carrier*** (the survivors bring their ratios,
+renormalised). So `merge(variant, one_of)` is a *narrower variant*, **not** a flat uniform
+`one_of`. That distinction is why the three verbs below behave the way they do.
+
+### Restricting to a subset (`one_of`)
+
+A child that includes another dataset can **restrict** an inherited variant field to a subset
+of its cases, with `one_of` on the ref'd field:
+
+```yaml
+# animals.yaml — eats is a 4-way variant
+- name: eats
+  type: variant
+  variants:
+    - { value: birds, ratio: 0.25 }
+    - { value: mice,  ratio: 0.25 }
+    - { value: grass, ratio: 0.25 }
+    - { value: fish,  ratio: 0.25 }
+
+# cats.yaml — includes animals; cats only eat birds or mice
+- name: eats
+  ref: animal.eats
+  one_of: [birds, mice]
+```
+
+`cats` rows then only ever eat `birds` or `mice`, and the surviving cases' weights **renormalise
+over the subset** (here `0.25`/`0.25` → `0.5`/`0.5`). This composes down any depth of includes —
+the restriction is pushed down to the most-constrained rows and the column is generated there,
+so a grandchild can restrict a grandparent's variant just as easily.
+
+### Tightening a case without dropping it (`constrain_cases`)
+
+`one_of` *drops* cases. To instead **narrow** a case's value-source — keeping every case — use
+`constrain_cases`, addressing parent cases by name:
+
+```yaml
+# scores.yaml — score is a variant: low (0–50) or high (50–100)
+# child.yaml — includes scores; cap the `high` case at 60 (low untouched, nothing dropped)
+- name: score
+  ref: s.score
+  constrain_cases:
+    - { name: high, range: { max: 60 } }
+```
+
+Each delta merges into the named case (intersecting ranges, overriding `value`/`generator`),
+reusing the same value-source spectrum as a top-level specialisation — just applied per case.
+
+### A note on the parent's overall mix
+
+When a child restricts a subset, the *parent's* overall case mix shifts — if cats (who only eat
+birds/mice) are a chunk of all animals, `animals.eats` will lean toward birds and mice. **This is
+intended:** a variant's `ratio`s are the *typical draw weights*, not a hard global guarantee, and
+restrictions specialise from them.
+
+**Best practice:** treat case ratios as a specialisation concern — set them where the constraint
+lives (or leave them to default to equal weights) rather than trying to pin an exact global
+distribution on a parent whose children carve it up.
+
+### Pinning the parent's marginal (`preserve_marginal`)
+
+If you *do* want the parent's declared case mix to hold exactly — with the unrestricted rows
+compensating for what the restricted ones can't be — set `preserve_marginal: true` on the parent
+variant:
+
+```yaml
+# animals.yaml — keep eats at 25/25/25/25 across ALL animals…
+- name: eats
+  type: variant
+  preserve_marginal: true
+  variants:
+    - { value: birds, ratio: 0.25 }
+    - { value: mice,  ratio: 0.25 }
+    - { value: grass, ratio: 0.25 }
+    - { value: fish,  ratio: 0.25 }
+# …even though cats (¼ of animals) only eat birds/mice — the other ¾ skew away from
+# birds/mice so the overall mix is still 25/25/25/25.
+```
+
+This is solved as a small transportation problem (the existing factoring/IPF), so it's exact
+when feasible. It can be **infeasible** — e.g. if so many animals are restricted to birds/mice
+that the pinned 50% can't cover them — and you'll get a clear error telling you to loosen the
+restriction or unset the ratio. Leaving ratios unset (the default) always works.
+
 ## Mutual exclusion is structural
 
 The cases of one union cannot co-occur — a row is `paid` *or* `pending`, never both.
@@ -104,8 +204,8 @@ Because each case is an ordinary lower-cover member, the existing per-member
 [IPF](/concepts/bernoulli-factoring/) restores each case's marginal `r_M·vᵢ`
 automatically — no variant-specific IPF — and
 [conflict pruning](/concepts/bernoulli-factoring/) handles any interaction between a
-case and a sibling. Variants need no special factoring code; they *are* lower-cover
-members.
+case and another lower-cover member. Variants need no special factoring code; they
+*are* lower-cover members.
 </Aside>
 
 ## Faithful distributions
@@ -132,3 +232,41 @@ multiplicatively rather than enumerated as a joint cross-product (see
 [Bernoulli Factoring → Further scaling directions](/concepts/bernoulli-factoring/#further-scaling-directions)).
 The segment membership mask is a `FixedBitSet`, so there is no ceiling on the number
 of members (lowered cases) in a group.
+
+## Heterogeneous unions (multi-type cases)
+
+The cases above all share one type. When a variant's cases span **more than one type** —
+a string in one case and a number in another, or two *different object schemas* (the
+"high-risk form vs standard form" shape) — there is no single column type to lower into.
+These are **heterogeneous tagged unions** (VAR-1), and they take a different path:
+
+- They do **not** take the same-type cross-product path. The field lowers to an Arrow
+  **`DenseUnion`** column (`FieldType::Union`), one case per choice. Each case generates
+  through *its own* type and generator — a `value:` case is a constant "static generator".
+- Internally the union rides the whole pipeline as a `DenseUnion`: DataFusion carries it
+  through shuffles and expressions, and its per-row `type_id` records which case fired.
+- At **write time only**, the union is converted to a portable **nullable-superset
+  struct**: one nullable sub-field per case, where each row populates only its active
+  case's sub-field (the rest are null). The populated sub-field *is* the case tag.
+
+This works for **Parquet, JSON, and JSONL**. **CSV** cannot represent a nested struct
+(the same limitation object fields have), so a heterogeneous variant written to CSV is
+rejected at validation — use `parquet`, `json`, or `jsonl`.
+
+An **object case** carries its own nested schema via `fields:` on the choice:
+
+```yaml
+- name: form
+  type: variant
+  variants:
+    - type: object
+      distribution: 0.5
+      fields:
+        - name: risk_level
+          type: string
+    - type: object
+      distribution: 0.5
+      fields:
+        - name: standard_code
+          type: string
+```

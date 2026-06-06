@@ -1,0 +1,9 @@
+name: flatten_on_scalar
+format: jsonl
+output_file: flatten_on_scalar
+rows: 10
+data:
+  - name: amount
+    type: number
+    range: { min: 1, max: 10 }
+    flatten: true

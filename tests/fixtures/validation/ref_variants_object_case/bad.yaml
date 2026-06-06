@@ -1,0 +1,15 @@
+name: child
+format: jsonl
+output_file: child
+include: { file: parent.yaml, ref: p, ratio: 0.5 }
+data:
+  - { name: id, ref: p.id }
+  # case-3 cases must be value-source-only — an object case is invalid here.
+  - name: thing
+    ref: p.thing
+    variants:
+      - type: object
+        ratio: 0.5
+        fields:
+          - { name: x, type: string }
+      - { value: "y", ratio: 0.5 }

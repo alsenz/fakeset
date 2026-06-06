@@ -1,0 +1,44 @@
+name: records
+format: jsonl
+output_file: records
+rows: 200
+data:
+  - name: id
+    type: string
+    generator: uuid
+  # Flatten union: the active case's fields appear at row level (no `claim_detail` wrapper).
+  - name: claim_detail
+    type: variant
+    flatten: true
+    variants:
+      - name: property_damage
+        type: object
+        distribution: 0.5
+        fields:
+          - name: estimate
+            type: number
+            range: { min: 100, max: 5000 }
+          - name: damage_address
+            type: string
+            generator: street_name
+      - name: theft
+        type: object
+        distribution: 0.5
+        fields:
+          - name: police_reference
+            type: string
+            generator: uuid
+          - name: items_stolen
+            type: number
+            range: { min: 1, max: 20 }
+  # Flatten object: street/postcode appear at row level (no `location` wrapper).
+  - name: location
+    type: object
+    flatten: true
+    fields:
+      - name: street
+        type: string
+        generator: street_name
+      - name: postcode
+        type: string
+        generator: zip_code

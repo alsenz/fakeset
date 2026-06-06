@@ -1,0 +1,6 @@
+name: parent
+format: jsonl
+rows: 10
+data:
+  - { name: id, type: string, generator: uuid }
+  - { name: thing, type: string }

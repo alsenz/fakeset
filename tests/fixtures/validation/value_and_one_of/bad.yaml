@@ -1,0 +1,8 @@
+name: bad
+format: csv
+rows: 10
+data:
+  - name: x
+    type: string
+    value: "a"
+    one_of: ["a", "b"]

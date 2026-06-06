@@ -1,0 +1,11 @@
+name: scores
+format: csv
+output_file: scores
+rows: 600
+data:
+  - { name: id, type: string, generator: uuid }
+  - name: score
+    type: variant
+    variants:
+      - { name: low,  type: number, range: { min: 0, max: 50 },   ratio: 0.5 }
+      - { name: high, type: number, range: { min: 50, max: 100 }, ratio: 0.5 }

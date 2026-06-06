@@ -1,0 +1,14 @@
+name: flatten_strategy_misplaced
+format: parquet
+output_file: flatten_strategy_misplaced
+rows: 10
+data:
+  # flatten_strategy is only meaningful on a flatten variant — not a flatten object.
+  - name: addr
+    type: object
+    flatten: true
+    flatten_strategy: prefixed
+    fields:
+      - name: street
+        type: string
+        generator: street_name

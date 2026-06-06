@@ -318,6 +318,12 @@ fn resolve_field(
         generator: merged.generator,
         range,
         value: merged.value,
+        one_of: merged.one_of,
+        // Carry the variant carrier (VAR-SPECIALIZE S4a): a ref'd variant keeps its cases so
+        // it generates real values, and `one_of` can restrict the carrier (not go uniform).
+        variants: base.variants.clone(),
+        // Per-case specialisations ride the field to the segment constraints (S5).
+        constrain_cases: field.constrain_cases.clone(),
         fields: base.fields.clone(),
         content: base.content.clone(),
         expression: field.expression.clone(),
@@ -433,6 +439,10 @@ fn resolve_list_link_content_field(
         generator: merged.generator,
         range,
         value: merged.value,
+        one_of: merged.one_of,
+        // Carry the variant carrier (VAR-SPECIALIZE S4a).
+        variants: target.variants.clone(),
+        constrain_cases: field.constrain_cases.clone(),
         fields: target.fields.clone(),
         content: target.content.clone(),
         refs: field.refs.clone(),

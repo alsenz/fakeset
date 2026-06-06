@@ -1,0 +1,13 @@
+name: member
+format: csv
+output_file: member
+include: { file: parent.yaml, ref: p, ratio: 1.0 }
+data:
+  - { name: id, ref: p.id }
+  # Case 3 over a generator parent: value specialises the parent's `generator: word`
+  # (S1 merge: value beats generator). Member status must be alpha/beta, not random words.
+  - name: status
+    ref: p.status
+    variants:
+      - { value: "alpha", ratio: 0.5 }
+      - { value: "beta", ratio: 0.5 }

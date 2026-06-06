@@ -1,0 +1,13 @@
+name: ok
+format: json
+output_file: ok
+rows: 10
+data:
+  - name: payload
+    type: variant
+    variants:
+      - value: "hello"
+        distribution: 0.5
+      - type: number
+        range: {min: 1, max: 10}
+        distribution: 0.5

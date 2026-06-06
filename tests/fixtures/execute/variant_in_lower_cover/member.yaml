@@ -8,14 +8,9 @@ include:
 data:
   - name: id
     ref: p.id
-variants:
-  - ratio: 0.5
-    data:
-      - name: code
-        type: string
-        value: "alpha"
-  - ratio: 0.5
-    data:
-      - name: code
-        type: string
-        value: "beta"
+  # A fresh (non-ref) field variant on a lower-cover member — lowered via VAR-EXPAND.
+  - name: code
+    type: variant
+    variants:
+      - { value: "alpha", ratio: 0.5 }
+      - { value: "beta", ratio: 0.5 }

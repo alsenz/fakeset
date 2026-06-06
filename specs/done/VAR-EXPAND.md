@@ -83,7 +83,7 @@ risks found in planning. It folds in the `VAR-LINKED-CONTENT` validation gate an
 the `variant-lowering.mdx` concepts page.
 
 Supersedes and absorbs the planner-side concerns of
-[`VAR-SPECIALIZE`](../VAR-SPECIALIZE.md): once variants are *lowered* into the
+[`VAR-SPECIALIZE`](VAR-SPECIALIZE.md): once variants are *lowered* into the
 lattice, specialisation constraints flow naturally as ordinary conflict pruning
 during Bernoulli factoring, and VAR-SPECIALIZE's contribution narrows to the
 merge-table change and the new `allowed_values:` YAML key.
@@ -592,7 +592,7 @@ Implementation can begin against `VAR-EXPAND-impl.md` PR 1.
 | `lib/validate.rs` | Reject `type: variant` on linked content list item fields (VAR-LINKED-CONTENT gate) |
 | `docs/.../concepts/variant-lowering.mdx` | New page (per §Documentation plan); sidebar entry |
 | `CLAUDE.md`, `README.md`, `reference/testing.mdx`, `src/docgen.rs` | Terminology adoption (per §Documentation plan) |
-| `specs/VAR-SPECIALIZE.md` | Already re-scoped to the merge-table change and `allowed_values:` |
+| `specs/done/VAR-SPECIALIZE.md` | Already re-scoped to the merge-table change and `allowed_values:` |
 
 ## Dependencies
 

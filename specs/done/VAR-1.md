@@ -2,9 +2,14 @@
 
 ## Status
 
-**Refreshed (design exploration).** This spec predates [`VAR-EXPAND`](done/VAR-EXPAND.md)
-(now **complete**) and was written in the VAR-2 vocabulary; it has been brought up to
-date. Two things changed the landscape:
+**Complete.** Implemented across PR 0–4 — see [`VAR-1-impl.md`](VAR-1-impl.md) for the
+as-built record. Heterogeneous (multi-type / multi-object-schema) variants lower to an
+Arrow `DenseUnion` (internal) and emit as a nullable-superset struct (parquet/json/jsonl);
+CSV is gated at validation; a configurable output encoding is deferred
+(**VAR-1-OUTPUT-FLAG**). The design rationale below is retained for context.
+
+This spec predates [`VAR-EXPAND`](VAR-EXPAND.md) and was written in the VAR-2 vocabulary;
+it was brought up to date during planning. Two things changed the landscape:
 
 1. **VAR-EXPAND landed lowering.** A `type: variant` field is a **tagged union**;
    `lower_member_variants` (`plan.rs`) lowers a lower-cover member's union into one

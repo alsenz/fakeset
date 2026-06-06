@@ -1,5 +1,6 @@
 name: orders
 format: csv
+output_file: orders
 rows: 100
 data:
   - name: id
@@ -10,19 +11,10 @@ data:
     range:
       min: 10
       max: 1000
-variants:
-  - distribution: 0.6
-    data:
-      - name: status
-        type: string
-        value: pending
-  - distribution: 0.3
-    data:
-      - name: status
-        type: string
-        value: shipped
-  - distribution: 0.1
-    data:
-      - name: status
-        type: string
-        value: cancelled
+  # Whole-row variation is now a field variant (top-level `variants:` retired — VAR-UNIFY U4).
+  - name: status
+    type: variant
+    variants:
+      - { value: pending, distribution: 0.6 }
+      - { value: shipped, distribution: 0.3 }
+      - { value: cancelled, distribution: 0.1 }

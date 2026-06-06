@@ -45,15 +45,12 @@ pub struct LowerCoverMember {
 /// parent's lower cover that arose from lowering a single `type: variant` field.
 ///
 /// Exactly one case fires per row — mutual exclusion is *structural* in the DFS
-/// (the group branches over "no case" ∪ "pick one case"), so the discriminant
-/// column is not needed to enforce it; it carries the chosen case to the executor
-/// and is what VAR-SPECIALIZE's subset restrictions constrain. The categorical prior
-/// factor weights each case by its absolute ratio `r_M·vᵢ`, with `1 − Σ ratios`
-/// reserved for "member absent" (= 0 for a mandatory union).
+/// (the group branches over "no case" ∪ "pick one case"), so **no discriminant column
+/// is materialised** to enforce it. The categorical prior factor weights each case by its
+/// absolute ratio `r_M·vᵢ`, with `1 − Σ ratios` reserved for "member absent"
+/// (= 0 for a mandatory union).
 #[derive(Clone, Debug)]
 pub struct ExclusionGroup {
-    /// Discriminant sentinel column for this union (`_disc_<field>`).
-    pub discriminant: String,
     /// Indices into the lower cover's member slice — the union's lowered cases.
     pub members: Vec<usize>,
     /// Absolute case ratios `r_M·vᵢ`, parallel to `members`.
@@ -110,13 +107,48 @@ pub fn assign_ring_slices(segments: &mut [Segment], parent_ring: &RingBounds) {
     for seg in segments.iter_mut() {
         let frac = seg.rows as f64 / total as f64;
         let slice_end = cursor + span * frac;
-        seg.ring = Some(RingBounds { start: cursor, end: slice_end });
+        seg.ring = Some(RingBounds {
+            start: cursor,
+            end: slice_end,
+        });
         cursor = slice_end;
     }
     // Clamp the last slice to exactly parent_ring.end to avoid f64 rounding drift.
     if let Some(r) = segments.last_mut().and_then(|s| s.ring.as_mut()) {
         r.end = parent_ring.end;
     }
+}
+
+/// Largest-remainder (Hamilton) rounding: floor each weight's proportional share of `total`,
+/// then hand the leftover `total − Σfloor` units to the cells with the largest fractional parts
+/// (ties → input order, so callers order their input for determinism). Unbiased per cell (each
+/// gets floor or floor+1) *and* conserves `total` exactly — both matter:
+///   - unbiased + minimal per-cell error keeps marginal distributions faithful (a plain
+///     `round()` is biased toward common cells; in a many-celled variant cross-product that
+///     bias becomes χ² failures);
+///   - exact total conservation keeps a member-that-is-also-a-parent's row count equal to the
+///     count its own step produced, so the precomputed-reuse path never pad-generates rows.
+///
+/// The single rounding primitive for both segment row counts (`plan_segments`) and pinned-variant
+/// subdivision (`plan::subdivide_for_pinned_variants`).
+pub(crate) fn largest_remainder(weights: &[f64], total: usize) -> Vec<usize> {
+    let sum: f64 = weights.iter().sum();
+    if sum <= 0.0 || weights.is_empty() {
+        return vec![0; weights.len()];
+    }
+    let scaled: Vec<f64> = weights.iter().map(|w| w / sum * total as f64).collect();
+    let mut counts: Vec<usize> = scaled.iter().map(|s| s.floor() as usize).collect();
+    let leftover = total.saturating_sub(counts.iter().sum());
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    // Stable sort by descending fractional part; equal fractions keep input order.
+    order.sort_by(|&a, &b| {
+        let (fa, fb) = (scaled[a].fract(), scaled[b].fract());
+        fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for &i in order.iter().take(leftover) {
+        counts[i] += 1;
+    }
+    counts
 }
 
 /// Plan the product-Bernoulli segments for a parent dataset given its lower cover.
@@ -190,44 +222,25 @@ pub fn plan_segments(
         ipf_rescale_sparse(&mut weights, members, &feasible);
     }
 
-    // --- Largest-remainder (Hamilton) rounding ---
-    // Floor every cell, then hand the leftover `parent_rows − Σfloor` rows to the cells
-    // with the largest fractional parts. This is unbiased per cell (each gets floor or
-    // floor+1) *and* conserves the grand total exactly — both properties matter:
-    //   - unbiased + minimal per-cell error keeps marginal distributions faithful (the
-    //     old `raw.round()` branch was biased toward common cells; many small cells in a
-    //     variant cross-product turned that bias into χ² failures);
-    //   - exact total conservation keeps a member-that-is-also-a-parent's row count equal
-    //     to the count its own step produced — independent stochastic rounding drifts that
-    //     count and the precomputed-reuse path then pad-generates rows with mismatched refs.
-    let total_weight: f64 = weights.values().copied().sum();
-    // `(included member indices, floor, frac)` per feasible cell. The ones-vec doubles
-    // as the member-path source and a deterministic tie-break key (HashMap iteration
-    // order is not stable).
-    let mut cells: Vec<(Vec<usize>, usize, f64)> = feasible
-        .keys()
-        .map(|mask| {
-            let raw = (weights[mask] / total_weight) * parent_rows as f64;
-            let fl = raw.floor();
-            (mask.ones().collect(), fl as usize, raw - fl)
+    // Round the feasible cells' weights to integer row counts conserving `parent_rows`. Order
+    // the cells by member-index list first so the rounding tie-break (and thus the output) is
+    // deterministic — HashMap iteration order is not.
+    let mut cells: Vec<Vec<usize>> = feasible.keys().map(|m| m.ones().collect()).collect();
+    cells.sort();
+    let cell_weights: Vec<f64> = cells
+        .iter()
+        .map(|ones| {
+            let mut mask = FixedBitSet::with_capacity(n);
+            ones.iter().for_each(|&i| mask.insert(i));
+            weights[&mask]
         })
         .collect();
-    let assigned: usize = cells.iter().map(|(_, fl, _)| *fl).sum();
-    let leftover = parent_rows.saturating_sub(assigned);
-    // Largest fractional remainders win the leftover rows; ties break by member list.
-    cells.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    let counts = largest_remainder(&cell_weights, parent_rows);
     let segments: Vec<Segment> = cells
         .iter()
-        .enumerate()
-        .filter_map(|(rank, (ones, fl, _))| {
-            let rows = fl + usize::from(rank < leftover);
-            if rows == 0 {
-                return None;
-            }
+        .zip(counts)
+        .filter(|(_, rows)| *rows > 0)
+        .map(|(ones, rows)| {
             let mut mask = FixedBitSet::with_capacity(n);
             let member_paths: Vec<PathBuf> = ones
                 .iter()
@@ -236,12 +249,12 @@ pub fn plan_segments(
                     members[idx].path.clone()
                 })
                 .collect();
-            Some(Segment {
+            Segment {
                 members: member_paths,
                 rows,
                 field_constraints: feasible[&mask].clone(),
                 ring: None,
-            })
+            }
         })
         .collect();
 
@@ -548,6 +561,30 @@ mod tests {
     use crate::models::{Field, FieldType, Format, RefsSpec};
     use serde_yaml::Value as YamlValue;
 
+    #[test]
+    fn largest_remainder_conserves_total_and_is_unbiased() {
+        // Exact proportional split.
+        assert_eq!(largest_remainder(&[0.5, 0.5], 10), vec![5, 5]);
+        // Subset whose weights sum to <1 must renormalise (not dump the tail on the last cell)
+        // — the property `subdivide_for_pinned_variants` and the `one_of` carrier rely on.
+        assert_eq!(largest_remainder(&[0.25, 0.25], 100), vec![50, 50]);
+        // Hamilton: the largest fractional remainder wins the leftover unit.
+        assert_eq!(largest_remainder(&[0.34, 0.33, 0.33], 10), vec![4, 3, 3]);
+        // Total is always conserved exactly, even with awkward fractions.
+        for total in [0, 1, 7, 99, 1000] {
+            let counts = largest_remainder(&[0.2, 0.3, 0.5], total);
+            assert_eq!(
+                counts.iter().sum::<usize>(),
+                total,
+                "total {total} conserved"
+            );
+        }
+        // Degenerate inputs.
+        assert_eq!(largest_remainder(&[], 5), Vec::<usize>::new());
+        assert_eq!(largest_remainder(&[1.0, 1.0], 0), vec![0, 0]);
+        assert_eq!(largest_remainder(&[0.0, 0.0], 4), vec![0, 0]);
+    }
+
     fn make_member(
         path: &str,
         ratio: f64,
@@ -834,9 +871,11 @@ mod tests {
     #[test]
     fn exclusion_group_mandatory_union_is_exclusive_and_exact() {
         // A mandatory union (Σ ratios == 1): cases c0 (0.6) and c1 (0.4).
-        let members = vec![make_member("c0", 0.6, vec![]), make_member("c1", 0.4, vec![])];
+        let members = vec![
+            make_member("c0", 0.6, vec![]),
+            make_member("c1", 0.4, vec![]),
+        ];
         let group = ExclusionGroup {
-            discriminant: "_disc_tier".to_string(),
             members: vec![0, 1],
             ratios: vec![0.6, 0.4],
             mandatory: true,
@@ -847,7 +886,9 @@ mod tests {
         let c0 = PathBuf::from("c0");
         let c1 = PathBuf::from("c1");
         assert!(
-            !segs.iter().any(|s| s.members.contains(&c0) && s.members.contains(&c1)),
+            !segs
+                .iter()
+                .any(|s| s.members.contains(&c0) && s.members.contains(&c1)),
             "no segment may contain two cases of one union"
         );
         // Mandatory ⇒ no "member absent" (empty) segment survives.
@@ -864,9 +905,11 @@ mod tests {
     fn exclusion_group_optional_union_keeps_member_absent_cell() {
         // An optional member (r_M = 0.5) with a union split 0.6/0.4 within it ⇒ absolute
         // case ratios 0.3 / 0.2, and a legitimate "member absent" mass of 0.5.
-        let members = vec![make_member("c0", 0.3, vec![]), make_member("c1", 0.2, vec![])];
+        let members = vec![
+            make_member("c0", 0.3, vec![]),
+            make_member("c1", 0.2, vec![]),
+        ];
         let group = ExclusionGroup {
-            discriminant: "_disc_tier".to_string(),
             members: vec![0, 1],
             ratios: vec![0.3, 0.2],
             mandatory: false,
@@ -874,14 +917,21 @@ mod tests {
         let segs = plan_segments(1000, &members, &[group]).unwrap();
 
         // The "no case" (member absent) segment exists and carries ~500 rows.
-        let absent: usize = segs.iter().filter(|s| s.members.is_empty()).map(|s| s.rows).sum();
-        assert!((absent as i64 - 500).abs() <= 30, "member-absent ≈ 500, got {absent}");
+        let absent: usize = segs
+            .iter()
+            .filter(|s| s.members.is_empty())
+            .map(|s| s.rows)
+            .sum();
+        assert!(
+            (absent as i64 - 500).abs() <= 30,
+            "member-absent ≈ 500, got {absent}"
+        );
         assert!((rows_for(&segs, "c0") as i64 - 300).abs() <= 25, "c0 ≈ 300");
         assert!((rows_for(&segs, "c1") as i64 - 200).abs() <= 25, "c1 ≈ 200");
     }
 
     #[test]
-    fn exclusion_group_with_plain_sibling_factors_jointly() {
+    fn exclusion_group_with_plain_member_factors_jointly() {
         // Mandatory union {c0 0.6, c1 0.4} alongside an independent plain member s (0.5).
         let members = vec![
             make_member("c0", 0.6, vec![]),
@@ -889,7 +939,6 @@ mod tests {
             make_member("s", 0.5, vec![]),
         ];
         let group = ExclusionGroup {
-            discriminant: "_disc_tier".to_string(),
             members: vec![0, 1],
             ratios: vec![0.6, 0.4],
             mandatory: true,
@@ -899,12 +948,17 @@ mod tests {
         let c0 = PathBuf::from("c0");
         let c1 = PathBuf::from("c1");
         assert!(
-            !segs.iter().any(|s| s.members.contains(&c0) && s.members.contains(&c1)),
-            "union cases stay mutually exclusive even with a sibling present"
+            !segs
+                .iter()
+                .any(|s| s.members.contains(&c0) && s.members.contains(&c1)),
+            "union cases stay mutually exclusive even with a plain member present"
         );
         // Every segment picks exactly one case (mandatory union, no empty segments).
-        assert!(segs.iter().all(|s| s.members.contains(&c0) || s.members.contains(&c1)));
-        // Marginals: each case ~ its ratio; sibling ~ 0.5.
+        assert!(
+            segs.iter()
+                .all(|s| s.members.contains(&c0) || s.members.contains(&c1))
+        );
+        // Marginals: each case ~ its ratio; the plain member ~ 0.5.
         assert!((rows_for(&segs, "c0") as i64 - 600).abs() <= 30, "c0 ≈ 600");
         assert!((rows_for(&segs, "c1") as i64 - 400).abs() <= 30, "c1 ≈ 400");
         assert!((rows_for(&segs, "s") as i64 - 500).abs() <= 40, "s ≈ 500");
@@ -960,7 +1014,10 @@ mod ring_tests {
         assert!((r(1).start - 0.3).abs() < 1e-9);
         assert!((r(1).end - 0.5).abs() < 1e-9);
         assert!((r(2).start - 0.5).abs() < 1e-9);
-        assert!((r(2).end - 1.0).abs() < 1e-9, "last slice must clamp to parent end");
+        assert!(
+            (r(2).end - 1.0).abs() < 1e-9,
+            "last slice must clamp to parent end"
+        );
     }
 
     #[test]
@@ -984,7 +1041,10 @@ mod ring_tests {
         for i in 0..segs.len() - 1 {
             let end = segs[i].ring.as_ref().unwrap().end;
             let next_start = segs[i + 1].ring.as_ref().unwrap().start;
-            assert!((end - next_start).abs() < 1e-9, "gap/overlap at boundary {i}");
+            assert!(
+                (end - next_start).abs() < 1e-9,
+                "gap/overlap at boundary {i}"
+            );
         }
         // Last slice ends exactly at 1.0.
         assert!((segs.last().unwrap().ring.as_ref().unwrap().end - 1.0).abs() < 1e-9);
@@ -1056,7 +1116,11 @@ mod var_expand_prototype {
             offsets.push(acc);
             acc += u.len();
         }
-        Layout { offsets, plain_off: acc, total: acc + cfg.plain.len() }
+        Layout {
+            offsets,
+            plain_off: acc,
+            total: acc + cfg.plain.len(),
+        }
     }
 
     fn case_bit(l: &Layout, u: usize, c: usize) -> usize {
@@ -1145,19 +1209,19 @@ mod var_expand_prototype {
 
         for raw in 0..(1u128 << l.total) {
             // Discriminant: at most one case per union.
-            let multi_case = cfg
-                .unions
-                .iter()
-                .enumerate()
-                .any(|(u, cases)| (0..cases.len()).filter(|&c| bit(raw, case_bit(l, u, c))).count() > 1);
+            let multi_case = cfg.unions.iter().enumerate().any(|(u, cases)| {
+                (0..cases.len())
+                    .filter(|&c| bit(raw, case_bit(l, u, c)))
+                    .count()
+                    > 1
+            });
             if multi_case {
                 continue;
             }
             // Cross-union (specialisation) conflicts.
-            let conflicts = cfg
-                .conflicts
-                .iter()
-                .any(|&((ua, ca), (ub, cb))| bit(raw, case_bit(l, ua, ca)) && bit(raw, case_bit(l, ub, cb)));
+            let conflicts = cfg.conflicts.iter().any(|&((ua, ca), (ub, cb))| {
+                bit(raw, case_bit(l, ua, ca)) && bit(raw, case_bit(l, ub, cb))
+            });
             if conflicts {
                 continue;
             }
@@ -1174,7 +1238,11 @@ mod var_expand_prototype {
                     }
                 }
                 for (c, &v) in cases.iter().enumerate() {
-                    w_naive *= if bit(raw, case_bit(l, u, c)) { v } else { 1.0 - v };
+                    w_naive *= if bit(raw, case_bit(l, u, c)) {
+                        v
+                    } else {
+                        1.0 - v
+                    };
                 }
             }
             for (p, &r) in cfg.plain.iter().enumerate() {
@@ -1233,8 +1301,16 @@ mod var_expand_prototype {
             let mut converged = true;
             for (i, m) in members.iter().enumerate() {
                 let target = m.ratio;
-                let mass_in: f64 = feasible.keys().filter(|k| k.contains(i)).map(|k| weights[k]).sum();
-                let mass_out: f64 = feasible.keys().filter(|k| !k.contains(i)).map(|k| weights[k]).sum();
+                let mass_in: f64 = feasible
+                    .keys()
+                    .filter(|k| k.contains(i))
+                    .map(|k| weights[k])
+                    .sum();
+                let mass_out: f64 = feasible
+                    .keys()
+                    .filter(|k| !k.contains(i))
+                    .map(|k| weights[k])
+                    .sum();
                 if mass_in <= EPS || mass_out <= EPS {
                     continue;
                 }
@@ -1267,8 +1343,8 @@ mod var_expand_prototype {
             uniform(2),
             uniform(3),
             uniform(5),
-            vec![0.9, 0.1],            // skewed
-            vec![0.97, 0.02, 0.01],    // extreme: min vᵢ = 0.01
+            vec![0.9, 0.1],         // skewed
+            vec![0.97, 0.02, 0.01], // extreme: min vᵢ = 0.01
         ];
 
         for n_unions in 1..=4 {
@@ -1329,11 +1405,17 @@ mod var_expand_prototype {
         let mut probe = cat.clone();
         let sweeps = ipf_mirror(&mut probe, &mem, &feasible, 200);
         eprintln!("stacked-unions+conflicts: converged in {sweeps} sweeps");
-        assert!(sweeps < 50, "interior IPF should converge fast; took {sweeps} sweeps");
+        assert!(
+            sweeps < 50,
+            "interior IPF should converge fast; took {sweeps} sweeps"
+        );
 
         // Correctness via the production function.
         ipf_rescale_sparse(&mut cat, &mem, &feasible);
-        assert!(illegal_mass(&cat, &illegal) <= 1e-9, "illegal mass must stay zero under conflicts");
+        assert!(
+            illegal_mass(&cat, &illegal) <= 1e-9,
+            "illegal mass must stay zero under conflicts"
+        );
         for (i, m) in mem.iter().enumerate() {
             assert!(
                 (marginal(&cat, i) - m.ratio).abs() < 1e-6,
@@ -1363,8 +1445,14 @@ mod var_expand_prototype {
 
         // Naive prior starts with substantial illegal mass (≈ 0.24 here).
         let naive_prior_leak = illegal_mass(&naive, &illegal);
-        assert!(naive_prior_leak > 0.2, "naive prior should leak (got {naive_prior_leak})");
-        assert!(illegal_mass(&cat, &illegal) <= TOL, "categorical prior must not leak");
+        assert!(
+            naive_prior_leak > 0.2,
+            "naive prior should leak (got {naive_prior_leak})"
+        );
+        assert!(
+            illegal_mass(&cat, &illegal) <= TOL,
+            "categorical prior must not leak"
+        );
 
         // Under a deliberately low cap the naive leak does not clear.
         let leaked = ipf_mirror(&mut naive, &mem, &feasible, 4);
@@ -1380,6 +1468,9 @@ mod var_expand_prototype {
 
         // Categorical prior stays exactly zero regardless of cap (I-projection).
         let _ = ipf_mirror(&mut cat, &mem, &feasible, 4);
-        assert!(illegal_mass(&cat, &illegal) <= 1e-9, "categorical illegal mass stays zero");
+        assert!(
+            illegal_mass(&cat, &illegal) <= 1e-9,
+            "categorical illegal mass stays zero"
+        );
     }
 }

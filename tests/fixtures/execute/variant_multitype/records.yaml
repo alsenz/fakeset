@@ -1,0 +1,33 @@
+name: records
+format: jsonl
+output_file: records
+rows: 200
+data:
+  - name: id
+    type: string
+    generator: uuid
+  # Scalar heterogeneous variant: string OR number.
+  - name: payload
+    type: variant
+    variants:
+      - value: "flagged"
+        distribution: 0.5
+      - type: number
+        range: {min: 0, max: 100}
+        distribution: 0.5
+  # Object-schema heterogeneous variant: two different nested schemas (supplier-form shape).
+  - name: form
+    type: variant
+    variants:
+      - type: object
+        distribution: 0.5
+        fields:
+          - name: risk_level
+            type: string
+            generator: word
+      - type: object
+        distribution: 0.5
+        fields:
+          - name: standard_code
+            type: string
+            generator: word

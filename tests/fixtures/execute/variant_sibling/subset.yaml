@@ -1,5 +1,6 @@
 name: subset
 format: csv
+output_file: subset
 include:
   file: source.yaml
   ref: src

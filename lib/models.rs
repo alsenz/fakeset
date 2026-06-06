@@ -93,6 +93,12 @@ pub enum FieldType {
     /// Expanded into global dataset variants by `expand_field_variants`
     /// before execution; never reaches the generator.
     Variant,
+    /// A heterogeneous (multi-type) tagged union — a `type: variant` field whose cases
+    /// span more than one type, produced internally by `expand_field_variants` (VAR-1).
+    /// The concrete per-case specs live in [`Field::union_cases`]; the column is
+    /// materialised as an Arrow `DenseUnion`. Never written in YAML, so skipped by serde.
+    #[serde(skip)]
+    Union,
 }
 
 impl std::fmt::Display for FieldType {
@@ -106,20 +112,17 @@ impl std::fmt::Display for FieldType {
             FieldType::Date => write!(f, "date"),
             FieldType::DateTime => write!(f, "date_time"),
             FieldType::Variant => write!(f, "variant"),
+            FieldType::Union => write!(f, "union"),
         }
     }
 }
 
-/// Sentinel-column prefix for tagged-union discriminants (VAR-EXPAND). When a
-/// `type: variant` field is lowered into its cases, each case is tagged with
-/// `_disc_<union_field>` so the planner can enforce "exactly one case per row" and
-/// the executor can tell cases apart. Stripped from output like the other
-/// `_`-prefixed sentinels.
-pub const DISCRIMINANT_PREFIX: &str = "_disc_";
-
-/// The discriminant sentinel column name for a tagged-union field.
-pub fn discriminant_column(union_field: &str) -> String {
-    format!("{DISCRIMINANT_PREFIX}{union_field}")
+/// Output column name for the materialised case tag of a `flatten` variant under the
+/// `discriminant` strategy (VAR-UNIFY): a **visible** output column naming the active case
+/// per row. (Tagged-union *exclusivity* needs no sentinel — it is structural in the DFS, so no
+/// internal discriminant column is ever materialised.)
+pub fn discriminant_tag_column(union_field: &str) -> String {
+    format!("{union_field}_case")
 }
 
 /// Arrow/Parquet datatype override for a field.
@@ -169,20 +172,53 @@ pub enum ParquetDatatype {
     TimestampUs,
 }
 
+/// How a `flatten`ed **variant** field's case fields are laid out in a flat columnar
+/// output (Parquet/CSV), where one schema must cover every row (VAR-UNIFY). JSON/JSONL
+/// ignore this — they emit per-row keys (only the active case's fields) regardless.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+pub enum FlattenStrategy {
+    /// Case fields side by side as a nullable superset; the populated set is the case tag.
+    /// Cross-case name collisions are rejected at validation (use `prefixed`).
+    #[serde(rename = "superset")]
+    #[default]
+    Superset,
+    /// Prefix each pulled-up field by its case name (`<case>_<field>`), so cases with
+    /// same-named fields don't collide.
+    #[serde(rename = "prefixed")]
+    Prefixed,
+    /// Superset layout plus a materialised `<field>_case` string column naming the active
+    /// case per row.
+    #[serde(rename = "discriminant")]
+    Discriminant,
+}
+
 /// One concrete alternative within a `type: variant` field.
 ///
 /// Carries the field properties for this choice (type, generator, value, range,
-/// locale, parquet) plus an optional distribution weight.  Name is inherited from
-/// the parent field.  Nested `variants` and structural properties (`fields`,
-/// `content`, `expression`, `ref`) are not permitted inside a variant choice.
+/// locale, parquet, and — for object cases — nested `fields`) plus an optional
+/// distribution weight.  Name is inherited from the parent field.  Nested `variants`
+/// and the other structural properties (`content`, `expression`, `ref`) are not
+/// permitted inside a variant choice.
+///
+/// A choice carrying `fields:` (or `type: object`) is an **object case** of a
+/// heterogeneous tagged union (VAR-1): such variants lower to a `FieldType::Union`
+/// rather than the same-type cross-product path.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FieldVariant {
+    /// Optional case label. For a **heterogeneous union** (VAR-1) it names the case in
+    /// the output (the union child / nullable-superset sub-field); without it, cases are
+    /// named positionally (`<field>_<i>`). Ignored for same-type variants.
+    pub name: Option<String>,
     #[serde(rename = "type")]
     pub field_type: Option<FieldType>,
     pub generator: Option<Generator>,
     pub locale: Option<Locale>,
     pub range: Option<Range>,
     pub value: Option<serde_yaml::Value>,
+    /// Nested fields for an **object case** of a heterogeneous union (VAR-1).
+    /// Empty for scalar cases.
+    #[serde(default)]
+    pub fields: Vec<Field>,
     /// Parquet type override for this specific choice.  If absent, the outer
     /// field's `parquet` annotation is used as a fallback.
     pub parquet: Option<ParquetConfig>,
@@ -190,6 +226,31 @@ pub struct FieldVariant {
     /// Free slots (None) share the remainder equally.  Must sum to ≤ 1.0;
     /// if all are set they must sum to exactly 1.0.
     #[serde(alias = "distribution")]
+    pub ratio: Option<f64>,
+}
+
+/// A per-case specialisation of a ref'd parent variant (VAR-SPECIALIZE S5; `constrain_cases`).
+/// Addresses a parent case by `name` and tightens its value-source — value/generator/range/
+/// `one_of` — by merging with the case's existing source. Non-restrictive (the case survives);
+/// other cases are untouched. Structural keys (`type`/`fields`/`ref`) are not permitted.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CaseDelta {
+    /// The parent variant case this delta specialises (matched by case `name`).
+    pub name: String,
+    pub generator: Option<Generator>,
+    pub value: Option<serde_yaml::Value>,
+    pub range: Option<Range>,
+}
+
+/// One case of a heterogeneous tagged union (VAR-1; `FieldType::Union`).
+///
+/// Unlike [`FieldVariant`], a case is a full [`Field`], so it can carry a nested object
+/// schema (`fields`) per case and generates through its **own** generator/value/type
+/// (a `value:` case is the static generator). `ratio` is this case's share of the
+/// union's rows. Constructed internally by `expand_field_variants`; never from YAML.
+#[derive(Debug, Clone)]
+pub struct UnionCase {
+    pub field: Field,
     pub ratio: Option<f64>,
 }
 
@@ -616,6 +677,22 @@ pub struct Field {
     /// Emit this constant value for every row instead of generating data.
     /// Incompatible with `generator`, `min`, and `max`.
     pub value: Option<serde_yaml::Value>,
+    /// Finite-set generator (VAR-SPECIALIZE): draw each row uniformly from this set. On a
+    /// plain field it is a standalone "one of these values" generator; on a field that `ref`s a
+    /// parent it *restricts* the inherited domain (a support selector — see `FieldConstraints`).
+    /// Mutually exclusive with `value`.
+    pub one_of: Option<Vec<serde_yaml::Value>>,
+    /// Opt-in marginal pinning for a `type: variant` field (VAR-SPECIALIZE S4c). When true, the
+    /// declared case `ratio`s are preserved as a **global** marginal across the whole
+    /// population: if a child restricts the variant to a subset, the unrestricted rows
+    /// compensate so the parent's overall case distribution still matches. Default false =
+    /// free-by-default (ratios are within-population draw weights; restrictions reshape the mix).
+    #[serde(default)]
+    pub preserve_marginal: bool,
+    /// Per-case specialisations of a ref'd parent variant (VAR-SPECIALIZE S5): tighten named
+    /// cases' value-sources without dropping any. See [`CaseDelta`].
+    #[serde(default)]
+    pub constrain_cases: Vec<CaseDelta>,
     /// Nested fields for object type — written directly as `fields:` in YAML.
     #[serde(default)]
     pub fields: Vec<Field>,
@@ -626,9 +703,26 @@ pub struct Field {
     /// Must be empty on all other field types.
     #[serde(default)]
     pub variants: Vec<FieldVariant>,
+    /// Cases of a heterogeneous tagged union when `field_type == Some(FieldType::Union)`
+    /// (VAR-1). Populated internally by `expand_field_variants`; never deserialised from YAML.
+    #[serde(skip)]
+    pub union_cases: Vec<UnionCase>,
     /// Parquet/Arrow datatype override.  When set, the field's Arrow schema uses
     /// this type and generated values are cast to it.  Valid on any field type.
     pub parquet: Option<ParquetConfig>,
+    /// Output-write-time pull-up (serde `#[serde(flatten)]` analogue; VAR-UNIFY). When
+    /// true, this field's nesting is elided at output: an `object` field's sub-fields are
+    /// pulled up into the parent level; a `variant` (union) field distributes flatten to its
+    /// object cases, emitting the active case's fields flat at the parent (nullable superset
+    /// for Parquet, per-row keys for JSON). Output-only — the internal model, refs, and
+    /// generation are untouched, so a flatten field **must have a name**. Valid only on
+    /// `object` and `variant` fields.
+    #[serde(default)]
+    pub flatten: bool,
+    /// Layout for a `flatten`ed **variant** field's case fields in flat columnar output
+    /// (Parquet/CSV); see [`FlattenStrategy`]. Only meaningful when `flatten` is true on a
+    /// variant field. Defaults to `superset`. Ignored for JSON/JSONL (per-row keys).
+    pub flatten_strategy: Option<FlattenStrategy>,
     /// SQL expression evaluated against the batch after all other fields are generated.
     /// Variables must refer to fields defined above this one in the YAML (evaluation order).
     /// Mutually exclusive with `type`, `ref`, `generator`, `min`, `max`, and `value`.
@@ -875,17 +969,21 @@ pub struct Include {
     pub exclude: Option<Vec<String>>,
 }
 
+/// One combination of the **case-3** cross-product (`ref` + `variants` fields — VAR-SPECIALIZE).
+/// *Not* user input: `expand_field_variants` builds these from a dataset's case-3 fields, and
+/// `plan::lower_member_variants` turns each into a ref-bound, value-pinned case-member. (The
+/// retired top-level `variants:` key once deserialised here directly; it is now rejected at
+/// validation — VAR-UNIFY U4.)
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VariantSchema {
-    /// Fields that override or extend the dataset's base `data` for this variant.
+    /// Field deltas overlaid on the dataset's base `data` for this combination.
     /// Same-named base fields are replaced; new names are appended.
     #[serde(default)]
     pub data: Schema,
-    /// Locale override for this variant's fields. Falls back to the dataset-level locale.
+    /// Locale override for this combination's fields. Falls back to the dataset-level locale.
     pub locale: Option<Locale>,
-    /// Fraction of the parent dataset's rows this variant receives (0.0–1.0).
-    /// Variants without a ratio share the remainder equally.
-    /// All ratios must sum to ≤ 1.0; if all are set they must sum to exactly 1.0.
+    /// Fraction of the parent dataset's rows this combination receives (product of its cases'
+    /// ratios). Combinations without a ratio share the remainder equally.
     #[serde(alias = "distribution")]
     pub ratio: Option<f64>,
 }
@@ -923,9 +1021,10 @@ pub struct SyntheticDataset {
     pub links: Vec<Include>,
     #[serde(default)]
     pub data: Schema,
-    /// When non-empty, the dataset is virtually split into N concrete variants at plan time.
-    /// Each variant inherits the base `data` fields and overrides/extends them with its own.
-    /// All variant outputs are written to the same output file and shuffled together.
+    /// **Internal** case-3 lowering artifact — see [`VariantSchema`]. Always empty as loaded
+    /// from YAML (top-level `variants:` is rejected at validation, VAR-UNIFY U4); populated by
+    /// `expand_field_variants` with the cross-product of the dataset's `ref` + `variants`
+    /// (case-3) fields, then consumed by `plan::lower_member_variants`.
     #[serde(default)]
     pub variants: Vec<VariantSchema>,
 }

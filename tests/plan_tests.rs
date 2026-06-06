@@ -297,105 +297,74 @@ fn non_ref_dataset_has_no_inherited_fields() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn variant_dataset_produces_n_generate_steps() {
-    // orders has 3 variants (60/30/10%) — should produce 3 GenerateDataset steps,
-    // no standalone non-variant GenerateDataset for orders, and one WriteSharedOutput.
+fn variant_dataset_generates_per_row() {
+    // VAR-UNIFY Phase 2: a same-type field variant (orders.status) generates per-row, not via
+    // cross-product — so there are no `orders__v*` variant steps, just one GenerateDataset for
+    // orders and one WriteSharedOutput.
     let steps = plan_for("tests/fixtures/execute/variants");
 
-    let variant_steps: Vec<_> = steps.iter().filter(|s| {
-        matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name.starts_with("orders__v"))
-    }).collect();
-    assert_eq!(
-        variant_steps.len(),
-        3,
-        "expected 3 variant GenerateDataset steps, got {}",
-        variant_steps.len()
+    assert!(
+        !steps.iter().any(|s| matches!(
+            s,
+            ExecutionStep::GenerateDataset { dataset, .. } if dataset.name.starts_with("orders__v")
+        )),
+        "no per-variant GenerateDataset steps under per-row generation"
     );
+    let orders_steps = steps
+        .iter()
+        .filter(|s| {
+            matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name == "orders")
+        })
+        .count();
+    assert_eq!(orders_steps, 1, "exactly one GenerateDataset for orders");
 
-    let write_steps: Vec<_> = steps.iter().filter(|s| {
-        matches!(s, ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "orders")
-    }).collect();
-    assert_eq!(
-        write_steps.len(),
-        1,
-        "expected exactly one WriteSharedOutput for 'orders'"
-    );
+    let write_steps = steps
+        .iter()
+        .filter(|s| {
+            matches!(s, ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "orders")
+        })
+        .count();
+    assert_eq!(write_steps, 1, "one WriteSharedOutput for 'orders'");
 }
 
 #[test]
-fn variant_rows_sum_to_parent_and_respect_distribution() {
+fn variant_dataset_single_step_has_all_rows() {
+    // Per-row: one GenerateDataset carries all 100 rows (the distribution is resolved per-row
+    // at generation time, not pre-split into variant steps).
     let steps = plan_for("tests/fixtures/execute/variants");
-
-    let total: usize = steps
-        .iter()
-        .filter_map(|s| match s {
-            ExecutionStep::GenerateDataset { dataset, rows, .. }
-                if dataset.name.starts_with("orders__v") =>
-            {
-                Some(rows)
-            }
-            _ => None,
-        })
-        .sum();
-    assert_eq!(
-        total, 100,
-        "variant row counts must sum to parent rows (100)"
-    );
-
-    // v0 = 60%, v1 = 30%, v2 = 10% of 100
-    let v0 = steps
+    let rows = steps
         .iter()
         .find_map(|s| match s {
-            ExecutionStep::GenerateDataset { dataset, rows, .. }
-                if dataset.name == "orders__v0" =>
-            {
+            ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name == "orders" => {
                 Some(*rows)
             }
             _ => None,
         })
-        .expect("orders__v0 step not found");
-    let v1 = steps
-        .iter()
-        .find_map(|s| match s {
-            ExecutionStep::GenerateDataset { dataset, rows, .. }
-                if dataset.name == "orders__v1" =>
-            {
-                Some(*rows)
-            }
-            _ => None,
-        })
-        .expect("orders__v1 step not found");
-    let v2 = steps
-        .iter()
-        .find_map(|s| match s {
-            ExecutionStep::GenerateDataset { dataset, rows, .. }
-                if dataset.name == "orders__v2" =>
-            {
-                Some(*rows)
-            }
-            _ => None,
-        })
-        .expect("orders__v2 step not found");
-    assert_eq!(v0, 60);
-    assert_eq!(v1, 30);
-    assert_eq!(v2, 10);
+        .expect("orders GenerateDataset step");
+    assert_eq!(rows, 100, "the single orders step carries all rows");
 }
 
 #[test]
 fn variant_lower_cover_member_produces_lower_cover_groups_and_shared_outputs() {
-    // source has 2 variants (70/30), subset is a Bernoulli lower cover member at ratio:0.4.
-    // Expected: 2 GenerateLowerCoverGroup steps (one per variant), 2 WriteSharedOutput steps
-    // (one for source variants, one for subset accumulation).
+    // source has a per-row variant (tier) + a Bernoulli lower-cover member `subset`. With
+    // per-row generation, source is a single lower-cover-group parent (no `source__v*` split):
+    // one GenerateLowerCoverGroup for source, and two WriteSharedOutput (source + subset).
     let steps = plan_for("tests/fixtures/execute/variant_sibling");
 
-    let lower_cover_groups: Vec<_> = steps.iter().filter(|s| {
-        matches!(s, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name.starts_with("source__v"))
-    }).collect();
-    assert_eq!(
-        lower_cover_groups.len(),
-        2,
-        "expected 2 GenerateLowerCoverGroup steps for variant parents"
+    assert!(
+        !steps.iter().any(|s| matches!(
+            s,
+            ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name.starts_with("source__v")
+        )),
+        "no per-variant lower-cover groups under per-row generation"
     );
+    let groups = steps
+        .iter()
+        .filter(|s| {
+            matches!(s, ExecutionStep::GenerateLowerCoverGroup { parent, .. } if parent.name == "source")
+        })
+        .count();
+    assert_eq!(groups, 1, "one GenerateLowerCoverGroup for source");
 
     let write_count = steps
         .iter()
@@ -408,42 +377,37 @@ fn variant_lower_cover_member_produces_lower_cover_groups_and_shared_outputs() {
 }
 
 #[test]
-fn field_variant_expands_to_correct_generate_steps() {
-    // orders.yaml: 120 rows, status(50/50) × tier(25/25/50) = 6 combinations.
-    // Expect 6 GenerateDataset steps + 1 WriteSharedOutput.
+fn field_variant_generates_per_row() {
+    // field_variants/orders.yaml: status × tier are now independent per-row columns — one
+    // GenerateDataset for orders (no `orders__v*` cross-product), one WriteSharedOutput, all
+    // 120 rows in the single step.
     let steps = plan_for("tests/fixtures/execute/field_variants");
 
-    let variant_steps: Vec<_> = steps.iter().filter(|s| {
-        matches!(s, ExecutionStep::GenerateDataset { dataset, .. } if dataset.name.starts_with("orders__v"))
-    }).collect();
-    assert_eq!(
-        variant_steps.len(),
-        6,
-        "expected 6 variant GenerateDataset steps, got {}",
-        variant_steps.len()
+    assert!(
+        !steps.iter().any(|s| matches!(
+            s,
+            ExecutionStep::GenerateDataset { dataset, .. } if dataset.name.starts_with("orders__v")
+        )),
+        "no cross-product variant steps under per-row generation"
     );
-
-    let write_steps: Vec<_> = steps.iter().filter(|s| {
-        matches!(s, ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "orders")
-    }).collect();
-    assert_eq!(
-        write_steps.len(),
-        1,
-        "expected exactly one WriteSharedOutput for 'orders'"
-    );
-
-    let total_rows: usize = steps
+    let rows = steps
         .iter()
-        .filter_map(|s| match s {
-            ExecutionStep::GenerateDataset { dataset, rows, .. }
-                if dataset.name.starts_with("orders__v") =>
-            {
-                Some(rows)
+        .find_map(|s| match s {
+            ExecutionStep::GenerateDataset { dataset, rows, .. } if dataset.name == "orders" => {
+                Some(*rows)
             }
             _ => None,
         })
-        .sum();
-    assert_eq!(total_rows, 120, "variant row counts must sum to 120");
+        .expect("orders GenerateDataset step");
+    assert_eq!(rows, 120, "the single orders step carries all rows");
+
+    let write_steps = steps
+        .iter()
+        .filter(|s| {
+            matches!(s, ExecutionStep::WriteSharedOutput { output_file, .. } if output_file == "orders")
+        })
+        .count();
+    assert_eq!(write_steps, 1, "one WriteSharedOutput for 'orders'");
 }
 
 // ---------------------------------------------------------------------------
@@ -601,4 +565,17 @@ fn card_uniform_min_too_large_errors() {
         msg.contains("reinforcement") && msg.contains("min"),
         "error should mention reinforcement and min cardinality; got: {msg}"
     );
+}
+
+#[test]
+fn pinned_marginal_infeasible_errors() {
+    // cats wants 60% of animals restricted to {birds,mice}, but the pinned marginal only
+    // allots 50% to birds+mice → infeasible (segment-side cut). Must error with guidance.
+    let err = plan_err_for("tests/fixtures/validation/pinned_marginal_infeasible");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("preserve_marginal"),
+        "should mention preserve_marginal: {msg}"
+    );
+    assert!(msg.contains("infeasible"), "should say infeasible: {msg}");
 }

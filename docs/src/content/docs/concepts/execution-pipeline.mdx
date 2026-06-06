@@ -81,12 +81,19 @@ Warnings (non-fatal) are printed to stderr; errors abort.
 
 ### 6. Expand field variants
 
-`type: variant` fields are expanded. A dataset with a single `type: variant` field
-with N alternatives is replaced by N concrete variant datasets at the same
-semi-lattice position. Multiple variant fields produce a cross-product expansion.
+`type: variant` fields are routed to their generation path (see
+[Variants as Tagged Unions](/concepts/variant-lowering/)):
 
-Variant datasets share the same `output_file:` and are written to the same output
-using a union + shuffle step (`WriteSharedOutput`).
+- **Heterogeneous** cases (multiple types, or object schemas) lower to an Arrow `DenseUnion`
+  column, emitted as a nullable-superset struct.
+- **Same-type** cases (the common case) keep their cases on the field and generate **per row**
+  (a per-row categorical draw) — no dataset duplication.
+- A **case-3** field (`ref` + `variants`) is cross-producted into the dataset's internal variant
+  set so the lower-cover planner can lower each case into a ref-bound, value-pinned case-member
+  (constraint-bearing — VAR-SPECIALIZE).
+
+(There is no longer a top-level `variants:` key or "N concrete variant datasets" — that was
+retired in VAR-UNIFY in favour of per-row generation and a `flatten` output primitive.)
 
 ### 7. Expand include fields
 
@@ -184,7 +191,7 @@ awkward in plain Arrow:
   declaration order. A fresh `SessionContext` is created per call to avoid
   registration lifecycle issues.
 - **`filter_hidden_columns`** — project out hidden fields before emitting.
-- **`union_and_shuffle`** — union accumulated variant batches and sort by a random
+- **`union_and_shuffle`** — union accumulated batches and sort by a random
   column for reproducibility-agnostic shuffles.
 
 Parent assembly is pure Arrow column selection: `generate_segment_atom_batch`

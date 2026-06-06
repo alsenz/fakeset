@@ -1,0 +1,9 @@
+name: cats
+format: csv
+output_file: cats
+include: { file: animals.yaml, ref: a, ratio: 0.6 }
+data:
+  - { name: id, ref: a.id }
+  - name: eats
+    ref: a.eats
+    one_of: [birds, mice]

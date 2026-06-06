@@ -80,7 +80,10 @@ include:
 `type: variant` fields are **tagged unions** lowered into this same machinery: a
 lower-cover member's union becomes one case per value, factored as a mutually
 exclusive group, so variant ratios are honoured by the same segmentation (no
-separate code path). See the docs' *Variants as Tagged Unions* page.
+separate code path). Cases that span **more than one type** (or different object
+schemas) become a *heterogeneous* union — generated as an Arrow `DenseUnion` and
+written as a nullable-superset struct (Parquet/JSON/JSONL; not CSV). See the docs'
+*Variants as Tagged Unions* page.
 
 ## YAML schema
 
@@ -217,7 +220,7 @@ The binary is placed at `target/release/fakeset`.
 ### Rust unit and integration tests
 
 ```bash
-cargo test          # ~248 tests
+cargo test          # ~263 tests
 ```
 
 ### Statistical regression tests

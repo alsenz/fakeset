@@ -1,5 +1,6 @@
 name: policies
 format: parquet
+output_file: policies
 rows: 100
 data:
   - name: policy_id

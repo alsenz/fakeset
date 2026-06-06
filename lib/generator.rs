@@ -4,15 +4,18 @@
 use anyhow::{Result, anyhow, bail};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, ListArray, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    TimestampMicrosecondArray, UnionArray,
 };
-use arrow::buffer::OffsetBuffer;
-use arrow::compute::{cast, concat};
-use arrow::datatypes::{DataType, Field as ArrowField};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::compute::{cast, concat, interleave};
+use arrow::datatypes::{DataType, Field as ArrowField, UnionFields};
 use fake::{Fake, Faker};
 use std::sync::Arc;
 
-use crate::models::{CountSpec, Field, FieldType, Generator, Locale};
+use crate::expand_variants::unified_variant_type;
+use crate::models::{
+    CountSpec, Field, FieldType, FieldVariant, Generator, Locale, resolve_distributions,
+};
 use crate::schema::{field_to_arrow, parquet_datatype_to_arrow};
 use std::collections::HashMap;
 
@@ -155,6 +158,33 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
     let prefix_len: usize = prefix.iter().map(|a| a.len()).sum();
     let n = rows.saturating_sub(prefix_len);
 
+    // Same-type field variant (VAR-UNIFY Phase 2): a per-row categorical over the cases. The
+    // field keeps a concrete unified `field_type` for schema/ref purposes, plus its `variants`
+    // for generation — so it dispatches here rather than to the type's normal arm.
+    if !field.variants.is_empty() {
+        return prepend_prefix(prefix, build_same_type_variant_column(field, n)?);
+    }
+
+    // `one_of` (VAR-SPECIALIZE): a uniform finite-set generator — sugar for a same-type variant
+    // with value-only, ratio-less cases. A `value` (singleton) takes precedence below.
+    if field.value.is_none()
+        && let Some(set) = &field.one_of
+    {
+        let cases: Vec<FieldVariant> = set
+            .iter()
+            .map(|v| FieldVariant {
+                field_type: field.field_type.clone(),
+                value: Some(v.clone()),
+                ..Default::default()
+            })
+            .collect();
+        let synth = Field {
+            variants: cases,
+            ..field.clone()
+        };
+        return prepend_prefix(prefix, build_same_type_variant_column(&synth, n)?);
+    }
+
     let ft = field
         .field_type
         .as_ref()
@@ -236,6 +266,7 @@ fn generate_column_raw(field: &Field, rows: usize, prefix: &[ArrayRef]) -> Resul
                 field.name
             )
         }
+        FieldType::Union => build_union_column(field, n)?,
         FieldType::List => match field.content.as_deref() {
             None => {
                 let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::repeat_n(0, n));
@@ -384,10 +415,178 @@ fn constant_column(ft: &FieldType, val: &serde_yaml::Value, n: usize) -> Result<
                 vec![dt.timestamp_micros(); n],
             )))
         }
-        FieldType::Object | FieldType::List | FieldType::Variant => {
-            bail!("constant `value` is not supported for object/list/variant fields")
+        FieldType::Object | FieldType::List | FieldType::Variant | FieldType::Union => {
+            bail!("constant `value` is not supported for object/list/variant/union fields")
         }
     }
+}
+
+/// Build an Arrow `DenseUnion` column for a heterogeneous tagged union (VAR-1).
+///
+/// Each case (`field.union_cases`) is generated through its **own** field spec — its own
+/// generator/value/type, so a `value:` case is the static generator. The active case is
+/// drawn **independently per row** from the declared ratios. Per-row sampling (rather than
+/// a largest-remainder block split) is what keeps the distribution correct: this generator
+/// is called once per segment/slot batch, so any rounding rule that hands a small batch's
+/// leftover to the biggest case would systematically over-represent it once the pipeline
+/// fragments generation. `type_id i` ↔ the i-th case, matching `field_to_arrow`.
+fn build_union_column(field: &Field, n: usize) -> Result<ArrayRef> {
+    let cases = &field.union_cases;
+    if cases.is_empty() {
+        bail!("union field '{}' has no cases", field.name);
+    }
+
+    // Cumulative distribution for per-row categorical sampling.
+    let weights = resolve_distributions(&cases.iter().map(|c| c.ratio).collect::<Vec<_>>());
+    let mut cumulative = Vec::with_capacity(weights.len());
+    let mut acc = 0.0;
+    for w in &weights {
+        acc += w;
+        cumulative.push(acc);
+    }
+
+    // Draw each row's case independently; count rows per case for child-array sizing.
+    let mut case_of_row: Vec<usize> = Vec::with_capacity(n);
+    let mut counts = vec![0usize; cases.len()];
+    for _ in 0..n {
+        let u: f64 = (0.0f64..1.0f64).fake();
+        let i = cumulative
+            .iter()
+            .position(|&c| u < c)
+            .unwrap_or(cases.len() - 1);
+        case_of_row.push(i);
+        counts[i] += 1;
+    }
+
+    let union_fields: UnionFields = cases
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as i8, Arc::new(field_to_arrow(&c.field))))
+        .collect();
+    let mut children: Vec<ArrayRef> = Vec::with_capacity(cases.len());
+    for (case, &count) in cases.iter().zip(counts.iter()) {
+        children.push(generate_column(&case.field, count, &[])?);
+    }
+
+    // Dense union: each row's type_id is its case; offset is the running index into that
+    // case's child array.
+    let mut next = vec![0i32; cases.len()];
+    let mut type_ids: Vec<i8> = Vec::with_capacity(n);
+    let mut offsets: Vec<i32> = Vec::with_capacity(n);
+    for &i in &case_of_row {
+        type_ids.push(i as i8);
+        offsets.push(next[i]);
+        next[i] += 1;
+    }
+
+    let arr = UnionArray::try_new(
+        union_fields,
+        ScalarBuffer::from(type_ids),
+        Some(ScalarBuffer::from(offsets)),
+        children,
+    )?;
+    Ok(Arc::new(arr))
+}
+
+/// A `Field` for generating one case of a same-type variant: the case's value-source over the
+/// union's shared (unified) type.
+fn case_to_field(name: &str, ftype: FieldType, c: &FieldVariant) -> Field {
+    Field {
+        name: name.to_string(),
+        field_type: Some(ftype),
+        generator: c.generator.clone(),
+        locale: c.locale.clone(),
+        range: c.range,
+        value: c.value.clone(),
+        parquet: c.parquet.clone(),
+        ..Default::default()
+    }
+}
+
+/// Build a same-type (homogeneous) variant column by **per-row categorical** sampling
+/// (VAR-UNIFY Phase 2): draw each row's case independently, generate each case's values in
+/// bulk, then `interleave` them back into row order. This is `build_union_column`'s sampling
+/// without the union wrapper — all cases share one Arrow type, so the result is a plain column.
+fn build_same_type_variant_column(field: &Field, n: usize) -> Result<ArrayRef> {
+    // VAR-SPECIALIZE S4b — a `one_of` restriction *filters the carrier*: keep only the cases
+    // whose value is in the set (matched by value), and let their ratios renormalise over the
+    // survivors. `merge(Variant, one_of) = Variant[subset]`, not a flat uniform `one_of`.
+    let restricted: Vec<FieldVariant>;
+    let cases: &[FieldVariant] = if let Some(set) = &field.one_of {
+        restricted = field
+            .variants
+            .iter()
+            .filter(|c| c.value.as_ref().is_some_and(|v| set.contains(v)))
+            .cloned()
+            .collect();
+        if restricted.is_empty() {
+            bail!(
+                "variant field '{}': `one_of` restricts to no declared cases",
+                field.name
+            );
+        }
+        &restricted
+    } else {
+        &field.variants
+    };
+    if cases.is_empty() {
+        bail!("variant field '{}' has no cases", field.name);
+    }
+    let unified = unified_variant_type(cases).ok_or_else(|| {
+        anyhow!(
+            "variant field '{}': cases have inconsistent types (a heterogeneous variant should \
+             have lowered to a union)",
+            field.name
+        )
+    })?;
+
+    // Cumulative distribution → per-row independent draw. Renormalise so the weights sum to 1
+    // — after a `one_of` filter the surviving ratios sum to <1, and an un-normalised tail would
+    // dump the leftover mass on the last case (the carrier/support "renormalise over survivors").
+    let raw = resolve_distributions(&cases.iter().map(|c| c.ratio).collect::<Vec<_>>());
+    let total: f64 = raw.iter().sum();
+    let weights: Vec<f64> = if total > 0.0 {
+        raw.iter().map(|w| w / total).collect()
+    } else {
+        raw
+    };
+    let mut cumulative = Vec::with_capacity(weights.len());
+    let mut acc = 0.0;
+    for w in &weights {
+        acc += w;
+        cumulative.push(acc);
+    }
+    let mut case_of_row: Vec<usize> = Vec::with_capacity(n);
+    let mut counts = vec![0usize; cases.len()];
+    for _ in 0..n {
+        let u: f64 = (0.0f64..1.0f64).fake();
+        let i = cumulative
+            .iter()
+            .position(|&c| u < c)
+            .unwrap_or(cases.len() - 1);
+        case_of_row.push(i);
+        counts[i] += 1;
+    }
+
+    // Generate each case's values in bulk through its own value-source.
+    let case_cols: Vec<ArrayRef> = cases
+        .iter()
+        .zip(counts.iter())
+        .map(|(c, &cnt)| generate_column(&case_to_field(&field.name, unified.clone(), c), cnt, &[]))
+        .collect::<Result<_>>()?;
+
+    // Scatter back to row order: row r takes the next unused value from its chosen case.
+    let mut next = vec![0usize; cases.len()];
+    let indices: Vec<(usize, usize)> = case_of_row
+        .iter()
+        .map(|&i| {
+            let o = next[i];
+            next[i] += 1;
+            (i, o)
+        })
+        .collect();
+    let refs: Vec<&dyn Array> = case_cols.iter().map(|a| a.as_ref()).collect();
+    Ok(interleave(&refs, &indices)?)
 }
 
 /// Extract a `usize` range from `args` with given key names and defaults.
@@ -507,5 +706,81 @@ fn fake_string(
             Generator::Date => fake_date(None, None).format("%Y-%m-%d").to_string(),
             Generator::DateTime => fake_datetime(None, None).to_rfc3339(),
         },
+    }
+}
+
+#[cfg(test)]
+mod union_tests {
+    //! VAR-1 PR 2 — dormant `FieldType::Union` machinery. These build a union `Field`
+    //! directly (no `expand_variants` caller produces one yet) to exercise the schema
+    //! and generation arms in isolation.
+    use super::*;
+    use crate::models::{Range, UnionCase};
+    use arrow::datatypes::UnionMode;
+    use serde_yaml::Value as YamlValue;
+
+    /// Two heterogeneous cases: a static-string case ("x") and a number case (0..10),
+    /// 50/50.
+    fn union_field() -> Field {
+        Field {
+            field_type: Some(FieldType::Union),
+            union_cases: vec![
+                UnionCase {
+                    field: Field {
+                        field_type: Some(FieldType::String),
+                        value: Some(YamlValue::String("x".into())),
+                        ..Default::default()
+                    },
+                    ratio: Some(0.5),
+                },
+                UnionCase {
+                    field: Field {
+                        field_type: Some(FieldType::Number),
+                        range: Some(Range {
+                            min: Some(0.0),
+                            max: Some(10.0),
+                        }),
+                        ..Default::default()
+                    },
+                    ratio: Some(0.5),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generates_denseunion_with_expected_case_split() {
+        // Per-row categorical sampling over two 0.5 cases — assert the split is in a
+        // sane band (not exact, since each row is drawn independently).
+        let arr = generate_column(&union_field(), 1000, &[]).unwrap();
+        let u = arr
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("a UnionArray");
+        assert_eq!(u.type_ids().len(), 1000);
+        let mut hist = std::collections::BTreeMap::new();
+        for &t in u.type_ids().iter() {
+            *hist.entry(t).or_insert(0) += 1;
+        }
+        assert!(
+            (400..=600).contains(hist.get(&0).unwrap_or(&0)),
+            "string case ≈ 500"
+        );
+        assert!(
+            (400..=600).contains(hist.get(&1).unwrap_or(&0)),
+            "number case ≈ 500"
+        );
+    }
+
+    #[test]
+    fn field_to_arrow_is_dense_union() {
+        match field_to_arrow(&union_field()).data_type() {
+            DataType::Union(fields, mode) => {
+                assert_eq!(*mode, UnionMode::Dense);
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("expected a Union datatype, got {other:?}"),
+        }
     }
 }

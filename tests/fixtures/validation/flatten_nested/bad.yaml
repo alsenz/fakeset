@@ -1,0 +1,15 @@
+name: flatten_nested
+format: jsonl
+output_file: flatten_nested
+rows: 10
+data:
+  - name: outer
+    type: object
+    fields:
+      - name: inner
+        type: object
+        flatten: true
+        fields:
+          - name: x
+            type: string
+            generator: word

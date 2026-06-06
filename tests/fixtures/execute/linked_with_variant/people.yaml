@@ -1,0 +1,14 @@
+name: people
+format: jsonl
+output_file: people
+rows: 40
+data:
+  - { name: id, type: string, generator: uuid }
+  - { name: full_name, type: string, generator: name }
+  # Same-type field variant on a LINKED dataset — the U5/U6 regression case.
+  - name: tier
+    type: variant
+    variants:
+      - { value: gold, ratio: 0.2 }
+      - { value: silver, ratio: 0.3 }
+      - { value: bronze, ratio: 0.5 }

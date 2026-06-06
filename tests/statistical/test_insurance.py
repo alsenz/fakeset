@@ -113,10 +113,14 @@ def test_premium_status_values(insurance):
 
 
 
-def test_claim_type_values(insurance):
-    valid = {"property_damage", "theft", "liability", "medical", "accident"}
-    bad = ~insurance["claims"]["claim_type"].is_in(valid)
-    assert not bad.any(), f"Unexpected claim_type values: {insurance['claims'].filter(bad)['claim_type'].to_list()}"
+def test_claim_detail_is_self_describing_union(insurance):
+    # VAR-1 heterogeneous union: claim_detail is a struct with one sub-field per claim
+    # type; exactly one is populated per row (the populated case IS the claim type).
+    cases = ["property_damage", "theft", "liability", "medical", "accident"]
+    detail = insurance["claims"]["claim_detail"]
+    assert set(detail.struct.fields) == set(cases), f"unexpected union cases: {detail.struct.fields}"
+    populated = sum(detail.struct.field(c).is_not_null().cast(int) for c in cases)
+    assert (populated == 1).all(), "each claim must populate exactly one case of claim_detail"
 
 
 
@@ -254,13 +258,34 @@ def test_claims_include_ratio(insurance):
 # ---------------------------------------------------------------------------
 
 def test_contract_status_distribution(insurance):
-    """Contract status: active 70%, lapsed 20%, cancelled 10%."""
+    """Contract status: active 70%, lapsed 20%, cancelled 10%.
+
+    This also guards VAR-SPECIALIZE `preserve_marginal` (S4c): claims attach only to
+    active/lapsed contracts (see test_claim_contract_status_restricted), which would skew the
+    contract status mix away from 70/20/10 — but `preserve_marginal: true` on contracts.status
+    makes the non-claim contracts compensate so the global marginal still holds. Remove the
+    flag and this χ² test fails.
+    """
     stat, p = _chi2_goodness_of_fit(
         insurance["contracts"]["status"],
         {"active": 0.7, "lapsed": 0.2, "cancelled": 0.1},
         "contract status",
     )
     assert p > ALPHA, f"Contract status distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
+
+
+def test_claim_contract_status_restricted(insurance):
+    """VAR-SPECIALIZE S4b: a claim's inherited contract status is restricted to a subset.
+
+    Claims are only filed on active/lapsed contracts (`one_of: [active, lapsed]` on a ref to
+    contract.status) — never cancelled. Hard membership invariant on the restricted carrier.
+    """
+    valid = {"active", "lapsed"}
+    bad = ~insurance["claims"]["contract_status"].is_in(valid)
+    assert not bad.any(), (
+        "claims.contract_status must be restricted to {active, lapsed}; got "
+        f"{insurance['claims'].filter(bad)['contract_status'].unique().to_list()}"
+    )
 
 
 
@@ -276,15 +301,20 @@ def test_claim_status_distribution(insurance):
 
 
 
-def test_claim_type_distribution(insurance):
-    """Claim type: property_damage 30%, theft 20%, liability 20%, medical 20%, accident 10%."""
+def test_claim_detail_case_distribution(insurance):
+    """Claim detail case: property_damage 30%, theft 20%, liability 20%, medical 20%, accident 10%."""
     _require_rows(insurance["claims"], 50, "claims")
-    stat, p = _chi2_goodness_of_fit(
-        insurance["claims"]["claim_type"],
-        {"property_damage": 0.3, "theft": 0.2, "liability": 0.2, "medical": 0.2, "accident": 0.1},
-        "claim type",
-    )
-    assert p > ALPHA, f"Claim type distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
+    ratios = {"property_damage": 0.3, "theft": 0.2, "liability": 0.2, "medical": 0.2, "accident": 0.1}
+    detail = insurance["claims"]["claim_detail"]
+    n = len(detail)
+    expected = {k: v * n for k, v in ratios.items()}
+    if any(e < 5 for e in expected.values()):
+        pytest.skip(f"Chi-squared skipped for claim detail: min expected cell {min(expected.values()):.1f} < 5 (n={n})")
+    # The active case is the one populated sub-struct, so count non-null per case.
+    obs = [int(detail.struct.field(c).is_not_null().sum()) for c in ratios]
+    exp = [expected[c] for c in ratios]
+    stat, p = chisquare(f_obs=obs, f_exp=exp)
+    assert p > ALPHA, f"Claim detail case distribution deviates from declared ratios (χ²={stat:.2f}, p={p:.4f})"
 
 
 

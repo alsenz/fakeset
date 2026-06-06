@@ -1,6 +1,6 @@
 //! Arrow schema conversion. `schema_to_arrow` and `field_to_arrow` map fakeset field
 //! types to Arrow `DataType`s; `parquet_datatype_to_arrow` handles Parquet overrides.
-use arrow::datatypes::{DataType, Field as ArrowField, TimeUnit};
+use arrow::datatypes::{DataType, Field as ArrowField, TimeUnit, UnionFields, UnionMode};
 use std::sync::Arc;
 
 use crate::models::{Field, FieldType, ParquetDatatype, Schema};
@@ -55,6 +55,17 @@ pub fn field_to_arrow(field: &Field) -> ArrowField {
             "variant field '{}' must be expanded before execution; call expand_field_variants first",
             field.name
         ),
+        FieldType::Union => {
+            // Heterogeneous tagged union (VAR-1) → Arrow DenseUnion of the case types.
+            // type_id `i` ↔ the i-th case, matching `generate_column`'s union build.
+            let union_fields: UnionFields = field
+                .union_cases
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i as i8, Arc::new(field_to_arrow(&c.field))))
+                .collect();
+            DataType::Union(union_fields, UnionMode::Dense)
+        }
     };
     ArrowField::new(name, dt, true)
 }

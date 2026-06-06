@@ -1,18 +1,13 @@
 name: source
 format: csv
+output_file: source
 rows: 100
 data:
   - name: id
     type: string
     generator: uuid
-variants:
-  - distribution: 0.7
-    data:
-      - name: tier
-        type: string
-        value: gold
-  - distribution: 0.3
-    data:
-      - name: tier
-        type: string
-        value: silver
+  - name: tier
+    type: variant
+    variants:
+      - { value: gold, distribution: 0.7 }
+      - { value: silver, distribution: 0.3 }

@@ -1,0 +1,18 @@
+name: flatten_collision_sibling
+format: jsonl
+output_file: flatten_collision_sibling
+rows: 10
+data:
+  - name: city
+    type: string
+    generator: city_name
+  - name: address
+    type: object
+    flatten: true
+    fields:
+      - name: city
+        type: string
+        generator: city_name
+      - name: street
+        type: string
+        generator: street_name

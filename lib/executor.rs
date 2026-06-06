@@ -13,7 +13,7 @@
 //! | `_slot_idx` | `UInt32` | `execute_lower_cover_group_core` (member batches) | `AssembleFromWitness` (fold into lists) | `strip_slot_idx` before member emit |
 //! | `_staging_refs` | `List<UInt32>` | `execute_witness` | `execute_assemble_from_witness` (fold) | stripped during assembly |
 //! | `_linked_idx` | `UInt32` | `inject_linked_idx` (junction) / `execute_witness` | `execute_accumulate_to_linked` | `strip_linked_idx` before junction emit |
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use arrow::array::{
     Array, ArrayRef, Float64Array, ListArray, StringArray, StringBuilder, StructArray, UInt32Array,
     new_empty_array,
@@ -27,10 +27,8 @@ use datafusion::functions_aggregate::expr_fn::{
 };
 use datafusion::prelude::{SessionContext, col};
 use fake::Fake;
-use parquet::arrow::ArrowWriter;
 use serde_yaml::Value as YamlValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,6 +40,7 @@ use crate::models::{
     CountSpec, Field, Format, Include, Range, Reducer, RingBounds, Schema, SeedConfig,
     SyntheticDataset, eligible_linked_rows, resolve_include, split_ref,
 };
+use crate::output::{filter_hidden_columns, write_output};
 use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField};
 use crate::schema::{field_to_arrow, schema_to_arrow};
 use crate::segment::{LowerCoverMember, Segment};
@@ -243,27 +242,8 @@ pub async fn execute(
                         Some(q) => apply_data_quality(combined, q, schema)?,
                         None => combined,
                     };
-                    write_output(&final_batch, output_file, format, output_dir)?;
+                    write_output(&final_batch, output_file, format, output_dir, schema)?;
                 }
-            }
-            ExecutionStep::CombineVariantBatches {
-                original_path,
-                variant_paths,
-            } => {
-                let batches: Vec<RecordBatch> = variant_paths
-                    .iter()
-                    .filter_map(|vp| computed.get(vp))
-                    .cloned()
-                    .collect();
-                if let Some(first) = batches.first() {
-                    let combined = concat_batches(&first.schema(), &batches)
-                        .context("CombineVariantBatches: concat failed")?;
-                    computed.insert(original_path.clone(), combined);
-                }
-                // The canonical combined batch is now the dataset's final representation.
-                // Mark it so that downstream lower cover group steps that see this dataset
-                // as a member reuse the combined batch rather than regenerating fresh rows.
-                parent_computed.insert(original_path.clone());
             }
         }
     }
@@ -406,13 +386,18 @@ async fn execute_dataset_core(
 ) -> Result<()> {
     let inherited_map = resolve_inherited_fields(inherited, computed);
     let batch = if let Some(spec) = &dataset.import {
-        let ring = spec
-            .ring
-            .clone()
-            .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+        let ring = spec.ring.clone().unwrap_or(RingBounds {
+            start: 0.0,
+            end: 1.0,
+        });
         let idx = get_or_load_import(path, spec, seed_config.ring, import_cache)?;
         let import_batch = filter_ring(&idx, &ring)?;
-        generate_batch_with_import(&dataset.data, &inherited_map, &HashMap::new(), &import_batch)?
+        generate_batch_with_import(
+            &dataset.data,
+            &inherited_map,
+            &HashMap::new(),
+            &import_batch,
+        )?
     } else {
         generate_with_inherited(&dataset.data, rows, &inherited_map)?
     };
@@ -472,10 +457,10 @@ async fn execute_lower_cover_group_core(
         // For imported parents, load this segment's ring slice now so we know the
         // actual row count (hash distribution may differ slightly from seg.rows).
         let (n_rows, opt_import_batch) = if let Some(spec) = &dataset.import {
-            let ring = seg
-                .ring
-                .clone()
-                .unwrap_or(RingBounds { start: 0.0, end: 1.0 });
+            let ring = seg.ring.clone().unwrap_or(RingBounds {
+                start: 0.0,
+                end: 1.0,
+            });
             let idx = get_or_load_import(path, spec, seed_config.ring, import_cache)?;
             let ib = filter_ring(&idx, &ring)?;
             if ib.num_rows() == 0 {
@@ -537,15 +522,7 @@ async fn execute_lower_cover_group_core(
                         .contains(&m.path)
                         .then(|| computed.get(&m.path))
                         .flatten();
-                    project_member_columns(
-                        &atom_batch,
-                        m,
-                        acc.slot_offset,
-                        n_rows,
-                        &seg.field_constraints,
-                        pre,
-                        &mut acc,
-                    )?;
+                    project_member_columns(&atom_batch, m, acc.slot_offset, n_rows, pre, &mut acc)?;
                 }
 
                 project_parent_columns_from_atom(
@@ -563,7 +540,12 @@ async fn execute_lower_cover_group_core(
     }
 
     let (parent_shuffled, mut member_buffers) = acc
-        .finalise(is_staging, has_witness_sources, &dataset.data, &dataset.name)
+        .finalise(
+            is_staging,
+            has_witness_sources,
+            &dataset.data,
+            &dataset.name,
+        )
         .await?;
 
     if is_staging {
@@ -650,6 +632,7 @@ fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<Reco
 ///
 /// Returns `(slot_assignments, staging_idxs, surviving_indices)` where `surviving_indices`
 /// is the identity map (slot_assignments are already absolute pre-filter indices).
+#[allow(clippy::too_many_arguments)]
 fn draw_exclusive_shards(
     slot_start: usize,
     slot_count: usize,
@@ -1688,13 +1671,14 @@ fn generate_batch_with_import(
         .filter(|f| f.expression.is_none() && !f.is_list_link())
         .map(|f| -> Result<ArrayRef> {
             if f.imported_taint {
-                let col_idx = import_batch
-                    .schema()
-                    .index_of(&f.name)
-                    .map_err(|_| anyhow!("imported column '{}' not found in import batch", f.name))?;
+                let col_idx = import_batch.schema().index_of(&f.name).map_err(|_| {
+                    anyhow!("imported column '{}' not found in import batch", f.name)
+                })?;
                 Ok(import_batch.column(col_idx).clone())
             } else {
-                let prefix = inherited.get(&f.name).map_or(&[] as &[ArrayRef], |v| v.as_slice());
+                let prefix = inherited
+                    .get(&f.name)
+                    .map_or(&[] as &[ArrayRef], |v| v.as_slice());
                 let effective = overrides.get(&f.name).map(|fc| apply_constraints(f, fc));
                 generate_column(effective.as_ref().unwrap_or(f), n, prefix)
             }
@@ -1744,8 +1728,10 @@ fn build_segment_atom_schema(
     members: &[&LowerCoverMember],
     seg_constraints: &HashMap<String, FieldConstraints>,
 ) -> (Vec<Field>, HashMap<String, Vec<usize>>) {
-    let per_member_refs: Vec<HashMap<String, String>> =
-        members.iter().map(|m| member_ref_to_parent_map(m)).collect();
+    let per_member_refs: Vec<HashMap<String, String>> = members
+        .iter()
+        .map(|m| member_ref_to_parent_map(m))
+        .collect();
 
     let mut atom_fields: Vec<Field> = Vec::new();
     let mut providing_members: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1910,11 +1896,7 @@ fn generate_segment_atom_batch(
 ///
 /// The short case matches the stochastic-rounding tolerance previously provided
 /// by the LEFT JOIN in the pre-SEG-ATOM-1 parent assembly.
-fn pad_or_generate_tail(
-    field: &Field,
-    base: ArrayRef,
-    target_n: usize,
-) -> Result<ArrayRef> {
+fn pad_or_generate_tail(field: &Field, base: ArrayRef, target_n: usize) -> Result<ArrayRef> {
     let base_n = base.len();
     if base_n == target_n {
         return Ok(base);
@@ -1986,7 +1968,6 @@ fn project_member_columns(
     m: &LowerCoverMember,
     slot_offset: usize,
     n_rows: usize,
-    seg_constraints: &HashMap<String, FieldConstraints>,
     precomputed: Option<&RecordBatch>,
     acc: &mut SegmentBatchAccumulator,
 ) -> Result<()> {
@@ -2011,7 +1992,7 @@ fn project_member_columns(
             let m_n = sample_count(card).max(1);
             row_indices.extend(std::iter::repeat_n(i as u32, m_n));
             slot_tags.extend(std::iter::repeat_n((slot_offset + i) as u32, m_n));
-            let nonref = generate_member_nonref_fields(m, m_n, seg_constraints)?;
+            let nonref = generate_member_nonref_fields(m, m_n)?;
             if nonref.num_columns() > 0 {
                 emitted_any_nonref = true;
             }
@@ -2069,7 +2050,7 @@ fn project_member_columns(
 
     // No cardinality, not precomputed: one row per slot.
     let nonref_batch = {
-        let nonref = generate_member_nonref_fields(m, n_rows, seg_constraints)?;
+        let nonref = generate_member_nonref_fields(m, n_rows)?;
         (nonref.num_columns() > 0).then_some(nonref)
     };
     let mut out_fields: Vec<ArrowField> = Vec::new();
@@ -2137,15 +2118,17 @@ fn get_or_load_import(
 /// Variant compatibility against `seg_constraints` is checked using the **full**
 /// variant schema (including its ref fields) so that variants whose ref-bound
 /// values conflict with the segment are correctly pruned.
-fn generate_member_nonref_fields(
-    m: &LowerCoverMember,
-    rows: usize,
-    seg_constraints: &HashMap<String, FieldConstraints>,
-) -> Result<RecordBatch> {
+fn generate_member_nonref_fields(m: &LowerCoverMember, rows: usize) -> Result<RecordBatch> {
     // After VAR-EXPAND lowering, a member carries a concrete schema with no `variants:`
     // (tagged unions are lowered into separate case-members in the planner), so this
     // generates exactly the member's non-ref fields. Ref columns come from the shared
     // segment-atom batch; expression and list-link fields are handled elsewhere.
+    //
+    // Segment field constraints are deliberately NOT applied here: they are keyed by *parent*
+    // field name and describe the shared (ref'd) parent columns, which are materialised in the
+    // segment-atom batch and projected in. A member's *own* non-ref field is independent — even
+    // if it happens to share a name with a constrained parent field (e.g. both a parent and a
+    // child have a `status` field), the parent's restriction must not bleed onto it.
     let prefix = format!("{}.", m.reference);
     let is_nonref = |f: &Field| {
         f.simple_ref()
@@ -2169,7 +2152,7 @@ fn generate_member_nonref_fields(
         )?);
     }
 
-    generate_fresh_batch(&nonref_base, rows, seg_constraints)
+    generate_fresh_batch(&nonref_base, rows, &HashMap::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -2340,6 +2323,9 @@ fn apply_constraints(field: &Field, fc: &FieldConstraints) -> Field {
     if fc.value.is_some() {
         f.value = fc.value.clone();
     }
+    if fc.one_of.is_some() {
+        f.one_of = fc.one_of.clone();
+    }
     if fc.generator.is_some() {
         f.generator = fc.generator.clone();
     }
@@ -2350,6 +2336,31 @@ fn apply_constraints(field: &Field, fc: &FieldConstraints) -> Field {
         }
         if fc.max.is_some() {
             r.max = fc.max;
+        }
+    }
+    // VAR-SPECIALIZE S5: per-case carrier specialisations — narrow the matching variant case's
+    // value-source in place (non-restrictive; unnamed cases untouched).
+    for delta in &fc.case_overrides {
+        if let Some(case) = f
+            .variants
+            .iter_mut()
+            .find(|c| c.name.as_deref() == Some(&delta.name))
+        {
+            if delta.value.is_some() {
+                case.value = delta.value.clone();
+            }
+            if delta.generator.is_some() {
+                case.generator = delta.generator.clone();
+            }
+            if let Some(dr) = &delta.range {
+                let r = case.range.get_or_insert(Range::default());
+                if let Some(mn) = dr.min {
+                    r.min = Some(r.min.map_or(mn, |e| e.max(mn)));
+                }
+                if let Some(mx) = dr.max {
+                    r.max = Some(r.max.map_or(mx, |e| e.min(mx)));
+                }
+            }
         }
     }
     f
@@ -2487,76 +2498,6 @@ async fn evaluate_expressions(
     Ok(concat_batches(&schema, &batches)?)
 }
 
-/// Remove columns marked `hidden` from a batch before writing output.
-/// The full batch (including hidden columns) is kept in `computed` for inherited
-/// field wiring; only the filtered batch is written to output.
-fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordBatch> {
-    if !fields.iter().any(|f| f.hidden) {
-        return Ok(batch);
-    }
-    let hidden: HashSet<&str> = fields
-        .iter()
-        .filter(|f| f.hidden)
-        .map(|f| f.name.as_str())
-        .collect();
-    let visible: Vec<usize> = (0..batch.num_columns())
-        .filter(|&i| !hidden.contains(batch.schema().field(i).name().as_str()))
-        .collect();
-    Ok(batch.project(&visible)?)
-}
-
-// ---------------------------------------------------------------------------
-// Output writing
-// ---------------------------------------------------------------------------
-
-fn write_output(batch: &RecordBatch, name: &str, format: &Format, output_dir: &Path) -> Result<()> {
-    let ext = match format {
-        Format::Parquet => "parquet",
-        Format::Csv => "csv",
-        Format::Json => "json",
-        Format::Jsonl => "jsonl",
-    };
-    // If name already ends with the correct extension (e.g. from an explicit `file:` path),
-    // use it as-is; otherwise append the extension (legacy `output_file:` name convention).
-    let path = if std::path::Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        == Some(ext)
-    {
-        output_dir.join(name)
-    } else {
-        output_dir.join(format!("{name}.{ext}"))
-    };
-    let file = File::create(&path)?;
-
-    match format {
-        Format::Parquet => {
-            let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
-            writer.write(batch)?;
-            writer.close()?;
-        }
-        Format::Csv => {
-            let mut writer = arrow::csv::WriterBuilder::new()
-                .with_header(true)
-                .build(file);
-            writer.write(batch)?;
-        }
-        Format::Json => {
-            let mut writer = arrow::json::ArrayWriter::new(file);
-            writer.write_batches(&[batch])?;
-            writer.finish()?;
-        }
-        Format::Jsonl => {
-            let mut writer = arrow::json::LineDelimitedWriter::new(file);
-            writer.write_batches(&[batch])?;
-            writer.finish()?;
-        }
-    }
-
-    println!("  wrote {}", path.display());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2614,5 +2555,528 @@ mod tests {
         // First two rows from the precomputed batch; the remaining three are the
         // freshly generated constant from the field definition.
         assert_eq!(read_strings(&out), vec!["a", "b", "pad", "pad", "pad"]);
+    }
+}
+
+/// VAR-UNIFY PR U2 — `flatten`-aware output. Proves the write-time pull-up: an object
+/// field's struct children and a union field's case fields are spliced to the row level,
+/// and — the load-bearing assumption for "per-row keys" — the JSON writer omits null keys,
+/// so a flattened union row carries only its active case's fields.
+#[cfg(test)]
+mod flatten_output {
+    use super::*;
+    use crate::models::{Field, FieldType, FlattenStrategy};
+    use crate::output::prepare_output_batch;
+    use arrow::array::{Int32Array, StringArray, StructArray, UnionArray};
+    use arrow::buffer::ScalarBuffer;
+    use arrow::datatypes::{UnionFields, UnionMode};
+    use std::fs::File;
+
+    fn flatten_field(name: &str) -> Field {
+        Field {
+            name: name.into(),
+            field_type: Some(FieldType::Variant),
+            flatten: true,
+            ..Default::default()
+        }
+    }
+
+    fn flatten_field_strategy(name: &str, strategy: FlattenStrategy) -> Field {
+        Field {
+            flatten_strategy: Some(strategy),
+            ..flatten_field(name)
+        }
+    }
+
+    /// 2-row batch: `id` + a `detail` union with two object cases that **share** a field
+    /// name (`amount`) — the cross-case collision the `prefixed` strategy resolves.
+    fn flatten_union_collision_batch() -> RecordBatch {
+        let mk_struct = |v: i32| -> ArrayRef {
+            Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("amount", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![v])) as ArrayRef,
+            )]))
+        };
+        let alpha = mk_struct(10);
+        let beta = mk_struct(20);
+        let union_fields: UnionFields = [
+            (
+                0_i8,
+                Arc::new(ArrowField::new("alpha", alpha.data_type().clone(), false)),
+            ),
+            (
+                1_i8,
+                Arc::new(ArrowField::new("beta", beta.data_type().clone(), false)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let union = UnionArray::try_new(
+            union_fields.clone(),
+            ScalarBuffer::<i8>::from(vec![0, 1]),
+            Some(ScalarBuffer::<i32>::from(vec![0, 0])),
+            vec![alpha, beta],
+        )
+        .expect("build union");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "detail",
+                DataType::Union(union_fields, UnionMode::Dense),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(union)],
+        )
+        .expect("build batch")
+    }
+
+    fn col_names(batch: &RecordBatch) -> Vec<String> {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    /// 2-row batch: `id` + a `detail` dense union with two **object** cases —
+    /// row 0 = `alpha {a: Int32}`, row 1 = `beta {b: Utf8}`.
+    fn flatten_union_batch() -> RecordBatch {
+        let alpha_struct: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![10])) as ArrayRef,
+        )]));
+        let beta_struct: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("b", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+        )]));
+        let union_fields: UnionFields = [
+            (
+                0_i8,
+                Arc::new(ArrowField::new(
+                    "alpha",
+                    alpha_struct.data_type().clone(),
+                    false,
+                )),
+            ),
+            (
+                1_i8,
+                Arc::new(ArrowField::new(
+                    "beta",
+                    beta_struct.data_type().clone(),
+                    false,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let type_ids = ScalarBuffer::<i8>::from(vec![0, 1]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 0]);
+        let union = UnionArray::try_new(
+            union_fields.clone(),
+            type_ids,
+            Some(offsets),
+            vec![alpha_struct, beta_struct],
+        )
+        .expect("build union");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "detail",
+                DataType::Union(union_fields, UnionMode::Dense),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(union)],
+        )
+        .expect("build batch")
+    }
+
+    #[test]
+    fn flatten_union_pulls_case_fields_to_top_level() {
+        let out = prepare_output_batch(
+            &flatten_union_batch(),
+            &[flatten_field("detail")],
+            &Format::Jsonl,
+        )
+        .unwrap();
+        let sch = out.schema();
+        let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "a", "b"],
+            "case fields pulled up; `detail` gone"
+        );
+        let a = out.column_by_name("a").unwrap();
+        let b = out.column_by_name("b").unwrap();
+        assert!(a.is_valid(0) && !a.is_valid(1), "`a` only on the alpha row");
+        assert!(!b.is_valid(0) && b.is_valid(1), "`b` only on the beta row");
+    }
+
+    /// The gate: the JSON writer must omit null keys so each row carries only its active
+    /// case's fields. If this ever regressed, the spec's per-row-keys story would need a
+    /// custom encoder.
+    #[test]
+    fn flatten_union_jsonl_emits_per_row_keys() {
+        let out = prepare_output_batch(
+            &flatten_union_batch(),
+            &[flatten_field("detail")],
+            &Format::Jsonl,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut w = arrow::json::LineDelimitedWriter::new(&mut buf);
+            w.write(&out).unwrap();
+            w.finish().unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("\"a\"") && !lines[0].contains("\"b\""),
+            "row 0 should carry only the alpha case's keys: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("\"b\"") && !lines[1].contains("\"a\""),
+            "row 1 should carry only the beta case's keys: {}",
+            lines[1]
+        );
+    }
+
+    /// The Parquet superset path: flattened case fields become plain nullable top-level
+    /// columns, written and read back through a real Parquet file.
+    #[test]
+    fn flatten_union_parquet_superset_round_trips() {
+        let dir = std::env::temp_dir().join(format!("varunify_u2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_output(
+            &flatten_union_batch(),
+            "detail",
+            &Format::Parquet,
+            &dir,
+            &[flatten_field("detail")],
+        )
+        .expect("flattened superset writes to parquet");
+
+        let file = File::open(dir.join("detail.parquet")).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let names: Vec<String> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "a", "b"],
+            "case fields are top-level columns"
+        );
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn flatten_object_pulls_fields_to_top_level() {
+        let id: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        let addr: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("street", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["s1", "s2"])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("city", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["c1", "c2"])) as ArrayRef,
+            ),
+        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("addr", addr.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![id, addr]).unwrap();
+        let out = prepare_output_batch(&batch, &[flatten_field("addr")], &Format::Jsonl).unwrap();
+        let sch = out.schema();
+        let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "street", "city"]);
+    }
+
+    /// `prefixed` namespaces colliding case fields by case label, so a Parquet superset of
+    /// two cases that both carry `amount` becomes `alpha_amount` / `beta_amount`.
+    #[test]
+    fn flatten_union_prefixed_namespaces_colliding_fields() {
+        let out = prepare_output_batch(
+            &flatten_union_collision_batch(),
+            &[flatten_field_strategy("detail", FlattenStrategy::Prefixed)],
+            &Format::Parquet,
+        )
+        .unwrap();
+        assert_eq!(col_names(&out), vec!["id", "alpha_amount", "beta_amount"]);
+    }
+
+    /// `discriminant` keeps the superset names and appends a `<field>_case` tag column naming
+    /// the active case per row.
+    #[test]
+    fn flatten_union_discriminant_appends_case_tag() {
+        let out = prepare_output_batch(
+            &flatten_union_batch(),
+            &[flatten_field_strategy(
+                "detail",
+                FlattenStrategy::Discriminant,
+            )],
+            &Format::Parquet,
+        )
+        .unwrap();
+        assert_eq!(col_names(&out), vec!["id", "a", "b", "detail_case"]);
+        let tag = out.column_by_name("detail_case").unwrap();
+        let tag = tag.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(tag.value(0), "alpha");
+        assert_eq!(tag.value(1), "beta");
+    }
+
+    /// JSON/JSONL ignore the strategy — per-row keys use raw names regardless of `prefixed`.
+    #[test]
+    fn flatten_union_jsonl_ignores_strategy() {
+        let out = prepare_output_batch(
+            &flatten_union_collision_batch(),
+            &[flatten_field_strategy("detail", FlattenStrategy::Prefixed)],
+            &Format::Jsonl,
+        )
+        .unwrap();
+        // Raw (un-prefixed) names; the two `amount` columns coexist (one fires per row).
+        assert_eq!(col_names(&out), vec!["id", "amount", "amount"]);
+    }
+}
+
+/// VAR-1 PR 1 — DataFusion + writer spike (the decision gate; see `specs/VAR-1-impl.md`).
+///
+/// Proves that an Arrow `DenseUnion` column — the proposed internal representation for a
+/// heterogeneous tagged union — survives the three DataFusion operations the executor
+/// relies on (`union_and_shuffle`, `evaluate_expressions`, `filter_hidden_columns`), and
+/// records which output writers accept it. A green run here means the internal-rep
+/// decision stands (DenseUnion); a failure routes us to the documented fallback
+/// (internal nullable-superset struct). These tests are kept as the regression guard.
+#[cfg(test)]
+mod denseunion_spike {
+    use super::*;
+    use crate::models::{Field, Format, SyntheticDataset};
+    use crate::output::unionize_for_output;
+    use arrow::array::{Float64Array, Int32Array, StringArray, StructArray, UnionArray};
+    use arrow::buffer::ScalarBuffer;
+    use arrow::datatypes::{UnionFields, UnionMode};
+    use std::collections::BTreeMap;
+
+    /// A 6-row batch: an `id` Int32 column + a dense union `u` with three case types
+    /// (Utf8, Float64, Struct{a:Int32}) — two rows each, covering the scalar-mixed and
+    /// object-schema cases at once.
+    fn union_batch() -> RecordBatch {
+        let union_fields: UnionFields = [
+            (0_i8, Arc::new(ArrowField::new("s", DataType::Utf8, false))),
+            (
+                1_i8,
+                Arc::new(ArrowField::new("n", DataType::Float64, false)),
+            ),
+            (
+                2_i8,
+                Arc::new(ArrowField::new(
+                    "o",
+                    DataType::Struct(
+                        vec![Arc::new(ArrowField::new("a", DataType::Int32, false))].into(),
+                    ),
+                    false,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let numbers: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+        let structs: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", DataType::Int32, false)),
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        )]));
+
+        // Dense union: type_ids pick the case per slot; offsets index into that child.
+        let type_ids = ScalarBuffer::<i8>::from(vec![0, 1, 2, 0, 1, 2]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 0, 0, 1, 1, 1]);
+        let union = UnionArray::try_new(
+            union_fields.clone(),
+            type_ids,
+            Some(offsets),
+            vec![strings, numbers, structs],
+        )
+        .expect("build dense union");
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("u", DataType::Union(union_fields, UnionMode::Dense), false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(union),
+            ],
+        )
+        .expect("build batch")
+    }
+
+    fn union_col(batch: &RecordBatch) -> UnionArray {
+        batch
+            .column_by_name("u")
+            .expect("u column present")
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("u is a UnionArray")
+            .clone()
+    }
+
+    /// Per-case (type_id) row-count histogram — the integrity invariant a shuffle must preserve.
+    fn type_id_histogram(u: &UnionArray) -> BTreeMap<i8, usize> {
+        let mut h = BTreeMap::new();
+        for &t in u.type_ids().iter() {
+            *h.entry(t).or_insert(0) += 1;
+        }
+        h
+    }
+
+    #[tokio::test]
+    async fn denseunion_survives_union_and_shuffle() {
+        let batch = union_batch();
+        let before = type_id_histogram(&union_col(&batch));
+        let out = union_and_shuffle(vec![batch], "spike")
+            .await
+            .expect("DataFusion sort must carry a DenseUnion column");
+        assert_eq!(out.num_rows(), 6, "shuffle must preserve row count");
+        let after = type_id_histogram(&union_col(&out));
+        assert_eq!(before, after, "shuffle must preserve per-case row counts");
+    }
+
+    #[tokio::test]
+    async fn denseunion_survives_evaluate_expressions() {
+        let dataset = SyntheticDataset {
+            name: "spike".into(),
+            format: Format::Json,
+            rows: None,
+            output: None,
+            outputs: vec![],
+            locale: None,
+            include: None,
+            import: None,
+            links: vec![],
+            data: vec![Field {
+                name: "id_plus".into(),
+                expression: Some("id + 1".into()),
+                ..Default::default()
+            }],
+            variants: vec![],
+        };
+        let out = evaluate_expressions(union_batch(), &dataset)
+            .await
+            .expect("DataFusion SELECT * must carry a DenseUnion column through a CTE");
+        assert_eq!(out.num_rows(), 6);
+        assert!(
+            out.column_by_name("u").is_some(),
+            "union column survives the CTE"
+        );
+        assert!(
+            out.column_by_name("id_plus").is_some(),
+            "expression column added"
+        );
+    }
+
+    #[test]
+    fn denseunion_survives_filter_hidden_columns() {
+        let fields = vec![
+            Field {
+                name: "id".into(),
+                hidden: true,
+                ..Default::default()
+            },
+            Field {
+                name: "u".into(),
+                hidden: false,
+                ..Default::default()
+            },
+        ];
+        let out = filter_hidden_columns(union_batch(), &fields).expect("project a union column");
+        assert!(out.column_by_name("id").is_none(), "hidden column dropped");
+        assert!(out.column_by_name("u").is_some(), "union column kept");
+        assert_eq!(out.num_rows(), 6);
+    }
+
+    /// PR 4: the union → nullable-superset struct conversion has the right shape —
+    /// one sub-field per case, and **exactly one** sub-field non-null per row (so the
+    /// populated sub-field is an unambiguous case tag).
+    #[test]
+    fn unionize_for_output_is_nullable_superset() {
+        let portable = unionize_for_output(&union_batch()).unwrap();
+        let s = portable
+            .column_by_name("u")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("union column lowered to a struct");
+        assert_eq!(s.num_columns(), 3, "one sub-field per case");
+        assert_eq!(s.len(), 6);
+        for r in 0..s.len() {
+            let non_null = (0..s.num_columns())
+                .filter(|&c| s.column(c).is_valid(r))
+                .count();
+            assert_eq!(non_null, 1, "row {r} must populate exactly one case");
+        }
+    }
+
+    /// PR 4 guard: `write_output` now lowers a union to a portable nullable-superset
+    /// struct before writing, so the struct-capable writers (parquet/json/jsonl) succeed.
+    /// CSV can't represent nested types (a pre-existing limitation that also applies to
+    /// object fields), so it remains unsupported — asserted here so the boundary is
+    /// explicit. (Raw arrow writers still reject a union directly — ARROW-8817 — which is
+    /// exactly why `unionize_for_output` exists.)
+    #[test]
+    fn write_output_handles_union_via_conversion() {
+        let batch = union_batch();
+        let dir = std::env::temp_dir().join(format!("var1_pr4_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut results: Vec<(Format, bool)> = Vec::new();
+        for format in [Format::Parquet, Format::Json, Format::Jsonl, Format::Csv] {
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_output(&batch, "u", &format, &dir, &[]).is_ok()
+            }))
+            .unwrap_or(false);
+            results.push((format, ok));
+        }
+        std::panic::set_hook(prev_hook);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (format, ok) in &results {
+            println!(
+                "write_output {format:?}: {}",
+                if *ok { "ok" } else { "unsupported" }
+            );
+        }
+        for (format, ok) in results {
+            // Struct-capable formats succeed via conversion; CSV (flat) does not.
+            let expected = !matches!(format, Format::Csv);
+            assert_eq!(
+                ok, expected,
+                "write_output {format:?}: support changed — revisit the conversion / CSV note"
+            );
+        }
     }
 }

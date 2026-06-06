@@ -178,10 +178,11 @@ async fn test_overlap_shared_ref_integrity() {
         csv_column(&out, "parent", "id").into_iter().collect();
     let parent_codes: std::collections::HashSet<String> =
         csv_column(&out, "parent", "code").into_iter().collect();
-    let parent_pairs: std::collections::HashSet<(String, String)> = csv_column(&out, "parent", "id")
-        .into_iter()
-        .zip(csv_column(&out, "parent", "code"))
-        .collect();
+    let parent_pairs: std::collections::HashSet<(String, String)> =
+        csv_column(&out, "parent", "id")
+            .into_iter()
+            .zip(csv_column(&out, "parent", "code"))
+            .collect();
 
     for m in ["m1", "m2"] {
         let m_ids = csv_column(&out, m, "parent_id");
@@ -195,8 +196,14 @@ async fn test_overlap_shared_ref_integrity() {
         let id_orphans = m_ids.iter().filter(|v| !parent_ids.contains(*v)).count();
         assert_eq!(id_orphans, 0, "{m}.parent_id has {id_orphans} orphan refs");
 
-        let code_orphans = m_codes.iter().filter(|v| !parent_codes.contains(*v)).count();
-        assert_eq!(code_orphans, 0, "{m}.parent_code has {code_orphans} orphan refs");
+        let code_orphans = m_codes
+            .iter()
+            .filter(|v| !parent_codes.contains(*v))
+            .count();
+        assert_eq!(
+            code_orphans, 0,
+            "{m}.parent_code has {code_orphans} orphan refs"
+        );
 
         // (parent_id, parent_code) pairs must appear together in the parent.
         // This is the multi-ref-per-member integrity check: each member row
@@ -771,6 +778,48 @@ async fn test_variant_incompatible_with_segment_constraint_is_pruned() {
         unexpected.is_empty(),
         "all member.category values must be 'premium' (V1='basic' pruned by segment constraint); unexpected: {unexpected:?}"
     );
+}
+
+/// VAR-SPECIALIZE S3 (case 3): a `ref` + `variants` field with no conflicting sibling — both
+/// cases survive segmentation, drawn from the inherited column.
+#[tokio::test]
+async fn test_ref_variants_both_cases_survive() {
+    let out = run("tests/fixtures/execute/variant_ref_both_cases").await;
+    let categories = csv_column(&out, "member", "category");
+    assert!(!categories.is_empty(), "member should have rows");
+    let bad: Vec<_> = categories
+        .iter()
+        .filter(|v| v.as_str() != "premium" && v.as_str() != "basic")
+        .collect();
+    assert!(bad.is_empty(), "values must be premium/basic; got {bad:?}");
+    assert!(
+        categories.iter().any(|v| v == "premium"),
+        "expected premium rows"
+    );
+    assert!(
+        categories.iter().any(|v| v == "basic"),
+        "expected basic rows"
+    );
+}
+
+/// VAR-SPECIALIZE S3 (case 3) over a `generator` parent: the per-case `value` specialises the
+/// parent's `generator: word` (S1 merge — value beats generator), so member rows are the
+/// pinned values, not random words.
+#[tokio::test]
+async fn test_ref_variants_specialise_generator_parent() {
+    let out = run("tests/fixtures/execute/variant_ref_over_generator").await;
+    let statuses = csv_column(&out, "member", "status");
+    assert!(!statuses.is_empty(), "member should have rows");
+    let bad: Vec<_> = statuses
+        .iter()
+        .filter(|v| v.as_str() != "alpha" && v.as_str() != "beta")
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "member.status must be the pinned values (value specialises the parent generator); got {bad:?}"
+    );
+    assert!(statuses.iter().any(|v| v == "alpha"), "expected alpha rows");
+    assert!(statuses.iter().any(|v| v == "beta"), "expected beta rows");
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,7 +1693,10 @@ async fn test_import_simple_row_count_and_columns() {
     let out = run("tests/fixtures/execute/import_simple").await;
 
     let rows = csv_rows(&out, "stocks");
-    assert_eq!(rows, 20, "stocks should have all 20 tickers from the CSV file");
+    assert_eq!(
+        rows, 20,
+        "stocks should have all 20 tickers from the CSV file"
+    );
 
     // Both imported columns should be present.
     let symbols = csv_column(&out, "stocks", "symbol");
@@ -1747,7 +1799,10 @@ async fn test_import_variants_cover_full_file() {
     let symbols = csv_column(&out, "stocks", "symbol");
     let mut seen = std::collections::HashSet::new();
     for sym in &symbols {
-        assert!(seen.insert(sym.clone()), "symbol '{sym}' appeared more than once");
+        assert!(
+            seen.insert(sym.clone()),
+            "symbol '{sym}' appeared more than once"
+        );
     }
 }
 
@@ -1785,9 +1840,8 @@ async fn test_import_links_pool_not_written_trades_draw_from_it() {
     assert_eq!(trades.len(), 30, "trades should have 30 rows");
 
     let valid_symbols: std::collections::HashSet<&str> = [
-        "AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "META", "NVDA", "JPM",
-        "JNJ", "V", "PG", "UNH", "BAC", "XOM", "HD", "WMT", "INTC",
-        "VZ", "CSCO", "ORCL",
+        "AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "META", "NVDA", "JPM", "JNJ", "V", "PG", "UNH",
+        "BAC", "XOM", "HD", "WMT", "INTC", "VZ", "CSCO", "ORCL",
     ]
     .iter()
     .copied()
@@ -1839,11 +1893,19 @@ async fn test_chained_links_ref_integrity() {
 
     let city_ids: std::collections::HashSet<&str> = cities
         .iter()
-        .map(|r| r["city_id"].as_str().expect("cities.city_id must be string"))
+        .map(|r| {
+            r["city_id"]
+                .as_str()
+                .expect("cities.city_id must be string")
+        })
         .collect();
     let region_ids: std::collections::HashSet<&str> = regions
         .iter()
-        .map(|r| r["region_id"].as_str().expect("regions.region_id must be string"))
+        .map(|r| {
+            r["region_id"]
+                .as_str()
+                .expect("regions.region_id must be string")
+        })
         .collect();
 
     // Inner link: regions.region_cities[].city_id ⊆ cities.city_id
@@ -1879,7 +1941,9 @@ async fn test_chained_links_ref_integrity() {
             items.len()
         );
         for item in items {
-            let rid = item["region_id"].as_str().expect("region_id must be string");
+            let rid = item["region_id"]
+                .as_str()
+                .expect("region_id must be string");
             assert!(
                 region_ids.contains(rid),
                 "country {i}: region_id '{rid}' is not in regions (chain broken at outer link)"
@@ -1937,7 +2001,10 @@ async fn test_variant_lowering_mandatory_member_no_orphan() {
         "mandatory member should have one row per parent row"
     );
     let orphans = sub_ids.iter().filter(|v| !parent_ids.contains(*v)).count();
-    assert_eq!(orphans, 0, "subscribers.parent_id has {orphans} orphan refs");
+    assert_eq!(
+        orphans, 0,
+        "subscribers.parent_id has {orphans} orphan refs"
+    );
 }
 
 /// The union's declared ratios are honoured (loose band — segment Bernoulli rounding
@@ -1954,5 +2021,302 @@ async fn test_variant_lowering_case_distribution() {
     assert!(
         (gold_frac - 0.6).abs() < 0.12,
         "gold fraction {gold_frac:.3} should be near declared 0.6 (gold={gold}, silver={silver})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// VAR-1 — heterogeneous (multi-type / object-schema) variants → DenseUnion,
+// emitted as a portable nullable-superset struct (PR 4, end-to-end).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_multitype_variant_writes_union_as_superset_struct() {
+    let out = run("tests/fixtures/execute/variant_multitype").await;
+    let path = out.join("records.jsonl");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("missing output file: {}", path.display()));
+
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 200, "expected 200 JSONL rows");
+
+    // The scalar union's string case appears (the number case populates payload_1 instead).
+    assert!(
+        content.contains("flagged"),
+        "scalar union string case 'flagged' should appear in output"
+    );
+    // Both object-schema cases reach output as the superset struct's sub-fields.
+    assert!(
+        content.contains("risk_level"),
+        "object case A field 'risk_level' should appear in output"
+    );
+    assert!(
+        content.contains("standard_code"),
+        "object case B field 'standard_code' should appear in output"
+    );
+
+    // Superset semantics: every row carries the union columns as nested objects.
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.contains("\"payload\":") && l.contains("\"form\":")),
+        "each row must carry the union columns as nested (struct) objects"
+    );
+}
+
+/// VAR-UNIFY PR U2: a `flatten` union field pulls the active case's fields up to row level
+/// (no wrapper key), and a `flatten` object field pulls its fields up too. JSON per-row keys
+/// mean each row carries exactly one case's fields.
+#[tokio::test]
+async fn test_flatten_pulls_fields_to_row_level() {
+    let out = run("tests/fixtures/execute/flatten_variant").await;
+    let path = out.join("records.jsonl");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("missing output file: {}", path.display()));
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 200, "expected 200 JSONL rows");
+
+    // The flatten wrappers are elided — no `claim_detail` / `location` keys anywhere.
+    assert!(
+        !content.contains("\"claim_detail\""),
+        "flatten union wrapper `claim_detail` must not appear"
+    );
+    assert!(
+        !content.contains("\"location\""),
+        "flatten object wrapper `location` must not appear"
+    );
+
+    for l in &lines {
+        // The flatten object's fields are always present at row level.
+        assert!(
+            l.contains("\"street\"") && l.contains("\"postcode\""),
+            "every row carries the flattened object's fields: {l}"
+        );
+        // Exactly one union case fires per row (per-row keys): estimate XOR police_reference.
+        let pd = l.contains("\"estimate\"");
+        let theft = l.contains("\"police_reference\"");
+        assert!(pd ^ theft, "exactly one case's fields per row: {l}");
+    }
+
+    // Both cases occur across the dataset.
+    assert!(
+        content.contains("\"estimate\""),
+        "property_damage case should occur"
+    );
+    assert!(
+        content.contains("\"police_reference\""),
+        "theft case should occur"
+    );
+}
+
+/// VAR-UNIFY U5/U6 regression guard: a LINKED dataset carrying a same-type field variant must
+/// generate (one combined batch today via CombineVariantBatches; one batch directly after the
+/// per-row repoint) and feed the list link. Added green on the pre-repoint machinery.
+#[tokio::test]
+async fn test_linked_dataset_with_variant() {
+    let out = run("tests/fixtures/execute/linked_with_variant").await;
+
+    let people = std::fs::read_to_string(out.join("people.jsonl")).expect("people.jsonl written");
+    let plines: Vec<&str> = people.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(plines.len(), 40, "linked dataset row count preserved");
+    for tier in ["gold", "silver", "bronze"] {
+        assert!(
+            people.contains(tier),
+            "tier `{tier}` should appear in the linked dataset"
+        );
+    }
+    // Every row carries exactly one tier value from the set.
+    for l in &plines {
+        let n = ["gold", "silver", "bronze"]
+            .iter()
+            .filter(|t| l.contains(*t))
+            .count();
+        assert_eq!(n, 1, "each linked row has exactly one tier: {l}");
+    }
+
+    // The link assembled and the variant column flowed through to the events output.
+    let events = std::fs::read_to_string(out.join("events.jsonl")).expect("events.jsonl written");
+    assert!(
+        !events.trim().is_empty(),
+        "events output should be non-empty"
+    );
+    assert!(
+        events.contains("attendees"),
+        "events carry the list-link column"
+    );
+}
+
+/// VAR-SPECIALIZE S2: standalone `one_of` is a uniform finite-set generator (string + numeric).
+#[tokio::test]
+async fn test_one_of_standalone_generator() {
+    let out = run("tests/fixtures/execute/one_of_standalone").await;
+    let colours = csv_column(&out, "items", "colour");
+    assert!(!colours.is_empty(), "items should have rows");
+    assert!(
+        colours
+            .iter()
+            .all(|c| ["red", "green", "blue"].contains(&c.as_str())),
+        "colour must be drawn from the one_of set; got unexpected: {:?}",
+        colours
+            .iter()
+            .filter(|c| !["red", "green", "blue"].contains(&c.as_str()))
+            .collect::<Vec<_>>()
+    );
+    for c in ["red", "green", "blue"] {
+        assert!(
+            colours.iter().any(|v| v == c),
+            "expected colour `{c}` to appear"
+        );
+    }
+    let sizes = csv_column(&out, "items", "size");
+    assert!(
+        sizes
+            .iter()
+            .all(|s| ["10", "20", "30", "10.0", "20.0", "30.0"].contains(&s.as_str())),
+        "size must be drawn from the numeric one_of set; got {sizes:?}"
+    );
+}
+
+/// VAR-SPECIALIZE S2 (case 2): `one_of` on a ref field restricts the parent's `generator`
+/// domain (merge: generator + one_of → one_of), so the child column is drawn from the set.
+#[tokio::test]
+async fn test_one_of_specialises_parent_generator() {
+    let out = run("tests/fixtures/execute/one_of_specialises_generator").await;
+    let statuses = csv_column(&out, "child", "status");
+    assert!(!statuses.is_empty(), "child should have rows");
+    assert!(
+        statuses
+            .iter()
+            .all(|s| ["active", "closed", "pending"].contains(&s.as_str())),
+        "child.status must be drawn from the one_of set (not random words); got unexpected: {:?}",
+        statuses
+            .iter()
+            .filter(|s| !["active", "closed", "pending"].contains(&s.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// VAR-SPECIALIZE S4a/S4b: a parent variant (`animals.eats`) ref'd down a 3-level chain
+/// (animals → pets → cats) keeps its carrier — every level generates *valid cases* (not the
+/// pre-S4 garbage) — and the leaf restriction (`cats: one_of [birds, mice]`) is honoured and
+/// renormalised over the surviving cases.
+#[tokio::test]
+async fn test_three_level_variant_carrier_and_restriction() {
+    let out = run("tests/fixtures/execute/three_level_chain").await;
+    let valid = ["birds", "mice", "grass", "fish"];
+
+    for ds in ["animals", "pets", "cats"] {
+        let eats = csv_column(&out, ds, "eats");
+        assert!(!eats.is_empty(), "{ds} should have rows");
+        let bad: Vec<_> = eats
+            .iter()
+            .filter(|e| !valid.contains(&e.as_str()))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{ds}.eats must be valid cases (carrier propagated, no garbage); got {bad:?}"
+        );
+    }
+
+    // cats is restricted to the subset, and both surviving cases appear.
+    let cats = csv_column(&out, "cats", "eats");
+    assert!(
+        cats.iter().all(|e| e == "birds" || e == "mice"),
+        "cats.eats must be restricted to {{birds, mice}}; got unexpected: {:?}",
+        cats.iter()
+            .filter(|e| e.as_str() != "birds" && e.as_str() != "mice")
+            .collect::<Vec<_>>()
+    );
+    // S4b carrier renormalisation: the surviving cases keep their (equal) ratios renormalised
+    // over the subset — birds:mice ≈ 1:1. Guards against the "sum<1 dumps the tail mass on the
+    // last case" bug (which produced ~26/74 while still passing a mere "both appear" check).
+    let birds = cats.iter().filter(|e| e.as_str() == "birds").count();
+    let frac = birds as f64 / cats.len() as f64;
+    assert!(
+        (0.35..=0.65).contains(&frac),
+        "restricted carrier must renormalise ~50/50 over {{birds, mice}}; birds were {:.0}% of {} cats",
+        frac * 100.0,
+        cats.len()
+    );
+}
+
+/// VAR-SPECIALIZE S4c: with `preserve_marginal`, the parent's declared case marginal is
+/// preserved even though `cats` (a quarter of animals) is restricted to birds/mice — the
+/// unrestricted rows compensate.
+#[tokio::test]
+async fn test_pinned_marginal_preserves_parent_distribution() {
+    let out = run("tests/fixtures/execute/pinned_marginal").await;
+    let eats = csv_column(&out, "animals", "eats");
+    assert_eq!(eats.len(), 1000, "animals rows");
+    let mut counts = std::collections::HashMap::new();
+    for e in &eats {
+        *counts.entry(e.clone()).or_insert(0usize) += 1;
+    }
+    for case in ["birds", "mice", "grass", "fish"] {
+        let c = *counts.get(case).unwrap_or(&0);
+        assert!(
+            (200..=300).contains(&c),
+            "pinned marginal: {case} should be ~250 (25% of 1000), got {c}"
+        );
+    }
+    let cats = csv_column(&out, "cats", "eats");
+    assert!(
+        cats.iter().all(|e| e == "birds" || e == "mice"),
+        "cats restricted to birds/mice"
+    );
+}
+
+/// VAR-SPECIALIZE S5: `constrain_cases` tightens one case of a ref'd parent variant (by name)
+/// without dropping any. The child's `high` case is capped at 60, so every child score ≤ 60,
+/// while the parent's `high` case still reaches ~100.
+#[tokio::test]
+async fn test_constrain_cases_tightens_one_case() {
+    let out = run("tests/fixtures/execute/constrain_cases").await;
+    let parse = |xs: Vec<String>| {
+        xs.iter()
+            .filter_map(|v| v.parse::<f64>().ok())
+            .collect::<Vec<_>>()
+    };
+
+    let child = parse(csv_column(&out, "child", "score"));
+    assert!(!child.is_empty(), "child should have rows");
+    assert!(
+        child.iter().all(|&v| v <= 60.0 + 1e-6),
+        "every child score must be ≤ 60 (high case capped); max was {}",
+        child.iter().cloned().fold(f64::MIN, f64::max)
+    );
+
+    let parent = parse(csv_column(&out, "scores", "score"));
+    assert!(
+        parent.iter().any(|&v| v > 60.0),
+        "parent's high case should still exceed 60 (unconstrained)"
+    );
+}
+
+/// Regression: a segment constraint on a restricted parent variant field must not bleed onto a
+/// lower-cover member's *own* non-ref field that coincidentally shares the name. Here both
+/// `accounts` (parent) and `vips` (member) have a `status` field; `vips.account_tier` restricts
+/// the parent's `status` to {gold, silver}, which must leave `vips.status` (open/closed) intact.
+#[tokio::test]
+async fn test_member_own_field_unaffected_by_parent_name_collision() {
+    let out = run("tests/fixtures/execute/member_field_name_collision").await;
+
+    let tier = csv_column(&out, "vips", "account_tier");
+    assert!(
+        tier.iter().all(|v| v == "gold" || v == "silver"),
+        "account_tier (ref to parent status) must be restricted to {{gold, silver}}"
+    );
+
+    let own = csv_column(&out, "vips", "status");
+    assert!(!own.is_empty(), "vips should have rows");
+    assert!(
+        own.iter().all(|v| v == "open" || v == "closed"),
+        "vips' OWN status must be open/closed — the parent's restriction must not leak; got {:?}",
+        own.iter()
+            .filter(|v| v.as_str() != "open" && v.as_str() != "closed")
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        own.iter().any(|v| v == "open") && own.iter().any(|v| v == "closed"),
+        "both own values appear"
     );
 }

@@ -42,7 +42,7 @@ fn main() {
     types.insert("SyntheticDataset".into(), TypeDoc {
         description: "Top-level dataset definition. Every YAML file defines one dataset.".into(),
         fields: Some(vec![
-            f("name",        "string",           true,  "Dataset name; used as the default output filename."),
+            f("name",        "string",           true,  "Dataset name / identifier (used in refs and includes). A dataset is written to disk only if it declares output / output_file — there is NO default output file; a dataset with neither is generated but not emitted (e.g. a pool or intermediate)."),
             f("format",      "Format",           true,  "Output format: parquet, csv, json, or jsonl."),
             f("rows",        "integer?",         false, "Explicit row count. Mutually exclusive with ratio on include."),
             f("locale",      "Locale?",          false, "Default locale for locale-capable generators. Field-level locale takes precedence."),
@@ -52,7 +52,6 @@ fn main() {
             f("import",      "ImportSpec?",      false, "Load rows from a pre-existing external file instead of generating them. Mutually exclusive with rows."),
             f("links",       "Include[]",        false, "Linked datasets for list-link sampling."),
             f("data",        "Field[]",          false, "Field definitions. Evaluated in declaration order for expressions."),
-            f("variants",    "VariantSchema[]",  false, "Virtually splits the dataset into N concrete variants."),
         ]),
         variants: None,
     });
@@ -86,16 +85,30 @@ fn main() {
         variants: None,
     });
 
-    types.insert("RingBounds".into(), TypeDoc {
-        description: "Hash ring bounds for partitioning an imported file. \
+    types.insert(
+        "RingBounds".into(),
+        TypeDoc {
+            description: "Hash ring bounds for partitioning an imported file. \
                       Row i is included iff h(i) ∈ [start, end) where h is a deterministic \
-                      positional hash seeded by --seed.ring.".into(),
-        fields: Some(vec![
-            f("start", "float", true,  "Ring start (inclusive). Must be in [0.0, 1.0) and less than end."),
-            f("end",   "float", true,  "Ring end (exclusive). Must be in (0.0, 1.0] and greater than start."),
-        ]),
-        variants: None,
-    });
+                      positional hash seeded by --seed.ring."
+                .into(),
+            fields: Some(vec![
+                f(
+                    "start",
+                    "float",
+                    true,
+                    "Ring start (inclusive). Must be in [0.0, 1.0) and less than end.",
+                ),
+                f(
+                    "end",
+                    "float",
+                    true,
+                    "Ring end (exclusive). Must be in (0.0, 1.0] and greater than start.",
+                ),
+            ]),
+            variants: None,
+        },
+    );
 
     types.insert("Field".into(), TypeDoc {
         description: "Defines one column in a dataset schema.".into(),
@@ -107,10 +120,15 @@ fn main() {
             f("locale",      "Locale?",          false, "Locale for this field's generator. Overrides dataset-level locale."),
             f("range",       "Range?",           false, "Inclusive numeric bounds for number fields."),
             f("value",       "any?",             false, "Emit this constant for every row. Incompatible with generator, range."),
+            f("one_of",      "any[]?",           false, "Finite-set generator (VAR-SPECIALIZE): draw each row uniformly from this set. On a ref field it restricts the inherited domain. Mutually exclusive with value."),
+            f("preserve_marginal", "boolean",     false, "On a type: variant field: pin the declared case ratios as a global marginal, so restrictions in children are compensated by other rows. Default false (free-by-default). Errors if infeasible."),
+            f("constrain_cases", "CaseDelta[]?",   false, "On a field that refs a parent variant: tighten named cases' value-sources (value/generator/range) without dropping any. Each entry names a parent case (VAR-SPECIALIZE)."),
             f("fields",      "Field[]",          false, "Nested fields for object type."),
             f("content",     "ListContent?",     false, "Element spec for list type."),
             f("variants",    "FieldVariant[]",   false, "Alternatives for type: variant fields."),
             f("parquet",     "ParquetConfig?",   false, "Arrow/Parquet type override."),
+            f("flatten",     "boolean",          false, "Output-only (VAR-UNIFY): elide this field's nesting at write time, pulling its sub-columns up to the parent level. Valid on object and variant fields; requires a name. Object → its fields pull up; variant → the active case's fields pull up (JSON per-row keys; Parquet nullable superset)."),
+            f("flatten_strategy", "FlattenStrategy?", false, "Layout for a flattened variant's case fields in flat columnar output (Parquet/CSV): superset (default), prefixed, or discriminant. Ignored for JSON/JSONL (per-row keys)."),
             f("expression",  "string?",          false, "SQL expression evaluated after all other fields are generated."),
             f("hidden",      "boolean",          false, "Present in internal batch but excluded from output."),
             f("count",       "CountSpec?",       false, "Items per row for list fields."),
@@ -183,18 +201,36 @@ fn main() {
     types.insert(
         "FieldVariant".into(),
         TypeDoc {
-            description: "One alternative within a type: variant field.".into(),
+            description: "One alternative (case) within a type: variant field. Cases that \
+                          span more than one type — or carry different object schemas via \
+                          fields — make the variant a heterogeneous tagged union (VAR-1), \
+                          emitted as a nullable-superset struct (parquet/json/jsonl; not csv)."
+                .into(),
             fields: Some(vec![
-                f("type", "FieldType?", false, "Type for this variant."),
+                f(
+                    "name",
+                    "string?",
+                    false,
+                    "Case label for a heterogeneous union — names the output sub-field. \
+                     Without it, cases are named positionally (<field>_<i>). Ignored for \
+                     same-type variants.",
+                ),
+                f("type", "FieldType?", false, "Type for this case."),
                 f(
                     "generator",
                     "Generator?",
                     false,
-                    "Generator for this variant.",
+                    "Generator for this case (its own; a value: case is the static generator).",
                 ),
-                f("locale", "Locale?", false, "Locale for this variant."),
-                f("range", "Range?", false, "Numeric range for this variant."),
-                f("value", "any?", false, "Constant value for this variant."),
+                f("locale", "Locale?", false, "Locale for this case."),
+                f("range", "Range?", false, "Numeric range for this case."),
+                f("value", "any?", false, "Constant value for this case."),
+                f(
+                    "fields",
+                    "Field[]",
+                    false,
+                    "Nested fields for an object case of a heterogeneous union.",
+                ),
                 f(
                     "parquet",
                     "ParquetConfig?",
@@ -211,16 +247,6 @@ fn main() {
             variants: None,
         },
     );
-
-    types.insert("VariantSchema".into(), TypeDoc {
-        description: "One concrete variant of a dataset (used in variants:).".into(),
-        fields: Some(vec![
-            f("data",   "Field[]",  false, "Fields that override or extend base data. Same-named base fields replaced; new names appended."),
-            f("locale", "Locale?",  false, "Locale override for this variant's fields."),
-            f("ratio",  "float?",   false, "Fraction of parent rows allocated to this variant. Unset variants share the remainder equally."),
-        ]),
-        variants: None,
-    });
 
     types.insert(
         "CountSpec".into(),
@@ -290,7 +316,7 @@ fn main() {
             ev("list",      "Array of items. Requires content: to define the element spec."),
             ev("date",      "Calendar date (Arrow Date32)."),
             ev("date_time", "Timestamp with microsecond precision (Arrow TimestampMicrosecond)."),
-            ev("variant",   "Multi-alternative field. Expanded into global dataset variants before execution. Requires variants: list."),
+            ev("variant",   "Tagged union: exactly one of N cases per row. Requires variants: list. Heterogeneous (multi-type / multi-object-schema) cases lower to an Arrow union, emitted as a nullable-superset struct (VAR-1). A variant field on a ref'd field specialises the inherited column per case (VAR-SPECIALIZE)."),
         ]),
     });
 
@@ -304,6 +330,19 @@ fn main() {
                 ev("csv", "Comma-separated values."),
                 ev("json", "JSON array of objects."),
                 ev("jsonl", "Newline-delimited JSON (one object per line)."),
+            ]),
+        },
+    );
+
+    types.insert(
+        "FlattenStrategy".into(),
+        TypeDoc {
+            description: "Layout for a flattened variant's case fields in flat columnar output (Parquet/CSV). Ignored for JSON/JSONL.".into(),
+            fields: None,
+            variants: Some(vec![
+                ev("superset", "Case fields side by side as a nullable superset; the populated set is the case tag. Cross-case name collisions are rejected (use prefixed)."),
+                ev("prefixed", "Prefix each pulled-up field by its case name (<case>_<field>), avoiding cross-case collisions."),
+                ev("discriminant", "Superset layout plus a materialised <field>_case string column naming the active case per row."),
             ]),
         },
     );

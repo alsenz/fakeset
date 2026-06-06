@@ -1,0 +1,10 @@
+name: value_below_range
+format: parquet
+rows: 10
+data:
+  # A constant numeric `value` outside the declared range is a genuine error.
+  - name: score
+    type: number
+    value: 42.0
+    range:
+      max: 10.0

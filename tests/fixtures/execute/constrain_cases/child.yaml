@@ -1,0 +1,11 @@
+name: child
+format: csv
+output_file: child
+include: { file: scores.yaml, ref: s, ratio: 0.5 }
+data:
+  - { name: id, ref: s.id }
+  # Tighten only the `high` case (50..100 → 50..60); `low` untouched, no case dropped.
+  - name: score
+    ref: s.score
+    constrain_cases:
+      - { name: high, range: { max: 60 } }

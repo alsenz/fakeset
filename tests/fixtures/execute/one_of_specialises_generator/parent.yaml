@@ -1,0 +1,6 @@
+name: parent
+format: csv
+rows: 300
+data:
+  - { name: id, type: string, generator: uuid }
+  - { name: status, type: string, generator: word }

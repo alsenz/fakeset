@@ -257,7 +257,7 @@ The original (idealized) checklist follows for reference:
   `specs/done/`; `CLAUDE.md` feature-spec table flipped and re-pathed.
 - `mod var_expand_prototype` (`lib/segment.rs`) retained as a permanent
   planner-math regression guard.
-- `specs/VAR-SPECIALIZE.md` re-pointed: its substrate (lowering + the reserved
+- `specs/done/VAR-SPECIALIZE.md` re-pointed: its substrate (lowering + the reserved
   discriminant) now exists; status notes VAR-EXPAND is complete.
 - `specs/VAR-LINKED-CONTENT.md` remains the open future stub (its validation gate
   lives in `validate.rs`).

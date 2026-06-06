@@ -12,6 +12,8 @@ fn constraints(
         min,
         max,
         value,
+        one_of: None,
+        case_overrides: vec![],
     }
 }
 
@@ -40,9 +42,11 @@ fn test_not_satisfiable_inverted_range() {
 }
 
 #[test]
-fn test_not_satisfiable_value_with_min() {
+fn test_satisfiable_numeric_value_within_min() {
+    // VAR-SPECIALIZE: a numeric `value` within bounds is satisfiable (value is the tightest
+    // source; bounds are a containment check, not a conflict).
     assert!(
-        !constraints(
+        constraints(
             None,
             Some(0.0),
             None,
@@ -53,9 +57,23 @@ fn test_not_satisfiable_value_with_min() {
 }
 
 #[test]
-fn test_not_satisfiable_value_with_generator() {
+fn test_not_satisfiable_numeric_value_below_min() {
     assert!(
         !constraints(
+            None,
+            Some(100.0),
+            None,
+            Some(serde_yaml::Value::Number(42.into()))
+        )
+        .satisfiable()
+    );
+}
+
+#[test]
+fn test_satisfiable_value_with_generator() {
+    // VAR-SPECIALIZE: `value` supersedes the generator — no longer a conflict.
+    assert!(
+        constraints(
             Some(Generator::FirstName),
             None,
             None,

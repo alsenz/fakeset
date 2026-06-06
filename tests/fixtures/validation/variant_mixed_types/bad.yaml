@@ -1,0 +1,13 @@
+name: bad
+format: csv
+output_file: bad
+rows: 10
+data:
+  - name: payload
+    type: variant
+    variants:
+      - value: "hello"
+        distribution: 0.5
+      - type: number
+        range: {min: 1, max: 10}
+        distribution: 0.5

@@ -1,0 +1,10 @@
+name: orders
+format: csv
+rows: 100
+data:
+  - { name: id, type: string, generator: uuid }
+# Retired (VAR-UNIFY U4): top-level dataset `variants:` is no longer accepted — use a
+# `type: variant` field instead.
+variants:
+  - { distribution: 0.6, data: [ { name: status, type: string, value: pending } ] }
+  - { distribution: 0.4, data: [ { name: status, type: string, value: shipped } ] }

@@ -1,0 +1,16 @@
+name: vips
+format: csv
+output_file: vips
+include: { file: accounts.yaml, ref: a, ratio: 0.5 }
+data:
+  - { name: id, ref: a.id }
+  # Restrict the inherited parent `status` to a subset (seg constraint keyed by parent name "status").
+  - name: account_tier
+    ref: a.status
+    one_of: [gold, silver]
+  # vips' OWN field, coincidentally also named `status` — must NOT inherit the parent restriction.
+  - name: status
+    type: variant
+    variants:
+      - { value: open,   ratio: 0.6 }
+      - { value: closed, ratio: 0.4 }

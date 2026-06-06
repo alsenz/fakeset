@@ -1,0 +1,25 @@
+name: flatten_prefixed_parquet
+format: parquet
+output_file: flatten_prefixed_parquet
+rows: 10
+data:
+  # Cross-case `amount` collision is fine under `prefixed` (→ property_damage_amount, etc.).
+  - name: detail
+    type: variant
+    flatten: true
+    flatten_strategy: prefixed
+    variants:
+      - name: property_damage
+        type: object
+        ratio: 0.5
+        fields:
+          - name: amount
+            type: number
+            range: { min: 1, max: 10 }
+      - name: theft
+        type: object
+        ratio: 0.5
+        fields:
+          - name: amount
+            type: number
+            range: { min: 1, max: 10 }

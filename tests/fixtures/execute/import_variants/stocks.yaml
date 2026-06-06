@@ -1,16 +1,12 @@
 name: stocks
 format: csv
+output_file: stocks
 import:
   file: tickers.csv
   ref: tickers
-variants:
-  - ratio: 0.5
-    data:
-      - name: tier
-        type: string
-        value: "A"
-  - ratio: 0.5
-    data:
-      - name: tier
-        type: string
-        value: "B"
+data:
+  - name: tier
+    type: variant
+    variants:
+      - { value: "A", ratio: 0.5 }
+      - { value: "B", ratio: 0.5 }

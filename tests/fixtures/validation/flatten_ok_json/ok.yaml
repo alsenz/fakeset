@@ -1,0 +1,38 @@
+name: flatten_ok_json
+format: jsonl
+output_file: flatten_ok_json
+rows: 10
+data:
+  - name: claim_id
+    type: string
+    generator: uuid
+  # Cross-case `amount` collision is harmless for JSON (per-row keys, one case fires).
+  - name: claim_detail
+    type: variant
+    flatten: true
+    variants:
+      - name: property_damage
+        type: object
+        ratio: 0.5
+        fields:
+          - name: amount
+            type: number
+            range: { min: 1, max: 10 }
+      - name: theft
+        type: object
+        ratio: 0.5
+        fields:
+          - name: amount
+            type: number
+            range: { min: 1, max: 10 }
+  # A flatten object with no sibling collision.
+  - name: address
+    type: object
+    flatten: true
+    fields:
+      - name: street
+        type: string
+        generator: street_name
+      - name: postcode
+        type: string
+        generator: zip_code

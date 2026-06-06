@@ -1,5 +1,6 @@
 name: contracts
 format: parquet
+output_file: contracts
 include:
   file: customers.yaml
   ref: customer
@@ -34,6 +35,10 @@ data:
     generator: date
   - name: status
     type: variant
+    # Pin this case mix globally: claims only attach to active/lapsed contracts (see
+    # claims.yaml), but preserve_marginal makes the non-claim contracts compensate so the
+    # overall status distribution still holds at 70/20/10 (VAR-SPECIALIZE S4c).
+    preserve_marginal: true
     variants:
       - value: "active"
         ratio: 0.7

@@ -5,10 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::constraints::validate_field_constraints;
+use crate::expand_variants::is_heterogeneous;
 use crate::expressions::extract_identifiers;
 use crate::models::{
-    Corruptions, CountSpec, DataQuality, Field, FieldType, FieldVariant, Generator, Include,
-    Locale, Reducer, RefBinding, Schema, SyntheticDataset, resolve_include, split_ref,
+    Corruptions, CountSpec, DataQuality, Field, FieldType, FieldVariant, FlattenStrategy, Format,
+    Generator, Include, Locale, Reducer, RefBinding, Schema, SyntheticDataset,
+    discriminant_tag_column, resolve_include, split_ref,
 };
 
 /// Validate all loaded datasets, returning any non-fatal warnings.
@@ -28,34 +30,32 @@ fn validate_dataset(
     all: &HashMap<PathBuf, SyntheticDataset>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
-    // Rule 0: variant distribution consistency.
+    // Rule 0 (VAR-UNIFY U4): top-level dataset `variants:` is retired as user input —
+    // whole-row variation is expressed as a `type: variant` field in `data:`. Validation runs
+    // *before* `expand_field_variants`, so a non-empty `dataset.variants` here can only have
+    // come from YAML, which reliably catches the retired key.
     if !dataset.variants.is_empty() {
-        let fixed_sum: f64 = dataset.variants.iter().filter_map(|v| v.ratio).sum();
-        let n_free = dataset
-            .variants
-            .iter()
-            .filter(|v| v.ratio.is_none())
-            .count();
-        if fixed_sum > 1.0 + 1e-9 {
-            bail!(
-                "dataset '{}': variant distributions sum to {:.4} which exceeds 1.0",
-                dataset.name,
-                fixed_sum
-            );
-        }
-        if n_free == 0 && (fixed_sum - 1.0).abs() > 1e-9 {
-            bail!(
-                "dataset '{}': all variant distributions are explicit but sum to {:.4}, not 1.0",
-                dataset.name,
-                fixed_sum
-            );
-        }
-        if dataset.variants.len() == 1 {
-            warnings.push(format!(
-                "warning: dataset '{}' has only one variant — this is equivalent to plain `data`",
-                dataset.name
-            ));
-        }
+        bail!(
+            "dataset '{}': top-level `variants:` is no longer supported — express whole-row \
+             variation as a `type: variant` field in `data:` instead (VAR-UNIFY). See the \
+             YAML schema reference.",
+            dataset.name
+        );
+    }
+
+    // Rule 0b (VAR-1): a heterogeneous variant lowers to a nested union column (emitted
+    // as a nullable-superset struct). CSV is flat and cannot represent nested types — the
+    // same limitation object fields have — so reject it here with a clear error rather
+    // than failing at write time. Struct-capable formats (parquet/json/jsonl) are fine.
+    if matches!(dataset.format, Format::Csv)
+        && let Some(field_path) = first_heterogeneous_variant(&dataset.data, "")
+    {
+        bail!(
+            "dataset '{}': field '{field_path}' is a heterogeneous (multi-type) variant, \
+             which becomes a nested union column that CSV cannot represent. Use `format: \
+             parquet`, `json`, or `jsonl` for this dataset. See specs/VAR-1.md.",
+            dataset.name
+        );
     }
 
     // Rule 1a: explicit rows is incompatible with ratio includes.
@@ -262,6 +262,9 @@ fn validate_dataset(
             )?;
         }
     }
+
+    // Rule 3b (VAR-UNIFY): `flatten` placement + output name-collision checks.
+    validate_flatten(&dataset.data, &dataset.format, "", warnings)?;
 
     // Rule 4: every field ref points to a real include and a real field.
     validate_dataset_refs(path, dataset, all)?;
@@ -582,6 +585,221 @@ fn validate_locale_generator(
     Ok(())
 }
 
+/// Dotted path of the first heterogeneous-variant field (recursing into objects), if any.
+/// Used to gate CSV output, which cannot represent the resulting nested union column.
+fn first_heterogeneous_variant(fields: &[Field], prefix: &str) -> Option<String> {
+    for f in fields {
+        let path = if prefix.is_empty() {
+            f.name.clone()
+        } else {
+            format!("{prefix}.{}", f.name)
+        };
+        match f.field_type {
+            Some(FieldType::Variant) if is_heterogeneous(&f.variants) => return Some(path),
+            Some(FieldType::Object) => {
+                if let Some(p) = first_heterogeneous_variant(&f.fields, &path) {
+                    return Some(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// VAR-UNIFY: validate `flatten` field placement and output name-collisions.
+///
+/// `flatten` elides a field's nesting at write time, pulling its sub-columns up to the
+/// parent level (one level; on a variant, distributed to object cases). The pulled-up names
+/// must therefore not collide with sibling fields (any format), nor — for the Parquet/CSV
+/// nullable-superset — with each other across union cases. JSON/JSONL emit per-row keys
+/// (only the active case fires), so cross-case collisions are harmless there. Runs before
+/// `expand_field_variants`, so a variant is still `FieldType::Variant` with `variants:` here.
+fn validate_flatten(
+    fields: &[Field],
+    format: &Format,
+    prefix: &str,
+    _warnings: &mut Vec<String>,
+) -> Result<()> {
+    let superset = !matches!(format, Format::Json | Format::Jsonl);
+    for field in fields {
+        let path = if prefix.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+
+        // `flatten_strategy` is only meaningful on a flatten variant field.
+        if field.flatten_strategy.is_some()
+            && !(field.flatten && matches!(field.field_type, Some(FieldType::Variant)))
+        {
+            bail!("field '{path}': `flatten_strategy` is only valid on a `flatten` variant field");
+        }
+
+        if field.flatten {
+            // Placement: only object/variant carry a nesting to elide.
+            match field.field_type {
+                Some(FieldType::Object) | Some(FieldType::Variant) => {}
+                _ => {
+                    bail!("field '{path}': `flatten` is only valid on `object` or `variant` fields")
+                }
+            }
+            // Name: flatten changes output shape only, never identity — refs resolve against
+            // the named, nested model before output, so the field must stay addressable.
+            if field.name.is_empty() {
+                bail!("field '{path}': a `flatten` field must have a `name`");
+            }
+            // Scope (VAR-UNIFY U2): only top-level flatten is implemented at write time.
+            // A nested flatten (inside an object) would need to pull up into the containing
+            // struct — gated here so it errors rather than silently emitting nested.
+            if !prefix.is_empty() {
+                bail!(
+                    "field '{path}': `flatten` is only supported on a top-level field for now \
+                     (nested flatten not yet implemented)"
+                );
+            }
+
+            // Effective strategy: JSON/JSONL ignore it (per-row keys, raw names); flat
+            // columnar formats apply the declared strategy (default superset).
+            let strategy = if superset {
+                field.flatten_strategy.unwrap_or_default()
+            } else {
+                FlattenStrategy::Superset
+            };
+
+            let sibling_names: HashSet<&str> = fields
+                .iter()
+                .filter(|f| !std::ptr::eq(*f, field))
+                .map(|f| f.name.as_str())
+                .collect();
+            let groups = flatten_pullup_groups(field, strategy);
+
+            // Sibling collision (any format), on the effective (possibly prefixed) names.
+            for name in groups.iter().flatten() {
+                if sibling_names.contains(name.as_str()) {
+                    bail!(
+                        "field '{path}': flattening pulls up `{name}`, which collides with a \
+                         sibling field of the same name — rename one of them."
+                    );
+                }
+            }
+
+            // Cross-case collision (flat columnar formats only). `prefixed` namespaces the
+            // pulled-up names by case, so it naturally avoids this; `superset`/`discriminant`
+            // share the column, so a shared name is a real collision.
+            if superset && groups.len() > 1 {
+                let mut seen: HashSet<&str> = HashSet::new();
+                for name in groups.iter().flatten() {
+                    if !seen.insert(name.as_str()) {
+                        bail!(
+                            "field '{path}': flatten pulls up `{name}` from more than one variant \
+                             case into a `{format}` superset, which collides. Use \
+                             `flatten_strategy: prefixed`, `format: json`/`jsonl`, or rename the \
+                             colliding case fields."
+                        );
+                    }
+                }
+            }
+
+            // The discriminant tag column must not collide either.
+            if superset && strategy == FlattenStrategy::Discriminant {
+                let tag = discriminant_tag_column(&field.name);
+                if sibling_names.contains(tag.as_str())
+                    || groups.iter().flatten().any(|n| n == &tag)
+                {
+                    bail!(
+                        "field '{path}': the `discriminant` tag column `{tag}` collides with an \
+                         existing field — rename the colliding field."
+                    );
+                }
+            }
+        }
+
+        if matches!(field.field_type, Some(FieldType::Object)) {
+            validate_flatten(&field.fields, format, &path, _warnings)?;
+        }
+    }
+    Ok(())
+}
+
+/// The names a `flatten` field pulls up to the parent under `strategy`, grouped by source:
+/// an object field yields one group (its sub-field names); a variant yields one group per
+/// case (an object case → its field names, prefixed by the case label under `Prefixed`; a
+/// scalar case → its single case label).
+fn flatten_pullup_groups(field: &Field, strategy: FlattenStrategy) -> Vec<Vec<String>> {
+    match field.field_type {
+        Some(FieldType::Object) => vec![field.fields.iter().map(|f| f.name.clone()).collect()],
+        Some(FieldType::Variant) => field
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(i, case)| {
+                let label = case
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{i}", field.name));
+                if case.fields.is_empty() {
+                    vec![label]
+                } else if strategy == FlattenStrategy::Prefixed {
+                    case.fields
+                        .iter()
+                        .map(|f| format!("{label}_{}", f.name))
+                        .collect()
+                } else {
+                    case.fields.iter().map(|f| f.name.clone()).collect()
+                }
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// VAR-SPECIALIZE case 3: validate the `variants:` on a `ref` field — a value-distribution
+/// specialising the inherited (scalar) field per case. Cases must be value-source-only
+/// (no object/structural keys); the distribution obeys the usual sum rules.
+fn validate_case3_variants(
+    path: &str,
+    variants: &[FieldVariant],
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    for (i, c) in variants.iter().enumerate() {
+        let cp = format!("{path}.variants[{i}]");
+        if !c.fields.is_empty() || matches!(c.field_type, Some(FieldType::Object)) {
+            bail!(
+                "field '{cp}': a `ref` + `variants` (per-case specialisation) case cannot be an \
+                 object case — it specialises a scalar inherited field; use `value` / \
+                 `generator` / `range` only"
+            );
+        }
+        let has_range = c
+            .range
+            .as_ref()
+            .is_some_and(|r| r.min.is_some() || r.max.is_some());
+        if c.value.is_none() && c.generator.is_none() && !has_range {
+            bail!(
+                "field '{cp}': a `ref` + `variants` case must specialise something \
+                 (`value`, `generator`, or `range`)"
+            );
+        }
+    }
+    let fixed_sum: f64 = variants.iter().filter_map(|v| v.ratio).sum();
+    let n_free = variants.iter().filter(|v| v.ratio.is_none()).count();
+    if fixed_sum > 1.0 + 1e-9 {
+        bail!("field '{path}': variant distributions sum to {fixed_sum:.4} which exceeds 1.0");
+    }
+    if n_free == 0 && (fixed_sum - 1.0).abs() > 1e-9 {
+        bail!(
+            "field '{path}': all variant distributions are explicit but sum to {fixed_sum:.4}, not 1.0"
+        );
+    }
+    if variants.len() == 1 {
+        warnings.push(format!(
+            "warning: field '{path}' has only one variant case — this is equivalent to a plain ref specialisation"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Result<()> {
     // Tainted fields come from an imported Arrow schema, not from YAML.
     // Their type is already resolved by load_import_headers; YAML structural rules don't apply.
@@ -635,6 +853,43 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
 
     // Constraint internal-consistency checks — apply regardless of whether `ref` is set.
     validate_field_constraints(path, field)?;
+
+    // `one_of` (VAR-SPECIALIZE): non-empty, and mutually exclusive with a single `value`.
+    if let Some(set) = &field.one_of {
+        if set.is_empty() {
+            bail!("field '{path}': `one_of` must be non-empty");
+        }
+        if field.value.is_some() {
+            bail!(
+                "field '{path}': `value` and `one_of` cannot both be set — use `value` for a \
+                 single constant, `one_of` for a finite set"
+            );
+        }
+    }
+
+    // `preserve_marginal` (VAR-SPECIALIZE S4c) pins a variant's global case marginal — only
+    // meaningful on a `type: variant` field.
+    if field.preserve_marginal && !matches!(field.field_type, Some(FieldType::Variant)) {
+        bail!("field '{path}': `preserve_marginal` is only valid on a `type: variant` field");
+    }
+
+    // `constrain_cases` (VAR-SPECIALIZE S5) specialises named cases of a ref'd parent variant.
+    if !field.constrain_cases.is_empty() {
+        if field.simple_ref().is_none() {
+            bail!(
+                "field '{path}': `constrain_cases` is only valid on a field that `ref`s a parent \
+                 variant (it specialises that variant's cases by name)"
+            );
+        }
+        for (i, d) in field.constrain_cases.iter().enumerate() {
+            if d.name.is_empty() {
+                bail!(
+                    "field '{path}': `constrain_cases[{i}]` must name the parent case it specialises"
+                );
+            }
+        }
+    }
+
     let range_min = field.range.as_ref().and_then(|r| r.min);
     let range_max = field.range.as_ref().and_then(|r| r.max);
 
@@ -643,6 +898,12 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
 
     // Type-dependent checks require a known type — deferred to the rewrite step for ref fields.
     if field.simple_ref().is_some() {
+        // Case 3 (VAR-SPECIALIZE): a `ref` field may carry `variants:` — a value-distribution
+        // that specialises the inherited field per case (each case lowers to a ref-bound,
+        // value-pinned case-member entering segmentation). Validate the cases here.
+        if !field.variants.is_empty() {
+            validate_case3_variants(path, &field.variants, warnings)?;
+        }
         return Ok(());
     }
 
@@ -661,6 +922,10 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
         for (i, choice) in field.variants.iter().enumerate() {
             validate_field_variant(&format!("{path}.variants[{i}]"), choice, warnings)?;
         }
+        // Heterogeneous (multi-type / multi-object) variants are supported (VAR-1): they
+        // lower to an Arrow union, emitted as a nullable-superset struct. The only output
+        // constraint is CSV (a flat format that can't hold the nested struct) — checked
+        // per-dataset in `validate_dataset`, where the output format is known.
         let fixed_sum: f64 = field.variants.iter().filter_map(|v| v.ratio).sum();
         let n_free = field.variants.iter().filter(|v| v.ratio.is_none()).count();
         if fixed_sum > 1.0 + 1e-9 {
@@ -758,13 +1023,36 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
             FieldType::Boolean => (default_val.is_bool(), "a boolean"),
             FieldType::List => (default_val.is_sequence(), "a sequence (e.g. `default: []`)"),
             FieldType::Object => (default_val.is_mapping(), "a mapping"),
-            FieldType::Variant => (true, ""),
+            // Variant/Union are pre-expansion or internal types; not reached here (validation
+            // runs before expand_field_variants). Accept to keep the match exhaustive.
+            FieldType::Variant | FieldType::Union => (true, ""),
         };
         if !compatible {
             bail!(
                 "field '{path}': `default` value is incompatible with `type: {field_type}` — \
                  expected {expected}"
             );
+        }
+    }
+
+    // `one_of` entries must be type-compatible with the declared field type (VAR-SPECIALIZE).
+    if let Some(set) = &field.one_of {
+        for v in set {
+            let (compatible, expected) = match field_type {
+                FieldType::Number => (v.is_number(), "numbers"),
+                FieldType::String | FieldType::Date | FieldType::DateTime => {
+                    (v.is_string(), "strings")
+                }
+                FieldType::Boolean => (v.is_bool(), "booleans"),
+                FieldType::List | FieldType::Object | FieldType::Variant | FieldType::Union => {
+                    (true, "")
+                }
+            };
+            if !compatible {
+                bail!(
+                    "field '{path}': `one_of` entries must be {expected} for `type: {field_type}`"
+                );
+            }
         }
     }
 
@@ -1383,58 +1671,6 @@ fn taint_closure(dataset: &SyntheticDataset) -> HashSet<String> {
     tainted
 }
 
-/// Build a minimal `SyntheticDataset` for use in tests.
-#[cfg(test)]
-fn test_dataset(name: &str, rows: Option<usize>, data: Vec<Field>) -> SyntheticDataset {
-    use crate::models::{Format, ImportSpec};
-    SyntheticDataset {
-        name: name.into(),
-        format: Format::Csv,
-        rows,
-        output: None,
-        outputs: vec![],
-        locale: None,
-        include: None,
-        import: None,
-        links: vec![],
-        data,
-        variants: vec![],
-    }
-}
-
-#[cfg(test)]
-fn test_imported_dataset(name: &str, total_rows: usize, imported_cols: &[&str]) -> SyntheticDataset {
-    use crate::models::{Format, ImportSpec};
-    let mut ds = SyntheticDataset {
-        name: name.into(),
-        format: Format::Csv,
-        rows: None,
-        output: None,
-        outputs: vec![],
-        locale: None,
-        include: None,
-        import: Some(ImportSpec {
-            file: format!("{name}.csv"),
-            reference: name.into(),
-            fields: vec![],
-            exclude: None,
-            ring: None,
-            total_rows,
-        }),
-        links: vec![],
-        data: vec![],
-        variants: vec![],
-    };
-    for col in imported_cols {
-        ds.data.push(Field {
-            name: col.to_string(),
-            imported_taint: true,
-            ..Default::default()
-        });
-    }
-    ds
-}
-
 /// Validate that a child-by-inclusion does not ref or specialise any tainted field.
 fn check_child_against_taint(
     child: &SyntheticDataset,
@@ -1490,7 +1726,6 @@ fn check_child_against_taint(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod import_taint_tests {
@@ -1563,6 +1798,7 @@ mod import_taint_tests {
     /// Build a (parent, child) dataset map. The child's include file resolves to the
     /// parent by path equality — no disk access needed when calling `check_import_taint`
     /// directly (bypassing `validate_dataset_refs` which requires real files).
+    #[allow(dead_code)]
     fn parent_child_map(
         parent_data: Vec<Field>,
         child_include_fields: Vec<String>,
@@ -1594,7 +1830,10 @@ mod import_taint_tests {
         let mut datasets = HashMap::new();
         datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
         let err = validate(&datasets).unwrap_err().to_string();
-        assert!(err.contains("`rows` cannot be set when `import` is present"), "{err}");
+        assert!(
+            err.contains("`rows` cannot be set when `import` is present"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1612,7 +1851,9 @@ mod import_taint_tests {
         datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
         let warnings = validate(&datasets).unwrap();
         assert!(
-            !warnings.iter().any(|w| w.contains("defaulting to 100 rows")),
+            !warnings
+                .iter()
+                .any(|w| w.contains("defaulting to 100 rows")),
             "spurious row-count warning: {warnings:?}"
         );
     }
@@ -1622,8 +1863,10 @@ mod import_taint_tests {
     #[test]
     fn ring_start_ge_end_errors() {
         let mut ds = imported_ds("tickers", &[("symbol", true)]);
-        ds.import.as_mut().unwrap().ring =
-            Some(crate::models::RingBounds { start: 0.6, end: 0.3 });
+        ds.import.as_mut().unwrap().ring = Some(crate::models::RingBounds {
+            start: 0.6,
+            end: 0.3,
+        });
         let mut datasets = HashMap::new();
         datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
         let err = validate(&datasets).unwrap_err().to_string();
@@ -1633,8 +1876,10 @@ mod import_taint_tests {
     #[test]
     fn ring_out_of_range_errors() {
         let mut ds = imported_ds("tickers", &[("symbol", true)]);
-        ds.import.as_mut().unwrap().ring =
-            Some(crate::models::RingBounds { start: 0.0, end: 1.5 });
+        ds.import.as_mut().unwrap().ring = Some(crate::models::RingBounds {
+            start: 0.0,
+            end: 1.5,
+        });
         let mut datasets = HashMap::new();
         datasets.insert(PathBuf::from("/s/tickers.yaml"), ds);
         let err = validate(&datasets).unwrap_err().to_string();
@@ -1660,7 +1905,10 @@ mod import_taint_tests {
             ..Default::default()
         });
         let t = taint_closure(&ds);
-        assert!(t.contains("display"), "expression derived from imported field must be tainted");
+        assert!(
+            t.contains("display"),
+            "expression derived from imported field must be tainted"
+        );
     }
 
     #[test]
@@ -1672,7 +1920,10 @@ mod import_taint_tests {
             ..Default::default()
         });
         let t = taint_closure(&ds);
-        assert!(!t.contains("suffix"), "expression with no imported deps should not be tainted");
+        assert!(
+            !t.contains("suffix"),
+            "expression with no imported deps should not be tainted"
+        );
     }
 
     // ── check_child_against_taint (called directly to avoid disk-path resolution) ──
@@ -1697,7 +1948,10 @@ mod import_taint_tests {
         let (child, inc) = child_with_include(
             "par",
             vec![],
-            vec![Field { name: "symbol".into(), ..Default::default() }],
+            vec![Field {
+                name: "symbol".into(),
+                ..Default::default()
+            }],
         );
         let err = check_child_against_taint(&child, &inc, &taint(&["symbol"]))
             .unwrap_err()
@@ -1739,8 +1993,7 @@ mod import_taint_tests {
 
     #[test]
     fn child_include_fields_listing_imported_column_errors() {
-        let (child, inc) =
-            child_with_include("par", vec!["symbol".into()], vec![]);
+        let (child, inc) = child_with_include("par", vec!["symbol".into()], vec![]);
         let err = check_child_against_taint(&child, &inc, &taint(&["symbol"]))
             .unwrap_err()
             .to_string();

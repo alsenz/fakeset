@@ -1,0 +1,14 @@
+name: animals
+format: csv
+output_file: animals
+rows: 1000
+data:
+  - { name: id, type: string, generator: uuid }
+  - name: eats
+    type: variant
+    preserve_marginal: true
+    variants:
+      - { value: birds, ratio: 0.25 }
+      - { value: mice,  ratio: 0.25 }
+      - { value: grass, ratio: 0.25 }
+      - { value: fish,  ratio: 0.25 }

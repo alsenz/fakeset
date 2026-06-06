@@ -84,6 +84,45 @@ after the declared ratios are summed, so you don't need to specify it explicitly
 `policies` uses the same mechanism for `policy_type`, giving the five product types
 (home, auto, life, health, travel) equal or near-equal weighting.
 
+### Heterogeneous variants (per-case schemas)
+
+When a variant's cases carry **different shapes**, it becomes a *heterogeneous* tagged
+union (VAR-1). `claims` uses one for `claim_detail`: each claim type has its own detail
+schema, and the claim type is recoverable from whichever case is populated — so there's
+no separate `claim_type` column.
+
+```yaml title="claims.yaml"
+- name: claim_detail
+  type: variant
+  variants:
+    - name: property_damage      # case label → output sub-field name
+      type: object
+      ratio: 0.3
+      fields:
+        - name: property_address
+          type: string
+          generator: street_name
+        - name: postcode
+          type: string
+          generator: zip_code
+    - name: theft
+      type: object
+      ratio: 0.2
+      fields:
+        - name: stolen_item
+          type: string
+          generator: word
+        - name: police_reference
+          type: string
+          generator: uuid
+    # … liability, medical, accident
+```
+
+Internally this generates as an Arrow `DenseUnion`; on write it becomes a
+nullable-superset struct — `claim_detail` is a struct with one sub-field per case, and
+exactly one is populated per row. Supported for Parquet/JSON/JSONL (CSV can't hold the
+nested struct). See [Variants as Tagged Unions](/concepts/variant-lowering/#heterogeneous-unions-multi-type-cases).
+
 ### List links
 
 `contracts` links to `policies` so that each contract row embeds 1–3 policy objects
