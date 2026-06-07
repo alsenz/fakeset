@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::arrow_util::{downcast, take_as};
 use crate::constraints::FieldConstraints;
 use crate::dq::apply_data_quality;
 use crate::generator::{generate_column, sample_count};
@@ -399,7 +400,7 @@ async fn execute_dataset_core(
             &import_batch,
         )?
     } else {
-        generate_with_inherited(&dataset.data, rows, &inherited_map)?
+        generate_batch(&dataset.data, rows, &inherited_map, &HashMap::new())?
     };
     if is_staging {
         // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
@@ -628,7 +629,7 @@ fn prepend_column(batch: &RecordBatch, name: &str, col: ArrayRef) -> Result<Reco
 // ---------------------------------------------------------------------------
 
 /// Draw strategy for `overlap: 0` — each staging slot owns an exclusive index-contiguous
-/// shard of the eligible linked pool. `shard_q` rows per shard, pre-computed by the planner.
+/// shard of the eligible linked rows. `shard_q` rows per shard, pre-computed by the planner.
 ///
 /// Returns `(slot_assignments, staging_idxs, surviving_indices)` where `surviving_indices`
 /// is the identity map (slot_assignments are already absolute pre-filter indices).
@@ -687,7 +688,7 @@ fn draw_exclusive_shards(
 }
 
 /// Draw strategy for the default overlap mode (absent or ≥ 1) — all staging slots share
-/// one pre-filtered eligible pool. Sub-modes:
+/// one pre-filtered set of eligible linked rows. Sub-modes:
 /// - `reinforcement: 0`  → Fisher-Yates without-replacement per slot
 /// - `overlap > 1`       → power-law initial weights + optional Pólya urn
 /// - default             → uniform with-replacement
@@ -696,7 +697,7 @@ fn draw_exclusive_shards(
 /// supplying the corresponding `surviving` index map before calling this function.
 ///
 /// Returns `(slot_assignments, staging_idxs, surviving_indices)`.
-fn draw_shared_pool(
+fn draw_shared_linked(
     slot_start: usize,
     slot_count: usize,
     filtered_linked: &RecordBatch,
@@ -943,11 +944,11 @@ fn execute_witness(
     // Two sampling strategies depending on overlap mode:
     //
     // overlap:0 — each staging slot draws from an exclusive shard of the pre-filter eligible
-    //   pool (`draw_exclusive_shards`). Shards are index-contiguous; surviving_indices is the
+    //   linked rows (`draw_exclusive_shards`). Shards are index-contiguous; surviving_indices is the
     //   identity map so Phases 2–4 are unchanged.
     //
     // default (overlap absent/≥1) — filter the full eligible set once, then all staging
-    //   slots draw against that shared filtered view (`draw_shared_pool`). Sub-modes for
+    //   slots draw against that shared filtered view (`draw_shared_linked`). Sub-modes for
     //   reinforcement and power-law overlap are handled inside the function.
     let (slot_assignments, staging_idxs, surviving_indices) = if include.overlap == Some(0.0) {
         draw_exclusive_shards(
@@ -963,7 +964,7 @@ fn execute_witness(
     } else {
         let (filtered_linked, surviving) =
             filter_batch_by_constraints(&eligible_linked, segment_constraints)?;
-        draw_shared_pool(
+        draw_shared_linked(
             slot_start,
             slot_count,
             &filtered_linked,
@@ -1043,11 +1044,8 @@ fn unnest_staging_refs(witness: &RecordBatch) -> Result<(RecordBatch, UInt32Arra
         .schema()
         .index_of("_staging_refs")
         .map_err(|_| anyhow!("unnest_staging_refs: '_staging_refs' not found in witness"))?;
-    let staging_refs = witness
-        .column(refs_col_idx)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| anyhow!("_staging_refs is not a ListArray"))?;
+    let staging_refs =
+        downcast::<ListArray>(witness.column(refs_col_idx).as_ref(), "_staging_refs")?;
 
     let total: usize = (0..witness.num_rows())
         .map(|r| staging_refs.value(r).len())
@@ -1057,10 +1055,7 @@ fn unnest_staging_refs(witness: &RecordBatch) -> Result<(RecordBatch, UInt32Arra
     let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
     for wr in 0..witness.num_rows() {
         let refs_slice = staging_refs.value(wr);
-        let refs_arr = refs_slice
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| anyhow!("_staging_refs list element is not UInt32"))?;
+        let refs_arr = downcast::<UInt32Array>(refs_slice.as_ref(), "_staging_refs list element")?;
         for &slot in refs_arr.values() {
             slot_idxs.push(slot);
             witness_row_idxs.push(wr as u32);
@@ -1071,16 +1066,8 @@ fn unnest_staging_refs(witness: &RecordBatch) -> Result<(RecordBatch, UInt32Arra
 
     // Sort by slot_idx: required for the offset-based list-fold.
     let sort_order = sort_to_indices(&slot_arr, None, None)?;
-    let slot_arr_sorted: UInt32Array = take(&slot_arr, &sort_order, None)?
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .unwrap()
-        .clone();
-    let witness_row_arr_sorted: UInt32Array = take(&witness_row_arr, &sort_order, None)?
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .unwrap()
-        .clone();
+    let slot_arr_sorted: UInt32Array = take_as(&slot_arr, &sort_order)?;
+    let witness_row_arr_sorted: UInt32Array = take_as(&witness_row_arr, &sort_order)?;
 
     // Strip sentinels; replicate remaining witness columns per slot.
     let stripped = strip_sentinel(
@@ -1178,17 +1165,18 @@ async fn execute_assemble_from_witness(
         }
 
         // Slot-grouped list fold: count rows per slot, build offsets, fold into ListArray.
-        let slot_idx_arr = junction
-            .column(
-                junction
-                    .schema()
-                    .index_of("_slot_idx")
-                    .map_err(|_| anyhow!("junction missing '_slot_idx'"))?,
-            )
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| anyhow!("_slot_idx is not UInt32"))?
-            .clone();
+        let slot_idx_arr = downcast::<UInt32Array>(
+            junction
+                .column(
+                    junction
+                        .schema()
+                        .index_of("_slot_idx")
+                        .map_err(|_| anyhow!("junction missing '_slot_idx'"))?,
+                )
+                .as_ref(),
+            "_slot_idx",
+        )?
+        .clone();
 
         let mut counts = vec![0usize; staging_n];
         for &idx in slot_idx_arr.values() {
@@ -1318,11 +1306,10 @@ async fn execute_accumulate_to_linked(
     // linked-row draw with `_staging_refs` encoding the back-references.
     let source_batch = if raw_source.schema().index_of("_staging_refs").is_ok() {
         let refs_col_idx = raw_source.schema().index_of("_staging_refs")?;
-        let staging_refs = raw_source
-            .column(refs_col_idx)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| anyhow!("AccumulateToLinked: _staging_refs is not a ListArray"))?;
+        let staging_refs = downcast::<ListArray>(
+            raw_source.column(refs_col_idx).as_ref(),
+            "AccumulateToLinked: _staging_refs",
+        )?;
         let total: usize = (0..raw_source.num_rows())
             .map(|r| staging_refs.value(r).len())
             .sum();
@@ -1428,10 +1415,8 @@ async fn execute_accumulate_to_linked(
                 DataType::List(f) => f.data_type().clone(),
                 other => bail!("AccumulateToLinked: expected List from array_agg, got {other:?}"),
             };
-            let agg_list = agg_values_col
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| anyhow!("AccumulateToLinked: __agg column is not a ListArray"))?;
+            let agg_list =
+                downcast::<ListArray>(agg_values_col.as_ref(), "AccumulateToLinked: __agg column")?;
             // For subsequent calls, carry forward existing accumulated items.
             let existing_list = if !is_first {
                 existing_linked_col.as_any().downcast_ref::<ListArray>()
@@ -1533,18 +1518,14 @@ fn accumulate_scalar_cumulative(
 ) -> Result<ArrayRef> {
     match existing_col.data_type() {
         DataType::Float64 => {
-            let existing = existing_col
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    anyhow!("accumulate_scalar_cumulative: existing column is not Float64")
-                })?;
-            let agg = agg_values_col
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    anyhow!("accumulate_scalar_cumulative: agg column is not Float64")
-                })?;
+            let existing = downcast::<Float64Array>(
+                existing_col.as_ref(),
+                "accumulate_scalar_cumulative: existing column",
+            )?;
+            let agg = downcast::<Float64Array>(
+                agg_values_col.as_ref(),
+                "accumulate_scalar_cumulative: agg column",
+            )?;
             let result: Vec<f64> = (0..linked_n as u32)
                 .map(|linked_row| {
                     let ev = if existing.is_null(linked_row as usize) {
@@ -1572,16 +1553,14 @@ fn accumulate_scalar_cumulative(
             Ok(Arc::new(Float64Array::from(result)))
         }
         DataType::Utf8 => {
-            let existing = existing_col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    anyhow!("accumulate_scalar_cumulative: existing column is not Utf8")
-                })?;
-            let agg = agg_values_col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| anyhow!("accumulate_scalar_cumulative: agg column is not Utf8"))?;
+            let existing = downcast::<StringArray>(
+                existing_col.as_ref(),
+                "accumulate_scalar_cumulative: existing column",
+            )?;
+            let agg = downcast::<StringArray>(
+                agg_values_col.as_ref(),
+                "accumulate_scalar_cumulative: agg column",
+            )?;
             let mut builder = StringBuilder::new();
             for linked_row in 0..linked_n as u32 {
                 let ev = if existing.is_null(linked_row as usize) {
@@ -1758,22 +1737,11 @@ fn build_segment_atom_schema(
     (atom_fields, providing_members)
 }
 
-/// Effective output field list for a member: `m.dataset.data` unioned with any
-/// variant-added fields. Variant fields override same-named base fields (taking
-/// the *last* variant's declaration for overlapping field shapes — matching
-/// `merge_variant_fields` semantics). Output column ordering follows base
-/// declaration order, then variant-added fields in declaration order.
+/// Effective output field list for a member. A lower-cover member reaching the executor is already
+/// lowered into concrete case-members (constraint-bearing variants resolved in the planner), so
+/// its `data` is the final column list.
 fn member_effective_fields(m: &LowerCoverMember) -> Vec<Field> {
-    if m.dataset.variants.is_empty() {
-        return m.dataset.data.clone();
-    }
-    let mut fields = m.dataset.data.clone();
-    for v in &m.dataset.variants {
-        for vf in &v.data {
-            crate::expand_variants::merge_delta_into(&mut fields, vf.clone());
-        }
-    }
-    fields
+    m.dataset.data.clone()
 }
 
 /// Map a member's local field name → parent field name, for every field whose
@@ -2260,7 +2228,7 @@ fn inject_linked_idx(
         let ov = link.overlap;
         let assignments: Vec<u32> = if ov == Some(0.0) {
             // overlap:0 for junction: one exclusive linked row per junction row (partition of size 1).
-            // This degenerates to without-replacement across the eligible pool.
+            // This degenerates to without-replacement across the eligible linked rows.
             sample_linked_without_replacement(n_eligible, n_rows)
         } else if r == Some(0.0) {
             sample_linked_without_replacement(n_eligible, n_rows)
@@ -2284,14 +2252,6 @@ fn inject_linked_idx(
         return prepend_column(batch, "_linked_idx", linked_idx_arr);
     }
     Ok(batch.clone())
-}
-
-fn generate_with_inherited(
-    schema: &Schema,
-    rows: usize,
-    inherited: &HashMap<String, Vec<ArrayRef>>,
-) -> Result<RecordBatch> {
-    generate_batch(schema, rows, inherited, &HashMap::new())
 }
 
 /// Generate a batch for `schema`. Fields in `overrides` have their constraints
@@ -2558,307 +2518,6 @@ mod tests {
     }
 }
 
-/// VAR-UNIFY PR U2 — `flatten`-aware output. Proves the write-time pull-up: an object
-/// field's struct children and a union field's case fields are spliced to the row level,
-/// and — the load-bearing assumption for "per-row keys" — the JSON writer omits null keys,
-/// so a flattened union row carries only its active case's fields.
-#[cfg(test)]
-mod flatten_output {
-    use super::*;
-    use crate::models::{Field, FieldType, FlattenStrategy};
-    use crate::output::prepare_output_batch;
-    use arrow::array::{Int32Array, StringArray, StructArray, UnionArray};
-    use arrow::buffer::ScalarBuffer;
-    use arrow::datatypes::{UnionFields, UnionMode};
-    use std::fs::File;
-
-    fn flatten_field(name: &str) -> Field {
-        Field {
-            name: name.into(),
-            field_type: Some(FieldType::Variant),
-            flatten: true,
-            ..Default::default()
-        }
-    }
-
-    fn flatten_field_strategy(name: &str, strategy: FlattenStrategy) -> Field {
-        Field {
-            flatten_strategy: Some(strategy),
-            ..flatten_field(name)
-        }
-    }
-
-    /// 2-row batch: `id` + a `detail` union with two object cases that **share** a field
-    /// name (`amount`) — the cross-case collision the `prefixed` strategy resolves.
-    fn flatten_union_collision_batch() -> RecordBatch {
-        let mk_struct = |v: i32| -> ArrayRef {
-            Arc::new(StructArray::from(vec![(
-                Arc::new(ArrowField::new("amount", DataType::Int32, true)),
-                Arc::new(Int32Array::from(vec![v])) as ArrayRef,
-            )]))
-        };
-        let alpha = mk_struct(10);
-        let beta = mk_struct(20);
-        let union_fields: UnionFields = [
-            (
-                0_i8,
-                Arc::new(ArrowField::new("alpha", alpha.data_type().clone(), false)),
-            ),
-            (
-                1_i8,
-                Arc::new(ArrowField::new("beta", beta.data_type().clone(), false)),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let union = UnionArray::try_new(
-            union_fields.clone(),
-            ScalarBuffer::<i8>::from(vec![0, 1]),
-            Some(ScalarBuffer::<i32>::from(vec![0, 0])),
-            vec![alpha, beta],
-        )
-        .expect("build union");
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new(
-                "detail",
-                DataType::Union(union_fields, UnionMode::Dense),
-                false,
-            ),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(union)],
-        )
-        .expect("build batch")
-    }
-
-    fn col_names(batch: &RecordBatch) -> Vec<String> {
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect()
-    }
-
-    /// 2-row batch: `id` + a `detail` dense union with two **object** cases —
-    /// row 0 = `alpha {a: Int32}`, row 1 = `beta {b: Utf8}`.
-    fn flatten_union_batch() -> RecordBatch {
-        let alpha_struct: ArrayRef = Arc::new(StructArray::from(vec![(
-            Arc::new(ArrowField::new("a", DataType::Int32, true)),
-            Arc::new(Int32Array::from(vec![10])) as ArrayRef,
-        )]));
-        let beta_struct: ArrayRef = Arc::new(StructArray::from(vec![(
-            Arc::new(ArrowField::new("b", DataType::Utf8, true)),
-            Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
-        )]));
-        let union_fields: UnionFields = [
-            (
-                0_i8,
-                Arc::new(ArrowField::new(
-                    "alpha",
-                    alpha_struct.data_type().clone(),
-                    false,
-                )),
-            ),
-            (
-                1_i8,
-                Arc::new(ArrowField::new(
-                    "beta",
-                    beta_struct.data_type().clone(),
-                    false,
-                )),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let type_ids = ScalarBuffer::<i8>::from(vec![0, 1]);
-        let offsets = ScalarBuffer::<i32>::from(vec![0, 0]);
-        let union = UnionArray::try_new(
-            union_fields.clone(),
-            type_ids,
-            Some(offsets),
-            vec![alpha_struct, beta_struct],
-        )
-        .expect("build union");
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new(
-                "detail",
-                DataType::Union(union_fields, UnionMode::Dense),
-                false,
-            ),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(union)],
-        )
-        .expect("build batch")
-    }
-
-    #[test]
-    fn flatten_union_pulls_case_fields_to_top_level() {
-        let out = prepare_output_batch(
-            &flatten_union_batch(),
-            &[flatten_field("detail")],
-            &Format::Jsonl,
-        )
-        .unwrap();
-        let sch = out.schema();
-        let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["id", "a", "b"],
-            "case fields pulled up; `detail` gone"
-        );
-        let a = out.column_by_name("a").unwrap();
-        let b = out.column_by_name("b").unwrap();
-        assert!(a.is_valid(0) && !a.is_valid(1), "`a` only on the alpha row");
-        assert!(!b.is_valid(0) && b.is_valid(1), "`b` only on the beta row");
-    }
-
-    /// The gate: the JSON writer must omit null keys so each row carries only its active
-    /// case's fields. If this ever regressed, the spec's per-row-keys story would need a
-    /// custom encoder.
-    #[test]
-    fn flatten_union_jsonl_emits_per_row_keys() {
-        let out = prepare_output_batch(
-            &flatten_union_batch(),
-            &[flatten_field("detail")],
-            &Format::Jsonl,
-        )
-        .unwrap();
-        let mut buf = Vec::new();
-        {
-            let mut w = arrow::json::LineDelimitedWriter::new(&mut buf);
-            w.write(&out).unwrap();
-            w.finish().unwrap();
-        }
-        let text = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(
-            lines[0].contains("\"a\"") && !lines[0].contains("\"b\""),
-            "row 0 should carry only the alpha case's keys: {}",
-            lines[0]
-        );
-        assert!(
-            lines[1].contains("\"b\"") && !lines[1].contains("\"a\""),
-            "row 1 should carry only the beta case's keys: {}",
-            lines[1]
-        );
-    }
-
-    /// The Parquet superset path: flattened case fields become plain nullable top-level
-    /// columns, written and read back through a real Parquet file.
-    #[test]
-    fn flatten_union_parquet_superset_round_trips() {
-        let dir = std::env::temp_dir().join(format!("varunify_u2_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        write_output(
-            &flatten_union_batch(),
-            "detail",
-            &Format::Parquet,
-            &dir,
-            &[flatten_field("detail")],
-        )
-        .expect("flattened superset writes to parquet");
-
-        let file = File::open(dir.join("detail.parquet")).unwrap();
-        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .build()
-            .unwrap();
-        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let names: Vec<String> = batches[0]
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        assert_eq!(
-            names,
-            vec!["id", "a", "b"],
-            "case fields are top-level columns"
-        );
-        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 2);
-    }
-
-    #[test]
-    fn flatten_object_pulls_fields_to_top_level() {
-        let id: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
-        let addr: ArrayRef = Arc::new(StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new("street", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec!["s1", "s2"])) as ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new("city", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec!["c1", "c2"])) as ArrayRef,
-            ),
-        ]));
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("addr", addr.data_type().clone(), true),
-        ]));
-        let batch = RecordBatch::try_new(schema, vec![id, addr]).unwrap();
-        let out = prepare_output_batch(&batch, &[flatten_field("addr")], &Format::Jsonl).unwrap();
-        let sch = out.schema();
-        let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["id", "street", "city"]);
-    }
-
-    /// `prefixed` namespaces colliding case fields by case label, so a Parquet superset of
-    /// two cases that both carry `amount` becomes `alpha_amount` / `beta_amount`.
-    #[test]
-    fn flatten_union_prefixed_namespaces_colliding_fields() {
-        let out = prepare_output_batch(
-            &flatten_union_collision_batch(),
-            &[flatten_field_strategy("detail", FlattenStrategy::Prefixed)],
-            &Format::Parquet,
-        )
-        .unwrap();
-        assert_eq!(col_names(&out), vec!["id", "alpha_amount", "beta_amount"]);
-    }
-
-    /// `discriminant` keeps the superset names and appends a `<field>_case` tag column naming
-    /// the active case per row.
-    #[test]
-    fn flatten_union_discriminant_appends_case_tag() {
-        let out = prepare_output_batch(
-            &flatten_union_batch(),
-            &[flatten_field_strategy(
-                "detail",
-                FlattenStrategy::Discriminant,
-            )],
-            &Format::Parquet,
-        )
-        .unwrap();
-        assert_eq!(col_names(&out), vec!["id", "a", "b", "detail_case"]);
-        let tag = out.column_by_name("detail_case").unwrap();
-        let tag = tag.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(tag.value(0), "alpha");
-        assert_eq!(tag.value(1), "beta");
-    }
-
-    /// JSON/JSONL ignore the strategy — per-row keys use raw names regardless of `prefixed`.
-    #[test]
-    fn flatten_union_jsonl_ignores_strategy() {
-        let out = prepare_output_batch(
-            &flatten_union_collision_batch(),
-            &[flatten_field_strategy("detail", FlattenStrategy::Prefixed)],
-            &Format::Jsonl,
-        )
-        .unwrap();
-        // Raw (un-prefixed) names; the two `amount` columns coexist (one fires per row).
-        assert_eq!(col_names(&out), vec!["id", "amount", "amount"]);
-    }
-}
-
 /// VAR-1 PR 1 — DataFusion + writer spike (the decision gate; see `specs/VAR-1-impl.md`).
 ///
 /// Proves that an Arrow `DenseUnion` column — the proposed internal representation for a
@@ -2981,7 +2640,6 @@ mod denseunion_spike {
                 expression: Some("id + 1".into()),
                 ..Default::default()
             }],
-            variants: vec![],
         };
         let out = evaluate_expressions(union_batch(), &dataset)
             .await

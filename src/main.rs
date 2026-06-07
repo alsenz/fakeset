@@ -437,29 +437,6 @@ fn print_datasets(
             }
         }
 
-        if !ds.variants.is_empty() {
-            let fixed_sum: f64 = ds.variants.iter().filter_map(|v| v.ratio).sum();
-            let n_free = ds.variants.iter().filter(|v| v.ratio.is_none()).count();
-            let free_share = if n_free > 0 {
-                (1.0 - fixed_sum) / n_free as f64
-            } else {
-                0.0
-            };
-            println!("  variants: {} →", ds.variants.len());
-            for (i, v) in ds.variants.iter().enumerate() {
-                let d = v.ratio.unwrap_or(free_share);
-                let locale_tag = v
-                    .locale
-                    .as_ref()
-                    .map(|l| format!(" locale:{l}"))
-                    .unwrap_or_default();
-                println!("    v{i} ({:.0}%{locale_tag}):", d * 100.0);
-                for field in &v.data {
-                    print_field(field, 6);
-                }
-            }
-        }
-
         println!();
     }
 }

@@ -1,7 +1,7 @@
 1. Check memory items for tidy up items
 2. Re run simplification prompt:
 ```
-Sometimes it's worth revisting things after an initial pass as you often find deeper improvements second time round.
+Sometimes it's worth revisting things after an initial pass as you often find deeper improvements second time round. Equally, sometimes there really are no better ways to produce beautiful simplicity through theoretical groundings.
 Let's re-run the code tidy up audit, with a broader scope across everything in lib in view of the development of recent theory. 
 - Any old or legacy code that contradicts or is contrary to the latest theory
 - Any code that needs to be brought in line with the new theory for clarity
@@ -15,11 +15,6 @@ Let's re-run the code tidy up audit, with a broader scope across everything in l
   yaml specs and schema and into the code and everything should semantically flow in a connected way.
   Make sure you don't diverge from the theoretical, conceptual and architectural grounding of this repo, but also bear in mind that strong alignment to theory creates clarity and simplicity. Look both across the work
   in this session but also adjacent work, older work that it perhaps now out of date, and be very mindful that executor is now quite large and complicated, but the scope is all of the modules in the lib.
-
-After that, remind me to ask you about testing gaps as the next phase.
-
-Keep your candidate list in mind - if anything doesn't get addressed this audit, we'll pick it up next. Definitely include a dead-code sweep as part of this run. WE'll keep the pytest stats suite to run for a
-subsequent step as well.
 ```
 3. Any changes before clear session
 4. Make sure CI passes

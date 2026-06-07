@@ -352,7 +352,7 @@ With U5 in, the cross-product path has no callers.
   tests (now exercising the per-row path).
 
 **Green-point:** full suite green with the entire top-level/cross-product apparatus gone.
-Complexity audit (`rust-code-analysis-cli`) should show `plan.rs`/`executor.rs` shrink.
+A complexity audit (scripted line/cyclomatic/nesting proxy over `lib/*.rs`) should show `plan.rs`/`executor.rs` shrink.
 
 > **Note (as-built):** the U6 plan above over-reached — `VariantSchema` /
 > `SyntheticDataset.variants` / `build_local_combinations` are **kept** (case-3 needs them), and

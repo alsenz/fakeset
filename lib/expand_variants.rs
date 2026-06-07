@@ -1,26 +1,22 @@
-//! Variant expansion (`expand_field_variants`). Three kinds of `type: variant` field are
-//! routed here:
+//! Variant expansion (`expand_field_variants`). Two kinds of `type: variant` field are routed
+//! here; a third is left for the planner:
 //! - **heterogeneous** (multi-type / object cases) → an Arrow `DenseUnion` (`FieldType::Union`)
 //!   via [`lower_heterogeneous_unions`] (VAR-1);
-//! - **case-3** (`ref` + `variants`) → cross-producted into `dataset.variants` so the lower-cover
-//!   planner can lower each case into a ref-bound, value-pinned case-member (VAR-SPECIALIZE);
 //! - **same-type, no ref** → left in place with a unified concrete `field_type` *and* its
-//!   `variants` retained, so the generator produces them **per-row** (VAR-UNIFY Phase 2).
+//!   `variants` retained, so the generator produces them **per-row** (VAR-UNIFY Phase 2);
+//! - **constraint-bearing** (`ref` + `variants`) → left untouched here, carrying its cases into
+//!   the lower-cover planner, which lowers them into case-members (`plan::lower_member_variants`).
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::models::{
-    Field, FieldType, FieldVariant, ParquetConfig, RefsSpec, Schema, SyntheticDataset, UnionCase,
-    VariantSchema, resolve_distributions,
-};
+use crate::models::{Field, FieldType, FieldVariant, Schema, SyntheticDataset, UnionCase};
 
 /// Route every `type: variant` field to its generation path (see the module docs):
 /// 1. Lower **heterogeneous** variants to `DenseUnion` columns.
-/// 2. Cross-product **case-3** (`ref` + `variants`) fields into `dataset.variants` for
-///    lower-cover lowering.
-/// 3. Finalise the rest: **same-type, no-ref** variants keep their cases (with a unified
-///    concrete `field_type`) for per-row generation; case-3 stubs keep only their `ref`.
+/// 2. Finalise the rest: **same-type, no-ref** variants get a unified concrete `field_type` and
+///    keep their cases for per-row generation; **constraint-bearing** (`ref` + `variants`) fields
+///    keep both their `ref` and their cases for the planner to lower.
 pub fn expand_field_variants(
     mut datasets: HashMap<PathBuf, SyntheticDataset>,
 ) -> Result<HashMap<PathBuf, SyntheticDataset>> {
@@ -28,131 +24,9 @@ pub fn expand_field_variants(
         // Heterogeneous (multi-type) variant fields become Arrow `DenseUnion` columns
         // (VAR-1) — lower them first so only homogeneous variants remain below.
         lower_heterogeneous_unions(&mut dataset.data);
-
-        // Case-3 (`ref` + `variants`) fields cross-product into `dataset.variants` for
-        // lower-cover lowering. Plain same-type variants are left in place to generate per-row.
-        let case3_paths = collect_variant_paths(&dataset.data, &[]);
-        if !case3_paths.is_empty() {
-            // `dataset.variants` is always empty here — top-level `variants:` is rejected at
-            // validation (VAR-UNIFY U4) — so the case-3 combos become the variant set directly.
-            dataset.variants = build_local_combinations(&case3_paths);
-        }
-
         finalize_variant_fields(&mut dataset.data);
     }
     Ok(datasets)
-}
-
-// ---------------------------------------------------------------------------
-// Collecting variant fields
-// ---------------------------------------------------------------------------
-
-/// Each entry: (path-to-field, variant-choices, outer-parquet-fallback, field-ref).
-/// The ref is `Some` for a **case-3** field (`ref` + `variants`; VAR-SPECIALIZE): each
-/// cross-product delta must then carry that ref so the lowered case inherits the parent
-/// column (and so enters lower-cover conflict pruning).
-type VariantPaths = Vec<(
-    Vec<String>,
-    Vec<FieldVariant>,
-    Option<ParquetConfig>,
-    Option<RefsSpec>,
-)>;
-
-fn collect_variant_paths(schema: &Schema, prefix: &[String]) -> VariantPaths {
-    let mut result = VariantPaths::new();
-    for field in schema {
-        let mut path = prefix.to_vec();
-        path.push(field.name.clone());
-
-        // Only **case-3** fields (`ref` + `variants`) cross-product into `dataset.variants`
-        // for lowering. Plain same-type `type: variant` fields are *not* collected — they
-        // generate per-row (VAR-UNIFY Phase 2; see `finalize_variant_fields`).
-        if field.refs.is_some() && !field.variants.is_empty() {
-            result.push((
-                path,
-                field.variants.clone(),
-                field.parquet.clone(),
-                field.refs.clone(),
-            ));
-        } else if matches!(field.field_type, Some(FieldType::Object)) {
-            result.extend(collect_variant_paths(&field.fields, &path));
-        }
-    }
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Building local combinations (Cartesian product)
-// ---------------------------------------------------------------------------
-
-fn build_local_combinations(variant_paths: &VariantPaths) -> Vec<VariantSchema> {
-    // Each combo accumulates (joint_dist, delta_schema).
-    let mut combos: Vec<(f64, Schema)> = vec![(1.0, vec![])];
-
-    for (path, choices, outer_parquet, refs) in variant_paths {
-        let choice_dists: Vec<Option<f64>> = choices.iter().map(|v| v.ratio).collect();
-        let dists = resolve_distributions(&choice_dists);
-        let mut next = Vec::with_capacity(combos.len() * choices.len());
-
-        for (joint_dist, delta) in &combos {
-            for (choice, &dist) in choices.iter().zip(dists.iter()) {
-                let mut new_delta = delta.clone();
-                let delta_field =
-                    build_delta_field(path, choice, outer_parquet.as_ref(), refs.as_ref());
-                merge_delta_into(&mut new_delta, delta_field);
-                next.push((joint_dist * dist, new_delta));
-            }
-        }
-        combos = next;
-    }
-
-    combos
-        .into_iter()
-        .map(|(dist, data)| VariantSchema {
-            data,
-            ratio: Some(dist),
-            locale: None,
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Delta field construction
-// ---------------------------------------------------------------------------
-
-/// Build a Field (possibly nested in Object wrappers) representing one Cartesian
-/// choice for the field at `path`.  `outer_parquet` is the parent field's parquet
-/// config and is used as a fallback when the variant choice has no parquet override.
-fn build_delta_field(
-    path: &[String],
-    variant: &FieldVariant,
-    outer_parquet: Option<&ParquetConfig>,
-    refs: Option<&RefsSpec>,
-) -> Field {
-    if path.len() == 1 {
-        let parquet = variant.parquet.clone().or_else(|| outer_parquet.cloned());
-        let field_type = infer_field_type(variant);
-        Field {
-            name: path[0].clone(),
-            field_type,
-            // Case 3: carry the field's ref onto each delta so the lowered case-member
-            // inherits the parent column (and its value pin enters conflict pruning).
-            refs: refs.cloned(),
-            generator: variant.generator.clone(),
-            locale: variant.locale.clone(),
-            range: variant.range,
-            value: variant.value.clone(),
-            parquet,
-            ..Default::default()
-        }
-    } else {
-        Field {
-            name: path[0].clone(),
-            field_type: Some(FieldType::Object),
-            fields: vec![build_delta_field(&path[1..], variant, outer_parquet, refs)],
-            ..Default::default()
-        }
-    }
 }
 
 /// Infer the concrete `FieldType` for a variant choice that omits `type`.
@@ -332,8 +206,13 @@ pub(crate) fn unified_variant_type(choices: &[FieldVariant]) -> Option<FieldType
 fn finalize_variant_fields(schema: &mut Schema) {
     for field in schema.iter_mut() {
         if !field.variants.is_empty() {
+            // A **constraint-bearing** variant (`ref` + its own `variants`) is marked for the
+            // lower-cover planner to lower into case-members; its cases are left in place. This
+            // marker is what distinguishes it later from a plain ref onto which `resolve_refs`
+            // copies the parent carrier (S4a). A plain **same-type** variant (no ref) instead gets
+            // a unified concrete type and keeps its cases for per-row generation.
             if field.refs.is_some() {
-                field.variants = vec![];
+                field.constraint_bearing = true;
             } else {
                 field.field_type = unified_variant_type(&field.variants);
             }
@@ -382,7 +261,6 @@ mod tests {
             import: None,
             links: vec![],
             data,
-            variants: vec![],
         }
     }
 
@@ -403,7 +281,6 @@ mod tests {
         let result = expand_field_variants(map).unwrap();
         let ds = result.values().next().unwrap();
 
-        assert!(ds.variants.is_empty(), "no top-level cross-product");
         let status = ds.data.iter().find(|f| f.name == "status").unwrap();
         assert_eq!(
             status.field_type,
@@ -443,7 +320,6 @@ mod tests {
         let ds = result.values().next().unwrap();
 
         // Independent per-row columns now — no Cartesian pre-enumeration.
-        assert!(ds.variants.is_empty(), "no cross-product");
         assert_eq!(
             ds.data
                 .iter()
@@ -492,7 +368,6 @@ mod tests {
         map.insert(PathBuf::from("/a/test.yaml"), ds);
         let result = expand_field_variants(map).unwrap();
         let ds = result.values().next().unwrap();
-        assert!(ds.variants.is_empty());
         let x = ds.data.iter().find(|f| f.name == "x").unwrap();
         assert_eq!(x.variants.len(), 3);
         assert!(
@@ -523,7 +398,6 @@ mod tests {
         let result = expand_field_variants(map).unwrap();
         let ds = result.values().next().unwrap();
 
-        assert!(ds.variants.is_empty());
         let meta = ds.data.iter().find(|f| f.name == "metadata").unwrap();
         let pr = meta.fields.iter().find(|f| f.name == "priority").unwrap();
         assert_eq!(
@@ -563,51 +437,6 @@ mod tests {
         assert_eq!(inferred, Some(FieldType::String));
     }
 
-    #[test]
-    fn outer_parquet_propagates_to_delta_when_inner_absent() {
-        use crate::models::{ParquetConfig, ParquetDatatype};
-        let outer_parquet = ParquetConfig {
-            datatype: ParquetDatatype::Int32,
-        };
-        let choice = FieldVariant {
-            field_type: Some(FieldType::Number),
-            range: Some(Range {
-                min: Some(0.0),
-                max: Some(100.0),
-            }),
-            ratio: Some(1.0),
-            parquet: None,
-            ..Default::default()
-        };
-        let delta = build_delta_field(&["amount".to_string()], &choice, Some(&outer_parquet), None);
-        assert_eq!(
-            delta.parquet.as_ref().map(|p| &p.datatype),
-            Some(&ParquetDatatype::Int32)
-        );
-    }
-
-    #[test]
-    fn inner_parquet_overrides_outer() {
-        use crate::models::{ParquetConfig, ParquetDatatype};
-        let outer_parquet = ParquetConfig {
-            datatype: ParquetDatatype::Int32,
-        };
-        let inner_parquet = ParquetConfig {
-            datatype: ParquetDatatype::Float32,
-        };
-        let choice = FieldVariant {
-            field_type: Some(FieldType::Number),
-            ratio: Some(1.0),
-            parquet: Some(inner_parquet),
-            ..Default::default()
-        };
-        let delta = build_delta_field(&["x".to_string()], &choice, Some(&outer_parquet), None);
-        assert_eq!(
-            delta.parquet.as_ref().map(|p| &p.datatype),
-            Some(&ParquetDatatype::Float32)
-        );
-    }
-
     // --- VAR-1 PR 3: heterogeneous variants lower to FieldType::Union ---
 
     fn number_choice(dist: Option<f64>) -> FieldVariant {
@@ -635,11 +464,6 @@ mod tests {
             "payload",
             vec![string_choice("x", Some(0.5)), number_choice(Some(0.5))],
         ));
-        // A union is a per-row column, NOT a dataset cross-product.
-        assert!(
-            ds.variants.is_empty(),
-            "heterogeneous variant must not become global variants"
-        );
         let f = ds.data.iter().find(|f| f.name == "payload").unwrap();
         assert_eq!(f.field_type, Some(FieldType::Union));
         assert_eq!(f.union_cases.len(), 2);
@@ -686,10 +510,6 @@ mod tests {
             "status",
             vec![string_choice("a", Some(0.5)), string_choice("b", Some(0.5))],
         ));
-        assert!(
-            ds.variants.is_empty(),
-            "no cross-product for same-type variants"
-        );
         let f = ds.data.iter().find(|f| f.name == "status").unwrap();
         assert_eq!(f.field_type, Some(FieldType::String));
         assert!(f.union_cases.is_empty(), "same-type → not a union");
@@ -741,10 +561,6 @@ mod tests {
                 object_choice("standard_code", Some(0.5)),
             ],
         ));
-        assert!(
-            ds.variants.is_empty(),
-            "object union is not a global variant"
-        );
         let f = ds.data.iter().find(|f| f.name == "form").unwrap();
         assert_eq!(f.field_type, Some(FieldType::Union));
         assert_eq!(f.union_cases.len(), 2);

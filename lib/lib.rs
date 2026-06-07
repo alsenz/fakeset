@@ -4,6 +4,7 @@
 //! generates referentially consistent Parquet/CSV/JSON/JSONL output by executing a
 //! topologically-sorted plan in which atoms (most-constrained nodes) are generated first
 //! and parent values are accumulated upward.
+pub mod arrow_util;
 pub mod constraints;
 pub mod dq;
 pub mod executor;

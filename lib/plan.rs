@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::constraints::FieldConstraints;
+use crate::expand_variants::{infer_field_type, merge_delta_into};
 use crate::graph::DatasetGraph;
 use crate::models::{
-    CountSpec, DataQuality, Field, Format, Include, Output, Reducer, RefBinding, RingBounds,
-    Schema, SyntheticDataset, eligible_linked_rows, expected_cardinality, for_each_list_link,
-    resolve_distributions, resolve_include, split_ref,
+    CountSpec, DataQuality, Field, FieldType, FieldVariant, Format, Include, Output, ParquetConfig,
+    Reducer, RefBinding, RefsSpec, RingBounds, Schema, SyntheticDataset, eligible_linked_rows,
+    expected_cardinality, for_each_list_link, resolve_distributions, resolve_include, split_ref,
 };
 use crate::segment::{
     ExclusionGroup, LowerCoverMember, Segment, assign_ring_slices, largest_remainder, plan_segments,
@@ -301,28 +302,128 @@ fn subdivide_one_pinned(
     Ok(out)
 }
 
-/// Merge base schema with variant schema: variant fields override same-named base fields.
-/// Object fields are deep-merged (sub-fields are individually overridden rather than
-/// replacing the entire object), matching the semantics of boolean factoring.
-pub(crate) fn merge_variant_fields(base: &Schema, variant_data: &Schema) -> Schema {
-    use crate::expand_variants::merge_delta_into;
+/// One combination of the cross-product of a member's **constraint-bearing** variant fields'
+/// cases (`ref` + `variants` — VAR-SPECIALIZE). Each combination picks one case per such field;
+/// `lower_member_variants` turns it into a **case-member**. Lowering vocabulary:
+/// *constraint-bearing variant → case combinations → case-members*.
+#[derive(Debug, Clone, Default)]
+struct CaseCombination {
+    /// Field deltas overlaid on the member's base `data` — each pins one constraint-bearing field
+    /// to its chosen case (carrying the field's `ref` + value).
+    data: Schema,
+    /// Joint ratio of this combination (product of its chosen cases' ratios).
+    ratio: f64,
+}
+
+/// `(path-to-field, cases, outer-parquet fallback, field-ref)` for each constraint-bearing variant
+/// field reachable in a schema. The `ref` is carried so each lowered case inherits the parent
+/// column (and its value pin enters conflict pruning).
+type VariantPaths = Vec<(
+    Vec<String>,
+    Vec<FieldVariant>,
+    Option<ParquetConfig>,
+    Option<RefsSpec>,
+)>;
+
+/// Collect every **constraint-bearing** variant field (`ref` + `variants`) in `schema`, recursing
+/// into object fields. Plain same-type variants are *not* collected — they generate per-row.
+fn collect_variant_paths(schema: &Schema, prefix: &[String]) -> VariantPaths {
+    let mut result = VariantPaths::new();
+    for field in schema {
+        let mut path = prefix.to_vec();
+        path.push(field.name.clone());
+        // `constraint_bearing` (set by `expand_field_variants`) distinguishes a case-3 field's own
+        // cases from a parent carrier that `resolve_refs` later copies onto a plain ref (S4a).
+        if field.constraint_bearing {
+            result.push((
+                path,
+                field.variants.clone(),
+                field.parquet.clone(),
+                field.refs.clone(),
+            ));
+        } else if matches!(field.field_type, Some(FieldType::Object)) {
+            result.extend(collect_variant_paths(&field.fields, &path));
+        }
+    }
+    result
+}
+
+/// Cartesian product of the cases of every constraint-bearing variant field → one
+/// [`CaseCombination`] per combination, carrying the joint ratio.
+fn build_local_combinations(variant_paths: &VariantPaths) -> Vec<CaseCombination> {
+    let mut combos: Vec<(f64, Schema)> = vec![(1.0, vec![])];
+    for (path, choices, outer_parquet, refs) in variant_paths {
+        let dists = resolve_distributions(&choices.iter().map(|v| v.ratio).collect::<Vec<_>>());
+        let mut next = Vec::with_capacity(combos.len() * choices.len());
+        for (joint_dist, delta) in &combos {
+            for (choice, &dist) in choices.iter().zip(dists.iter()) {
+                let mut new_delta = delta.clone();
+                merge_delta_into(
+                    &mut new_delta,
+                    build_delta_field(path, choice, outer_parquet.as_ref(), refs.as_ref()),
+                );
+                next.push((joint_dist * dist, new_delta));
+            }
+        }
+        combos = next;
+    }
+    combos
+        .into_iter()
+        .map(|(ratio, data)| CaseCombination { data, ratio })
+        .collect()
+}
+
+/// Build a `Field` (nested in `Object` wrappers for a nested path) for one Cartesian choice of the
+/// field at `path`. `outer_parquet` is the parent field's parquet fallback.
+fn build_delta_field(
+    path: &[String],
+    choice: &FieldVariant,
+    outer_parquet: Option<&ParquetConfig>,
+    refs: Option<&RefsSpec>,
+) -> Field {
+    if path.len() == 1 {
+        Field {
+            name: path[0].clone(),
+            field_type: infer_field_type(choice),
+            // Carry the field's ref onto each delta so the lowered case-member inherits the parent
+            // column (and its value pin enters conflict pruning).
+            refs: refs.cloned(),
+            generator: choice.generator.clone(),
+            locale: choice.locale.clone(),
+            range: choice.range,
+            value: choice.value.clone(),
+            parquet: choice.parquet.clone().or_else(|| outer_parquet.cloned()),
+            ..Default::default()
+        }
+    } else {
+        Field {
+            name: path[0].clone(),
+            field_type: Some(FieldType::Object),
+            fields: vec![build_delta_field(&path[1..], choice, outer_parquet, refs)],
+            ..Default::default()
+        }
+    }
+}
+
+/// Apply a case combination's deltas onto `base`, returning the concrete case-member schema.
+/// Object fields are deep-merged (sub-fields overridden individually).
+fn apply_combination(base: &Schema, combo: &CaseCombination) -> Schema {
     let mut result = base.clone();
-    for vfield in variant_data {
+    for vfield in &combo.data {
         merge_delta_into(&mut result, vfield.clone());
     }
     result
 }
 
-/// VAR-EXPAND lowering (experiment): replace each lower-cover member that carries a
-/// tagged union (`dataset.variants` non-empty) with one **case-member** per variant,
-/// and emit an [`ExclusionGroup`] over those cases so Bernoulli factoring treats them
-/// as one categorical choice. Members without variants pass through unchanged.
+/// VAR-EXPAND / VAR-SPECIALIZE lowering: replace each lower-cover member that carries
+/// **constraint-bearing** variant fields (`ref` + `variants`) with one **case-member** per case
+/// combination, and emit an [`ExclusionGroup`] over them so Bernoulli factoring treats them as one
+/// categorical choice. Members with no such fields pass through unchanged.
 ///
-/// `expand_field_variants` has already cross-producted multiple `type: variant` fields
-/// into `dataset.variants`, so each member lowers into a single group over that ∏ list.
-/// Each case-member bakes its variant delta into a concrete schema (`dataset.variants`
-/// cleared), keeps the original member's output spec (so all cases accumulate into one
-/// file), and takes the absolute ratio `r_M · vᵢ`.
+/// The cross-product of multiple constraint-bearing fields is computed here — the planner owns
+/// lowering (read straight from the member's `data`, no pre-staged dataset field). Each case-member
+/// bakes its combination's deltas into a concrete schema, keeps the member's output spec (so all
+/// cases accumulate into one file), and takes the absolute ratio `r_M · ratioᵢ`.
 fn lower_member_variants(
     members: &[LowerCoverMember],
     lower_cover_groups: &HashMap<PathBuf, Vec<LowerCoverMember>>,
@@ -332,34 +433,25 @@ fn lower_member_variants(
     for m in members {
         // Only lower members generated *in this group step* — i.e. pure leaf members.
         // A member that is itself a parent (a key in `lower_cover_groups`) is generated by
-        // its own group step (which lowers its own case-3 variants) and reused here via
-        // `parent_computed`; lowering it again would regenerate it with mismatched refs.
-        if m.dataset.variants.is_empty() || lower_cover_groups.contains_key(&m.path) {
+        // its own group step (which lowers its own constraint-bearing variants) and reused here
+        // via `parent_computed`; lowering it again would regenerate it with mismatched refs.
+        let paths = collect_variant_paths(&m.dataset.data, &[]);
+        if paths.is_empty() || lower_cover_groups.contains_key(&m.path) {
             lowered.push(m.clone());
             continue;
         }
-        let within = resolve_distributions(
-            &m.dataset
-                .variants
-                .iter()
-                .map(|v| v.ratio)
-                .collect::<Vec<_>>(),
-        );
+        let combos = build_local_combinations(&paths);
         let start = lowered.len();
-        let mut idxs = Vec::with_capacity(m.dataset.variants.len());
-        let mut ratios = Vec::with_capacity(m.dataset.variants.len());
-        for (i, variant) in m.dataset.variants.iter().enumerate() {
+        let mut idxs = Vec::with_capacity(combos.len());
+        let mut ratios = Vec::with_capacity(combos.len());
+        for (i, combo) in combos.iter().enumerate() {
             let mut case = m.clone();
-            case.dataset.data = merge_variant_fields(&m.dataset.data, &variant.data);
-            case.dataset.variants = vec![];
-            if variant.locale.is_some() {
-                case.dataset.locale = variant.locale.clone();
-            }
+            case.dataset.data = apply_combination(&m.dataset.data, combo);
             case.dataset.name = format!("{}__v{i}", m.dataset.name);
             case.path = internal_path(&m.path, &format!("v{i}"));
-            case.ratio = m.ratio * within[i];
+            case.ratio = m.ratio * combo.ratio;
             idxs.push(start + i);
-            ratios.push(m.ratio * within[i]);
+            ratios.push(m.ratio * combo.ratio);
             lowered.push(case);
         }
         let mandatory = (ratios.iter().sum::<f64>() - 1.0).abs() < 1e-9;
@@ -825,12 +917,11 @@ pub fn build_plan(
             continue;
         }
 
-        // After VAR-UNIFY Phase 2, `dataset.variants` is populated only by case-3
-        // (`ref` + `variants`) cross-product, which is lowered via the lower-cover path. A pure
-        // member is skipped above and lowered in its parent's group; the only way to reach
-        // here with variants is a dataset that is *both* an include-member and a parent — an
-        // unsupported combination (the old top-level `plan_variant_steps` path is gone).
-        if !dataset.variants.is_empty() {
+        // A **constraint-bearing** variant (`ref` + `variants`) is lowered via the lower-cover
+        // path. A pure member is skipped above and lowered in its parent's group; the only way to
+        // reach here with one is a dataset that is *both* an include-member and a parent of another
+        // dataset — an unsupported combination.
+        if !collect_variant_paths(&dataset.data, &[]).is_empty() {
             bail!(
                 "dataset '{}': a `ref` + `variants` (per-case specialisation) field on a dataset \
                  that is itself both an include-member and a parent of another dataset is not yet \
@@ -1249,7 +1340,6 @@ fn collect_linked_lower_cover_members(
                 import: None,
                 links: vec![],
                 data: item_fields.to_vec(),
-                variants: vec![],
             };
             groups.entry(inc_path).or_default().push(LowerCoverMember {
                 path: member_path,
@@ -1413,7 +1503,52 @@ fn rows_from_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Format, Schema, SyntheticDataset};
+    use crate::models::{Format, Range, Schema, SyntheticDataset};
+
+    #[test]
+    fn outer_parquet_propagates_to_delta_when_inner_absent() {
+        use crate::models::{ParquetConfig, ParquetDatatype};
+        let outer_parquet = ParquetConfig {
+            datatype: ParquetDatatype::Int32,
+        };
+        let choice = FieldVariant {
+            field_type: Some(FieldType::Number),
+            range: Some(Range {
+                min: Some(0.0),
+                max: Some(100.0),
+            }),
+            ratio: Some(1.0),
+            parquet: None,
+            ..Default::default()
+        };
+        let delta = build_delta_field(&["amount".to_string()], &choice, Some(&outer_parquet), None);
+        assert_eq!(
+            delta.parquet.as_ref().map(|p| &p.datatype),
+            Some(&ParquetDatatype::Int32)
+        );
+    }
+
+    #[test]
+    fn inner_parquet_overrides_outer() {
+        use crate::models::{ParquetConfig, ParquetDatatype};
+        let outer_parquet = ParquetConfig {
+            datatype: ParquetDatatype::Int32,
+        };
+        let inner_parquet = ParquetConfig {
+            datatype: ParquetDatatype::Float32,
+        };
+        let choice = FieldVariant {
+            field_type: Some(FieldType::Number),
+            ratio: Some(1.0),
+            parquet: Some(inner_parquet),
+            ..Default::default()
+        };
+        let delta = build_delta_field(&["x".to_string()], &choice, Some(&outer_parquet), None);
+        assert_eq!(
+            delta.parquet.as_ref().map(|p| &p.datatype),
+            Some(&ParquetDatatype::Float32)
+        );
+    }
 
     fn bare_dataset(rows: Option<usize>) -> SyntheticDataset {
         SyntheticDataset {
@@ -1427,7 +1562,6 @@ mod tests {
             import: None,
             links: vec![],
             data: Schema::default(),
-            variants: vec![],
         }
     }
 
@@ -1479,7 +1613,6 @@ mod tests {
             }),
             links: vec![],
             data: Schema::default(),
-            variants: vec![],
         }
     }
 

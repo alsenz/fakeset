@@ -432,22 +432,17 @@ fn test_list_link_expression_in_content_errors() {
 
 #[test]
 fn test_top_level_variants_rejected() {
-    // VAR-UNIFY U4: top-level dataset `variants:` is retired as user input — whole-row
-    // variation is now a `type: variant` field. (Distribution-sum validation is covered by
-    // the `field_variant_*` fixtures below.)
+    // VAR-UNIFY U4: top-level dataset `variants:` is retired. It is no longer a field on
+    // `SyntheticDataset`, so `#[serde(deny_unknown_fields)]` rejects the key at *load* time.
     let paths = vec![PathBuf::from(
         "tests/fixtures/validation/top_level_variants_retired",
     )];
-    let datasets = load_all_datasets(&paths).expect("should load");
-    let err = validate(&datasets).expect_err("top-level `variants:` should be rejected");
+    let err = load_all_datasets(&paths)
+        .expect_err("top-level `variants:` should be rejected at load (deny_unknown_fields)");
     let msg = err.to_string();
     assert!(
         msg.contains("variants"),
-        "error should mention `variants`: {msg}"
-    );
-    assert!(
-        msg.contains("field") || msg.contains("retired"),
-        "error should point at the field-variant migration: {msg}"
+        "error should name the unknown `variants` key: {msg}"
     );
 }
 

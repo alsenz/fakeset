@@ -204,11 +204,11 @@ fn apply_defaults(
         return Ok(col);
     }
 
-    let pool_len = active_defaults.len();
+    let n_defaults = active_defaults.len();
     let replacements: Vec<Option<usize>> = (0..n)
         .map(|_| {
             if (0.0f64..1.0f64).fake::<f64>() < rate {
-                Some((0usize..pool_len).fake::<usize>())
+                Some((0usize..n_defaults).fake::<usize>())
             } else {
                 None
             }

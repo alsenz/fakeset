@@ -311,25 +311,43 @@ fn resolve_field(
             )
         })?;
 
+    let mut resolved = merged_ref_field(field_name.to_string(), field, base, merged);
+    resolved.expression = field.expression.clone();
+    Ok(resolved)
+}
+
+/// Build a ref-resolved field — the single home for *what ref resolution produces*.
+///
+/// Ref resolution: inherit the **base** (ultimate non-ref target) field's `type` and nested
+/// schema, take the **merged** value-source (`generator`/`range`/`value`/`one_of` intersected
+/// with the local field's), and **propagate the variant carrier** — except a **case-3** field
+/// (`ref` + its own `variants`) keeps its own constraint-bearing cases for the planner to lower,
+/// rather than inheriting the parent's carrier (VAR-SPECIALIZE S4a). Per-case `constrain_cases`
+/// (S5) and the `constraint_bearing` marker ride along.
+///
+/// Callers set the one field that differs by context: `expression` (top-level refs) or `refs`
+/// (list-link content refs).
+fn merged_ref_field(name: String, local: &Field, base: &Field, merged: FieldConstraints) -> Field {
     let range = merged.to_range();
-    Ok(Field {
-        name: field_name.to_string(),
+    Field {
+        name,
         field_type: base.field_type.clone(),
         generator: merged.generator,
         range,
         value: merged.value,
         one_of: merged.one_of,
-        // Carry the variant carrier (VAR-SPECIALIZE S4a): a ref'd variant keeps its cases so
-        // it generates real values, and `one_of` can restrict the carrier (not go uniform).
-        variants: base.variants.clone(),
-        // Per-case specialisations ride the field to the segment constraints (S5).
-        constrain_cases: field.constrain_cases.clone(),
+        variants: if local.variants.is_empty() {
+            base.variants.clone()
+        } else {
+            local.variants.clone()
+        },
+        constrain_cases: local.constrain_cases.clone(),
+        constraint_bearing: local.constraint_bearing,
         fields: base.fields.clone(),
         content: base.content.clone(),
-        expression: field.expression.clone(),
-        hidden: field.hidden,
+        hidden: local.hidden,
         ..Default::default()
-    })
+    }
 }
 
 /// Walk a ref chain to its base (non-ref) field, returning a reference to it.
@@ -432,23 +450,9 @@ fn resolve_list_link_content_field(
             )
         })?;
 
-    let range = merged.to_range();
-    Ok(Field {
-        name: field.name.clone(),
-        field_type: target.field_type.clone(),
-        generator: merged.generator,
-        range,
-        value: merged.value,
-        one_of: merged.one_of,
-        // Carry the variant carrier (VAR-SPECIALIZE S4a).
-        variants: target.variants.clone(),
-        constrain_cases: field.constrain_cases.clone(),
-        fields: target.fields.clone(),
-        content: target.content.clone(),
-        refs: field.refs.clone(),
-        hidden: field.hidden,
-        ..Default::default()
-    })
+    let mut resolved = merged_ref_field(field.name.clone(), field, target, merged);
+    resolved.refs = field.refs.clone();
+    Ok(resolved)
 }
 
 // ---------------------------------------------------------------------------

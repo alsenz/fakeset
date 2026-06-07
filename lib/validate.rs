@@ -30,23 +30,35 @@ fn validate_dataset(
     all: &HashMap<PathBuf, SyntheticDataset>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
-    // Rule 0 (VAR-UNIFY U4): top-level dataset `variants:` is retired as user input —
-    // whole-row variation is expressed as a `type: variant` field in `data:`. Validation runs
-    // *before* `expand_field_variants`, so a non-empty `dataset.variants` here can only have
-    // come from YAML, which reliably catches the retired key.
-    if !dataset.variants.is_empty() {
-        bail!(
-            "dataset '{}': top-level `variants:` is no longer supported — express whole-row \
-             variation as a `type: variant` field in `data:` instead (VAR-UNIFY). See the \
-             YAML schema reference.",
-            dataset.name
-        );
-    }
+    // VAR-UNIFY U4: top-level dataset `variants:` is retired. It is no longer a field on
+    // `SyntheticDataset`, so `#[serde(deny_unknown_fields)]` rejects the key at *load* time —
+    // no validation rule is needed here.
+    check_csv_heterogeneous_variant(dataset)?; // Rule 0b (VAR-1)
+    check_row_count_rules(dataset, warnings)?; // Rules 1a/1b/2
+    check_import_ring(dataset)?;
+    check_links(path, dataset)?;
+    check_include_options(path, dataset, all, warnings)?;
+    check_fields(path, dataset, all, warnings)?; // Rule 3
 
-    // Rule 0b (VAR-1): a heterogeneous variant lowers to a nested union column (emitted
-    // as a nullable-superset struct). CSV is flat and cannot represent nested types — the
-    // same limitation object fields have — so reject it here with a clear error rather
-    // than failing at write time. Struct-capable formats (parquet/json/jsonl) are fine.
+    // Rule 3b (VAR-UNIFY): `flatten` placement + output name-collision checks.
+    validate_flatten(&dataset.data, &dataset.format, "", warnings)?;
+    // Rule 4: every field ref points to a real include and a real field.
+    validate_dataset_refs(path, dataset, all)?;
+    // Rule 5: expression variables only reference fields defined above them (YAML order).
+    validate_expression_order(dataset)?;
+    // Rule 6: collect reducer bindings are structurally valid.
+    validate_collect_bindings(path, dataset, all)?;
+    // Rule 7: data quality stanzas are structurally valid.
+    check_data_quality_stanzas(dataset)?;
+
+    Ok(())
+}
+
+/// Rule 0b (VAR-1): a heterogeneous variant lowers to a nested union column (emitted as a
+/// nullable-superset struct). CSV is flat and cannot represent nested types — the same
+/// limitation object fields have — so reject it here rather than failing at write time.
+/// Struct-capable formats (parquet/json/jsonl) are fine.
+fn check_csv_heterogeneous_variant(dataset: &SyntheticDataset) -> Result<()> {
     if matches!(dataset.format, Format::Csv)
         && let Some(field_path) = first_heterogeneous_variant(&dataset.data, "")
     {
@@ -57,8 +69,12 @@ fn validate_dataset(
             dataset.name
         );
     }
+    Ok(())
+}
 
-    // Rule 1a: explicit rows is incompatible with ratio includes.
+/// Rules 1a/1b/2: an explicit `rows` count is incompatible with ratio includes and with
+/// imports (the count is derived in both cases); a root dataset with no count warns.
+fn check_row_count_rules(dataset: &SyntheticDataset, warnings: &mut Vec<String>) -> Result<()> {
     if dataset.rows.is_some() && dataset.include.as_ref().is_some_and(|i| i.ratio.is_some()) {
         bail!(
             "dataset '{}': `rows` cannot be set when `include` specifies a `ratio` \
@@ -67,8 +83,6 @@ fn validate_dataset(
             dataset.name
         );
     }
-
-    // Rule 1b: explicit rows is incompatible with import (row count comes from the file).
     if dataset.rows.is_some() && dataset.import.is_some() {
         bail!(
             "dataset '{}': `rows` cannot be set when `import` is present \
@@ -76,8 +90,6 @@ fn validate_dataset(
             dataset.name
         );
     }
-
-    // Rule 2: root datasets (no include, no import) must declare an explicit row count.
     if dataset.rows.is_none() && dataset.include.is_none() && dataset.import.is_none() {
         warnings.push(format!(
             "warning: dataset '{}' has no includes and no explicit `rows` \
@@ -85,30 +97,36 @@ fn validate_dataset(
             dataset.name
         ));
     }
+    Ok(())
+}
 
-    // Rule: import ring bounds must be valid.
-    if let Some(ring) = dataset.import.as_ref().and_then(|s| s.ring.as_ref()) {
-        if ring.start < 0.0 || ring.end > 1.0 {
-            bail!(
-                "dataset '{}': `import.ring` values must lie in [0.0, 1.0); \
-                 got [{}, {})",
-                dataset.name,
-                ring.start,
-                ring.end
-            );
-        }
-        if ring.start >= ring.end {
-            bail!(
-                "dataset '{}': `import.ring.start` ({}) must be less than \
-                 `import.ring.end` ({})",
-                dataset.name,
-                ring.start,
-                ring.end
-            );
-        }
+/// Import ring bounds must lie in [0.0, 1.0) with `start < end`.
+fn check_import_ring(dataset: &SyntheticDataset) -> Result<()> {
+    let Some(ring) = dataset.import.as_ref().and_then(|s| s.ring.as_ref()) else {
+        return Ok(());
+    };
+    if ring.start < 0.0 || ring.end > 1.0 {
+        bail!(
+            "dataset '{}': `import.ring` values must lie in [0.0, 1.0); got [{}, {})",
+            dataset.name,
+            ring.start,
+            ring.end
+        );
     }
+    if ring.start >= ring.end {
+        bail!(
+            "dataset '{}': `import.ring.start` ({}) must be less than `import.ring.end` ({})",
+            dataset.name,
+            ring.start,
+            ring.end
+        );
+    }
+    Ok(())
+}
 
-    // Rule: validate links.
+/// Validate `links:`: target file existence, junction-link cardinality, reinforcement/overlap
+/// ranges, and the `content.from` ↔ link correspondence (every group ref maps to exactly one link).
+fn check_links(path: &Path, dataset: &SyntheticDataset) -> Result<()> {
     let group_refs = collect_group_refs(&dataset.data);
     for link in &dataset.links {
         if resolve_include(path, &link.file).is_none() {
@@ -118,16 +136,14 @@ fn validate_dataset(
                 link.file
             );
         }
-        if !group_refs.contains(&link.reference) {
-            // Junction link: cardinality is not meaningful (one linked-dataset row sampled per junction row).
-            if link.cardinality.is_some() {
-                bail!(
-                    "dataset '{}': junction link '{}' must not set `cardinality` — \
-                     junction links sample exactly one linked-dataset row per junction row",
-                    dataset.name,
-                    link.reference
-                );
-            }
+        // Junction link: cardinality is not meaningful (one linked-dataset row per junction row).
+        if !group_refs.contains(&link.reference) && link.cardinality.is_some() {
+            bail!(
+                "dataset '{}': junction link '{}' must not set `cardinality` — \
+                 junction links sample exactly one linked-dataset row per junction row",
+                dataset.name,
+                link.reference
+            );
         }
         if let Some(r) = link.reinforcement
             && (r < 0.0 || (r > 0.0 && r < 1.0))
@@ -179,8 +195,17 @@ fn validate_dataset(
             );
         }
     }
+    Ok(())
+}
 
-    // Rule: include.fields / exclude consistency.
+/// Validate include/link options: `fields`/`exclude` consistency, `reinforcement`/`overlap`
+/// being links-only, and top-level include `cardinality`.
+fn check_include_options(
+    path: &Path,
+    dataset: &SyntheticDataset,
+    all: &HashMap<PathBuf, SyntheticDataset>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
     let check_fields_exclude = |inc: &Include, kind: &str| -> Result<()> {
         if inc.exclude.is_some() && inc.fields.is_empty() {
             bail!(
@@ -205,7 +230,7 @@ fn validate_dataset(
         }
     }
 
-    // Rule: reinforcement and overlap are links: only.
+    // reinforcement and overlap are links: only.
     if let Some(inc) = &dataset.include {
         if inc.reinforcement.is_some() {
             bail!(
@@ -223,7 +248,7 @@ fn validate_dataset(
         }
     }
 
-    // Rule: top-level include cardinality constraints.
+    // top-level include cardinality constraints.
     if let Some(inc) = &dataset.include
         && let Some(card) = &inc.cardinality
     {
@@ -235,8 +260,17 @@ fn validate_dataset(
         }
         validate_cardinality(card, &format!("dataset '{}'", dataset.name))?;
     }
+    Ok(())
+}
 
-    // Rule 3: field-level structural constraints (type/ref/schema/content consistency).
+/// Rule 3: per-field structural validation (`validate_field`), plus list-link content fields
+/// (which need full dataset context for ref scoping).
+fn check_fields(
+    path: &Path,
+    dataset: &SyntheticDataset,
+    all: &HashMap<PathBuf, SyntheticDataset>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
     for field in &dataset.data {
         if field.name.is_empty() {
             bail!("dataset '{}': a field is missing a `name`", dataset.name);
@@ -262,20 +296,12 @@ fn validate_dataset(
             )?;
         }
     }
+    Ok(())
+}
 
-    // Rule 3b (VAR-UNIFY): `flatten` placement + output name-collision checks.
-    validate_flatten(&dataset.data, &dataset.format, "", warnings)?;
-
-    // Rule 4: every field ref points to a real include and a real field.
-    validate_dataset_refs(path, dataset, all)?;
-
-    // Rule 5: expression variables only reference fields defined above them (YAML order).
-    validate_expression_order(dataset)?;
-
-    // Rule 6: collect reducer bindings are structurally valid.
-    validate_collect_bindings(path, dataset, all)?;
-
-    // Rule 7: data quality stanzas are structurally valid.
+/// Rule 7: data quality stanzas (output-level and field-level) are structurally valid, and a
+/// field-level stanza requires an output-level one.
+fn check_data_quality_stanzas(dataset: &SyntheticDataset) -> Result<()> {
     let output_has_quality = dataset
         .resolved_outputs()
         .iter()
@@ -301,7 +327,6 @@ fn validate_dataset(
             }
         }
     }
-
     Ok(())
 }
 
@@ -476,38 +501,20 @@ fn validate_args(path: &str, field: &Field) -> Result<()> {
         return Ok(());
     };
 
-    if let Some(ft) = &field.field_type
-        && *ft == FieldType::Boolean
-    {
-        // boolean ratio — no generator required
-        for key in args.keys() {
-            if key != "ratio" {
-                bail!("field '{path}': unknown arg '{key}' for boolean field — valid key: `ratio`");
-            }
-        }
-        if let Some(v) = args.get("ratio") {
-            let ratio = v
-                .as_u64()
-                .ok_or_else(|| anyhow!("field '{path}': `args.ratio` must be an integer 0–100"))?;
-            if ratio > 100 {
-                bail!("field '{path}': `args.ratio` must be between 0 and 100, got {ratio}");
-            }
-        }
-        return Ok(());
+    if matches!(&field.field_type, Some(FieldType::Boolean)) {
+        return validate_boolean_args(path, args);
     }
 
     // For all other types, args require a generator.
-    let g = match &field.generator {
-        Some(g) => g,
-        None => bail!(
+    let g = field.generator.as_ref().ok_or_else(|| {
+        anyhow!(
             "field '{path}': `args` requires a `generator` to be set (or `type: boolean` for `ratio`)"
-        ),
-    };
+        )
+    })?;
 
-    let valid_keys = match g.valid_args() {
-        Some(keys) => keys,
-        None => bail!("field '{path}': generator `{g}` does not accept `args`"),
-    };
+    let valid_keys = g
+        .valid_args()
+        .ok_or_else(|| anyhow!("field '{path}': generator `{g}` does not accept `args`"))?;
 
     for key in args.keys() {
         if !valid_keys.contains(&key.as_str()) {
@@ -518,7 +525,33 @@ fn validate_args(path: &str, field: &Field) -> Result<()> {
         }
     }
 
-    // Type-check each known key.
+    validate_generator_args(path, g, args)
+}
+
+/// Boolean fields accept only `ratio` (an integer 0–100, no generator required).
+fn validate_boolean_args(path: &str, args: &HashMap<String, serde_yaml::Value>) -> Result<()> {
+    for key in args.keys() {
+        if key != "ratio" {
+            bail!("field '{path}': unknown arg '{key}' for boolean field — valid key: `ratio`");
+        }
+    }
+    if let Some(v) = args.get("ratio") {
+        let ratio = v
+            .as_u64()
+            .ok_or_else(|| anyhow!("field '{path}': `args.ratio` must be an integer 0–100"))?;
+        if ratio > 100 {
+            bail!("field '{path}': `args.ratio` must be between 0 and 100, got {ratio}");
+        }
+    }
+    Ok(())
+}
+
+/// Type-check the values of generator-specific args (keys already validated against `valid_args`).
+fn validate_generator_args(
+    path: &str,
+    g: &Generator,
+    args: &HashMap<String, serde_yaml::Value>,
+) -> Result<()> {
     match g {
         Generator::Sentence
         | Generator::Paragraph
@@ -553,18 +586,17 @@ fn validate_args(path: &str, field: &Field) -> Result<()> {
                 }
             }
         }
-        Generator::NumberWithFormat => {
-            if let Some(v) = args.get("format") {
-                if v.as_str().is_none() {
-                    bail!("field '{path}': `args.format` must be a string");
-                }
-            } else {
-                bail!("field '{path}': generator `number_with_format` requires `args.format`");
+        Generator::NumberWithFormat => match args.get("format") {
+            Some(v) if v.as_str().is_none() => {
+                bail!("field '{path}': `args.format` must be a string")
             }
-        }
+            None => {
+                bail!("field '{path}': generator `number_with_format` requires `args.format`")
+            }
+            Some(_) => {}
+        },
         _ => {}
     }
-
     Ok(())
 }
 
@@ -808,90 +840,14 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     }
     // Expression fields are fully self-contained: no type, ref, or generation constraints.
     if field.expression.is_some() {
-        if field.field_type.is_some() {
-            bail!("field '{path}': `expression` cannot be combined with `type`");
-        }
-        if field.simple_ref().is_some() {
-            bail!("field '{path}': `expression` cannot be combined with `ref`");
-        }
-        if field.generator.is_some()
-            || field
-                .range
-                .as_ref()
-                .is_some_and(|r| r.min.is_some() || r.max.is_some())
-        {
-            bail!("field '{path}': `expression` cannot be combined with `generator` or `range`");
-        }
-        if field.value.is_some() {
-            bail!("field '{path}': `expression` cannot be combined with `value`");
-        }
-        if !field.fields.is_empty() || field.content.is_some() {
-            bail!("field '{path}': `expression` cannot be combined with `fields` or `content`");
-        }
-        return Ok(());
+        return validate_expression_field(path, field);
     }
 
-    // Structural bans that apply when `ref` is set.
-    // `type` is un-mergeable (the ref target owns the type), so it stays banned.
-    // `fields` and `content` are structural, not constraints, so also banned.
-    // Constraint fields (generator, min, max, value) are allowed — they specialise
-    // the referenced field and are merged with its constraints during the rewrite step.
-    if field.simple_ref().is_some() {
-        if field.field_type.is_some() {
-            bail!(
-                "field '{path}': `type` cannot be set alongside `ref` \
-                 — the type is inherited from the referenced field"
-            );
-        }
-        if !field.fields.is_empty() {
-            bail!("field '{path}': `ref` and `fields` cannot both be set");
-        }
-        if field.content.is_some() {
-            bail!("field '{path}': `ref` and `content` cannot both be set");
-        }
-    }
+    validate_ref_structural_bans(path, field)?;
 
     // Constraint internal-consistency checks — apply regardless of whether `ref` is set.
     validate_field_constraints(path, field)?;
-
-    // `one_of` (VAR-SPECIALIZE): non-empty, and mutually exclusive with a single `value`.
-    if let Some(set) = &field.one_of {
-        if set.is_empty() {
-            bail!("field '{path}': `one_of` must be non-empty");
-        }
-        if field.value.is_some() {
-            bail!(
-                "field '{path}': `value` and `one_of` cannot both be set — use `value` for a \
-                 single constant, `one_of` for a finite set"
-            );
-        }
-    }
-
-    // `preserve_marginal` (VAR-SPECIALIZE S4c) pins a variant's global case marginal — only
-    // meaningful on a `type: variant` field.
-    if field.preserve_marginal && !matches!(field.field_type, Some(FieldType::Variant)) {
-        bail!("field '{path}': `preserve_marginal` is only valid on a `type: variant` field");
-    }
-
-    // `constrain_cases` (VAR-SPECIALIZE S5) specialises named cases of a ref'd parent variant.
-    if !field.constrain_cases.is_empty() {
-        if field.simple_ref().is_none() {
-            bail!(
-                "field '{path}': `constrain_cases` is only valid on a field that `ref`s a parent \
-                 variant (it specialises that variant's cases by name)"
-            );
-        }
-        for (i, d) in field.constrain_cases.iter().enumerate() {
-            if d.name.is_empty() {
-                bail!(
-                    "field '{path}': `constrain_cases[{i}]` must name the parent case it specialises"
-                );
-            }
-        }
-    }
-
-    let range_min = field.range.as_ref().and_then(|r| r.min);
-    let range_max = field.range.as_ref().and_then(|r| r.max);
+    validate_specialization_keys(path, field)?;
 
     validate_locale_generator(path, field.locale.as_ref(), field.generator.as_ref())?;
     validate_args(path, field)?;
@@ -916,37 +872,144 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
 
     // Variant field: validate its choices and distribution, then stop.
     if *field_type == FieldType::Variant {
-        if field.variants.is_empty() {
-            bail!("field '{path}': `type: variant` requires a non-empty `variants` list");
-        }
-        for (i, choice) in field.variants.iter().enumerate() {
-            validate_field_variant(&format!("{path}.variants[{i}]"), choice, warnings)?;
-        }
-        // Heterogeneous (multi-type / multi-object) variants are supported (VAR-1): they
-        // lower to an Arrow union, emitted as a nullable-superset struct. The only output
-        // constraint is CSV (a flat format that can't hold the nested struct) — checked
-        // per-dataset in `validate_dataset`, where the output format is known.
-        let fixed_sum: f64 = field.variants.iter().filter_map(|v| v.ratio).sum();
-        let n_free = field.variants.iter().filter(|v| v.ratio.is_none()).count();
-        if fixed_sum > 1.0 + 1e-9 {
-            bail!(
-                "field '{path}': variant distributions sum to {:.4} which exceeds 1.0",
-                fixed_sum
-            );
-        }
-        if n_free == 0 && (fixed_sum - 1.0).abs() > 1e-9 {
-            bail!(
-                "field '{path}': all variant distributions are explicit but sum to {:.4}, not 1.0",
-                fixed_sum
-            );
-        }
-        if field.variants.len() == 1 {
-            warnings.push(format!(
-                "warning: field '{path}' has only one variant choice — this is equivalent to a plain field"
-            ));
-        }
+        return validate_variant_field(path, field, warnings);
+    }
+
+    validate_typed_field(path, field, field_type, warnings)
+}
+
+/// An `expression` field carries no type/ref/generation: every other source is banned.
+fn validate_expression_field(path: &str, field: &Field) -> Result<()> {
+    if field.field_type.is_some() {
+        bail!("field '{path}': `expression` cannot be combined with `type`");
+    }
+    if field.simple_ref().is_some() {
+        bail!("field '{path}': `expression` cannot be combined with `ref`");
+    }
+    if field.generator.is_some()
+        || field
+            .range
+            .as_ref()
+            .is_some_and(|r| r.min.is_some() || r.max.is_some())
+    {
+        bail!("field '{path}': `expression` cannot be combined with `generator` or `range`");
+    }
+    if field.value.is_some() {
+        bail!("field '{path}': `expression` cannot be combined with `value`");
+    }
+    if !field.fields.is_empty() || field.content.is_some() {
+        bail!("field '{path}': `expression` cannot be combined with `fields` or `content`");
+    }
+    Ok(())
+}
+
+/// Structural keys banned alongside `ref`. `type` is un-mergeable (the ref target owns the
+/// type); `fields`/`content` are structural, not constraints. Constraint fields (generator,
+/// min, max, value) are allowed — they specialise the referenced field and merge during rewrite.
+fn validate_ref_structural_bans(path: &str, field: &Field) -> Result<()> {
+    if field.simple_ref().is_none() {
         return Ok(());
     }
+    if field.field_type.is_some() {
+        bail!(
+            "field '{path}': `type` cannot be set alongside `ref` \
+             — the type is inherited from the referenced field"
+        );
+    }
+    if !field.fields.is_empty() {
+        bail!("field '{path}': `ref` and `fields` cannot both be set");
+    }
+    if field.content.is_some() {
+        bail!("field '{path}': `ref` and `content` cannot both be set");
+    }
+    Ok(())
+}
+
+/// VAR-SPECIALIZE keys: `one_of` (finite-set selector), `preserve_marginal` (variant pin),
+/// and `constrain_cases` (per-case specialisation of a ref'd parent variant).
+fn validate_specialization_keys(path: &str, field: &Field) -> Result<()> {
+    // `one_of`: non-empty, and mutually exclusive with a single `value`.
+    if let Some(set) = &field.one_of {
+        if set.is_empty() {
+            bail!("field '{path}': `one_of` must be non-empty");
+        }
+        if field.value.is_some() {
+            bail!(
+                "field '{path}': `value` and `one_of` cannot both be set — use `value` for a \
+                 single constant, `one_of` for a finite set"
+            );
+        }
+    }
+
+    // `preserve_marginal` (S4c) pins a variant's global case marginal — variant-only.
+    if field.preserve_marginal && !matches!(field.field_type, Some(FieldType::Variant)) {
+        bail!("field '{path}': `preserve_marginal` is only valid on a `type: variant` field");
+    }
+
+    // `constrain_cases` (S5) specialises named cases of a ref'd parent variant.
+    if !field.constrain_cases.is_empty() {
+        if field.simple_ref().is_none() {
+            bail!(
+                "field '{path}': `constrain_cases` is only valid on a field that `ref`s a parent \
+                 variant (it specialises that variant's cases by name)"
+            );
+        }
+        for (i, d) in field.constrain_cases.iter().enumerate() {
+            if d.name.is_empty() {
+                bail!(
+                    "field '{path}': `constrain_cases[{i}]` must name the parent case it specialises"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `type: variant` field: validate each case, then check the case-distribution sums.
+fn validate_variant_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Result<()> {
+    if field.variants.is_empty() {
+        bail!("field '{path}': `type: variant` requires a non-empty `variants` list");
+    }
+    for (i, choice) in field.variants.iter().enumerate() {
+        validate_field_variant(&format!("{path}.variants[{i}]"), choice, warnings)?;
+    }
+    // Heterogeneous (multi-type / multi-object) variants are supported (VAR-1): they lower to
+    // an Arrow union, emitted as a nullable-superset struct. The only output constraint is CSV
+    // (a flat format that can't hold the nested struct) — checked per-dataset in
+    // `validate_dataset`, where the output format is known.
+    let fixed_sum: f64 = field.variants.iter().filter_map(|v| v.ratio).sum();
+    let n_free = field.variants.iter().filter(|v| v.ratio.is_none()).count();
+    if fixed_sum > 1.0 + 1e-9 {
+        bail!(
+            "field '{path}': variant distributions sum to {:.4} which exceeds 1.0",
+            fixed_sum
+        );
+    }
+    if n_free == 0 && (fixed_sum - 1.0).abs() > 1e-9 {
+        bail!(
+            "field '{path}': all variant distributions are explicit but sum to {:.4}, not 1.0",
+            fixed_sum
+        );
+    }
+    if field.variants.len() == 1 {
+        warnings.push(format!(
+            "warning: field '{path}' has only one variant choice — this is equivalent to a plain field"
+        ));
+    }
+    Ok(())
+}
+
+/// Structural and value checks for a non-ref, non-variant field with a known type:
+/// type/`fields`/`content`/`range`/generator compatibility, object & list recursion, and
+/// `default`/`one_of` value-type compatibility.
+fn validate_typed_field(
+    path: &str,
+    field: &Field,
+    field_type: &FieldType,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let range_min = field.range.as_ref().and_then(|r| r.min);
+    let range_max = field.range.as_ref().and_then(|r| r.max);
 
     if !field.fields.is_empty() && *field_type != FieldType::Object {
         bail!(
@@ -1062,7 +1125,7 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
 /// Validate all fields inside a `content: {group: <ref>, ...}` block.
 ///
 /// Two ref scopes apply:
-/// - **Pool-scoped** (`ref: link_ref.field`): dot-prefixed with the link ref; the target
+/// - **Linked-scoped** (`ref: link_ref.field`): dot-prefixed with the link ref; the target
 ///   field must exist in the linked dataset.
 /// - **Outer-scoped** (`ref: field`): no dot (or dot not matching the link ref); the field
 ///   must exist in the enclosing `dataset`. An explicit `type:` must be set (auto-inference
@@ -1767,7 +1830,6 @@ mod import_taint_tests {
             }),
             links: vec![],
             data: vec![],
-            variants: vec![],
         };
         for (col, tainted) in cols {
             ds.data.push(Field {
@@ -1791,7 +1853,6 @@ mod import_taint_tests {
             import: None,
             links: vec![],
             data,
-            variants: vec![],
         }
     }
 

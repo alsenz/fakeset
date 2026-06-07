@@ -423,6 +423,42 @@ fn constant_column(ft: &FieldType, val: &serde_yaml::Value, n: usize) -> Result<
 
 /// Build an Arrow `DenseUnion` column for a heterogeneous tagged union (VAR-1).
 ///
+/// Draw a case index per row via **per-row categorical sampling** — the shared kernel behind both
+/// variant builders (a `type: variant` field *is* a per-row categorical draw over its cases).
+///
+/// `ratios` are resolved (free `None` slots share the remainder equally) and **renormalised** to
+/// sum to 1: after a `one_of` filter the survivors sum to < 1, and an un-normalised tail would dump
+/// the leftover mass on the last case (the carrier "renormalises over survivors"). Returns
+/// `(case_of_row, counts)`, where `counts[i]` is how many rows drew case `i` (for child sizing).
+fn draw_categorical(ratios: &[Option<f64>], n: usize) -> (Vec<usize>, Vec<usize>) {
+    let raw = resolve_distributions(ratios);
+    let total: f64 = raw.iter().sum();
+    let weights: Vec<f64> = if total > 0.0 {
+        raw.iter().map(|w| w / total).collect()
+    } else {
+        raw
+    };
+    let mut cumulative = Vec::with_capacity(weights.len());
+    let mut acc = 0.0;
+    for w in &weights {
+        acc += w;
+        cumulative.push(acc);
+    }
+    let n_cases = weights.len();
+    let mut case_of_row: Vec<usize> = Vec::with_capacity(n);
+    let mut counts = vec![0usize; n_cases];
+    for _ in 0..n {
+        let u: f64 = (0.0f64..1.0f64).fake();
+        let i = cumulative
+            .iter()
+            .position(|&c| u < c)
+            .unwrap_or(n_cases - 1);
+        case_of_row.push(i);
+        counts[i] += 1;
+    }
+    (case_of_row, counts)
+}
+
 /// Each case (`field.union_cases`) is generated through its **own** field spec — its own
 /// generator/value/type, so a `value:` case is the static generator. The active case is
 /// drawn **independently per row** from the declared ratios. Per-row sampling (rather than
@@ -436,27 +472,8 @@ fn build_union_column(field: &Field, n: usize) -> Result<ArrayRef> {
         bail!("union field '{}' has no cases", field.name);
     }
 
-    // Cumulative distribution for per-row categorical sampling.
-    let weights = resolve_distributions(&cases.iter().map(|c| c.ratio).collect::<Vec<_>>());
-    let mut cumulative = Vec::with_capacity(weights.len());
-    let mut acc = 0.0;
-    for w in &weights {
-        acc += w;
-        cumulative.push(acc);
-    }
-
-    // Draw each row's case independently; count rows per case for child-array sizing.
-    let mut case_of_row: Vec<usize> = Vec::with_capacity(n);
-    let mut counts = vec![0usize; cases.len()];
-    for _ in 0..n {
-        let u: f64 = (0.0f64..1.0f64).fake();
-        let i = cumulative
-            .iter()
-            .position(|&c| u < c)
-            .unwrap_or(cases.len() - 1);
-        case_of_row.push(i);
-        counts[i] += 1;
-    }
+    let ratios: Vec<Option<f64>> = cases.iter().map(|c| c.ratio).collect();
+    let (case_of_row, counts) = draw_categorical(&ratios, n);
 
     let union_fields: UnionFields = cases
         .iter()
@@ -540,33 +557,8 @@ fn build_same_type_variant_column(field: &Field, n: usize) -> Result<ArrayRef> {
         )
     })?;
 
-    // Cumulative distribution → per-row independent draw. Renormalise so the weights sum to 1
-    // — after a `one_of` filter the surviving ratios sum to <1, and an un-normalised tail would
-    // dump the leftover mass on the last case (the carrier/support "renormalise over survivors").
-    let raw = resolve_distributions(&cases.iter().map(|c| c.ratio).collect::<Vec<_>>());
-    let total: f64 = raw.iter().sum();
-    let weights: Vec<f64> = if total > 0.0 {
-        raw.iter().map(|w| w / total).collect()
-    } else {
-        raw
-    };
-    let mut cumulative = Vec::with_capacity(weights.len());
-    let mut acc = 0.0;
-    for w in &weights {
-        acc += w;
-        cumulative.push(acc);
-    }
-    let mut case_of_row: Vec<usize> = Vec::with_capacity(n);
-    let mut counts = vec![0usize; cases.len()];
-    for _ in 0..n {
-        let u: f64 = (0.0f64..1.0f64).fake();
-        let i = cumulative
-            .iter()
-            .position(|&c| u < c)
-            .unwrap_or(cases.len() - 1);
-        case_of_row.push(i);
-        counts[i] += 1;
-    }
+    let ratios: Vec<Option<f64>> = cases.iter().map(|c| c.ratio).collect();
+    let (case_of_row, counts) = draw_categorical(&ratios, n);
 
     // Generate each case's values in bulk through its own value-source.
     let case_cols: Vec<ArrayRef> = cases

@@ -18,6 +18,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::arrow_util::downcast;
 use crate::models::{Field, FlattenStrategy, Format, discriminant_tag_column};
 
 /// Remove columns marked `hidden` from a batch before writing output.
@@ -81,10 +82,8 @@ pub(crate) fn unionize_for_output(batch: &RecordBatch) -> Result<RecordBatch> {
 fn union_to_portable(field: &ArrowField, col: &ArrayRef) -> Result<(ArrowField, ArrayRef)> {
     match col.data_type() {
         DataType::Union(union_fields, _) => {
-            let u = col
-                .as_any()
-                .downcast_ref::<UnionArray>()
-                .ok_or_else(|| anyhow!("union column '{}' is not a UnionArray", field.name()))?;
+            let u =
+                downcast::<UnionArray>(col.as_ref(), &format!("union column '{}'", field.name()))?;
             let type_ids = u.type_ids();
             let offsets = u
                 .offsets()
@@ -114,10 +113,10 @@ fn union_to_portable(field: &ArrowField, col: &ArrayRef) -> Result<(ArrowField, 
             ))
         }
         DataType::Struct(_) => {
-            let s = col
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| anyhow!("struct column '{}' is not a StructArray", field.name()))?;
+            let s = downcast::<StructArray>(
+                col.as_ref(),
+                &format!("struct column '{}'", field.name()),
+            )?;
             let DataType::Struct(orig_fields) = field.data_type() else {
                 unreachable!("matched Struct above")
             };
@@ -203,18 +202,16 @@ fn flatten_column(
 ) -> Result<Vec<(ArrowField, ArrayRef)>> {
     match col.data_type() {
         DataType::Union(union_fields, _) => {
-            let u = col
-                .as_any()
-                .downcast_ref::<UnionArray>()
-                .ok_or_else(|| anyhow!("flatten field '{}' is not a UnionArray", field.name()))?;
+            let u =
+                downcast::<UnionArray>(col.as_ref(), &format!("flatten field '{}'", field.name()))?;
             flatten_union_to_columns(field.name(), u, union_fields, strategy)
         }
         // An object has no cases, so `strategy` doesn't apply — splice its children raw.
         DataType::Struct(struct_fields) => {
-            let s = col
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| anyhow!("flatten field '{}' is not a StructArray", field.name()))?;
+            let s = downcast::<StructArray>(
+                col.as_ref(),
+                &format!("flatten field '{}'", field.name()),
+            )?;
             struct_fields
                 .iter()
                 .zip(s.columns())
@@ -254,10 +251,7 @@ fn flatten_union_to_columns(
             .collect();
         match child.data_type() {
             DataType::Struct(case_struct_fields) => {
-                let s = child
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or_else(|| anyhow!("union case '{label}' is not a struct"))?;
+                let s = downcast::<StructArray>(child.as_ref(), &format!("union case '{label}'"))?;
                 for (cf, carr) in case_struct_fields.iter().zip(s.columns()) {
                     let taken = take(carr.as_ref(), &idx, None)?;
                     let name = if strategy == FlattenStrategy::Prefixed {
@@ -350,4 +344,303 @@ pub(crate) fn write_output(
 
     println!("  wrote {}", path.display());
     Ok(())
+}
+
+/// VAR-UNIFY PR U2 — `flatten`-aware output. Proves the write-time pull-up: an object
+/// field's struct children and a union field's case fields are spliced to the row level,
+/// and — the load-bearing assumption for "per-row keys" — the JSON writer omits null keys,
+/// so a flattened union row carries only its active case's fields.
+#[cfg(test)]
+mod flatten_output {
+    use super::*;
+    use crate::models::FieldType;
+    use arrow::array::Int32Array;
+    use arrow::buffer::ScalarBuffer;
+    use arrow::datatypes::UnionMode;
+
+    fn flatten_field(name: &str) -> Field {
+        Field {
+            name: name.into(),
+            field_type: Some(FieldType::Variant),
+            flatten: true,
+            ..Default::default()
+        }
+    }
+
+    fn flatten_field_strategy(name: &str, strategy: FlattenStrategy) -> Field {
+        Field {
+            flatten_strategy: Some(strategy),
+            ..flatten_field(name)
+        }
+    }
+
+    /// 2-row batch: `id` + a `detail` union with two object cases that **share** a field
+    /// name (`amount`) — the cross-case collision the `prefixed` strategy resolves.
+    fn flatten_union_collision_batch() -> RecordBatch {
+        let mk_struct = |v: i32| -> ArrayRef {
+            Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("amount", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![v])) as ArrayRef,
+            )]))
+        };
+        let alpha = mk_struct(10);
+        let beta = mk_struct(20);
+        let union_fields: UnionFields = [
+            (
+                0_i8,
+                Arc::new(ArrowField::new("alpha", alpha.data_type().clone(), false)),
+            ),
+            (
+                1_i8,
+                Arc::new(ArrowField::new("beta", beta.data_type().clone(), false)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let union = UnionArray::try_new(
+            union_fields.clone(),
+            ScalarBuffer::<i8>::from(vec![0, 1]),
+            Some(ScalarBuffer::<i32>::from(vec![0, 0])),
+            vec![alpha, beta],
+        )
+        .expect("build union");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "detail",
+                DataType::Union(union_fields, UnionMode::Dense),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(union)],
+        )
+        .expect("build batch")
+    }
+
+    fn col_names(batch: &RecordBatch) -> Vec<String> {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    /// 2-row batch: `id` + a `detail` dense union with two **object** cases —
+    /// row 0 = `alpha {a: Int32}`, row 1 = `beta {b: Utf8}`.
+    fn flatten_union_batch() -> RecordBatch {
+        let alpha_struct: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![10])) as ArrayRef,
+        )]));
+        let beta_struct: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("b", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+        )]));
+        let union_fields: UnionFields = [
+            (
+                0_i8,
+                Arc::new(ArrowField::new(
+                    "alpha",
+                    alpha_struct.data_type().clone(),
+                    false,
+                )),
+            ),
+            (
+                1_i8,
+                Arc::new(ArrowField::new(
+                    "beta",
+                    beta_struct.data_type().clone(),
+                    false,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let type_ids = ScalarBuffer::<i8>::from(vec![0, 1]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 0]);
+        let union = UnionArray::try_new(
+            union_fields.clone(),
+            type_ids,
+            Some(offsets),
+            vec![alpha_struct, beta_struct],
+        )
+        .expect("build union");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "detail",
+                DataType::Union(union_fields, UnionMode::Dense),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(union)],
+        )
+        .expect("build batch")
+    }
+
+    #[test]
+    fn flatten_union_pulls_case_fields_to_top_level() {
+        let out = prepare_output_batch(
+            &flatten_union_batch(),
+            &[flatten_field("detail")],
+            &Format::Jsonl,
+        )
+        .unwrap();
+        let sch = out.schema();
+        let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "a", "b"],
+            "case fields pulled up; `detail` gone"
+        );
+        let a = out.column_by_name("a").unwrap();
+        let b = out.column_by_name("b").unwrap();
+        assert!(a.is_valid(0) && !a.is_valid(1), "`a` only on the alpha row");
+        assert!(!b.is_valid(0) && b.is_valid(1), "`b` only on the beta row");
+    }
+
+    /// The gate: the JSON writer must omit null keys so each row carries only its active
+    /// case's fields. If this ever regressed, the spec's per-row-keys story would need a
+    /// custom encoder.
+    #[test]
+    fn flatten_union_jsonl_emits_per_row_keys() {
+        let out = prepare_output_batch(
+            &flatten_union_batch(),
+            &[flatten_field("detail")],
+            &Format::Jsonl,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut w = arrow::json::LineDelimitedWriter::new(&mut buf);
+            w.write(&out).unwrap();
+            w.finish().unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("\"a\"") && !lines[0].contains("\"b\""),
+            "row 0 should carry only the alpha case's keys: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("\"b\"") && !lines[1].contains("\"a\""),
+            "row 1 should carry only the beta case's keys: {}",
+            lines[1]
+        );
+    }
+
+    /// The Parquet superset path: flattened case fields become plain nullable top-level
+    /// columns, written and read back through a real Parquet file.
+    #[test]
+    fn flatten_union_parquet_superset_round_trips() {
+        let dir = std::env::temp_dir().join(format!("varunify_u2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_output(
+            &flatten_union_batch(),
+            "detail",
+            &Format::Parquet,
+            &dir,
+            &[flatten_field("detail")],
+        )
+        .expect("flattened superset writes to parquet");
+
+        let file = File::open(dir.join("detail.parquet")).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let names: Vec<String> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "a", "b"],
+            "case fields are top-level columns"
+        );
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn flatten_object_pulls_fields_to_top_level() {
+        let id: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        let addr: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("street", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["s1", "s2"])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("city", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["c1", "c2"])) as ArrayRef,
+            ),
+        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("addr", addr.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![id, addr]).unwrap();
+        let out = prepare_output_batch(&batch, &[flatten_field("addr")], &Format::Jsonl).unwrap();
+        let sch = out.schema();
+        let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "street", "city"]);
+    }
+
+    /// `prefixed` namespaces colliding case fields by case label, so a Parquet superset of
+    /// two cases that both carry `amount` becomes `alpha_amount` / `beta_amount`.
+    #[test]
+    fn flatten_union_prefixed_namespaces_colliding_fields() {
+        let out = prepare_output_batch(
+            &flatten_union_collision_batch(),
+            &[flatten_field_strategy("detail", FlattenStrategy::Prefixed)],
+            &Format::Parquet,
+        )
+        .unwrap();
+        assert_eq!(col_names(&out), vec!["id", "alpha_amount", "beta_amount"]);
+    }
+
+    /// `discriminant` keeps the superset names and appends a `<field>_case` tag column naming
+    /// the active case per row.
+    #[test]
+    fn flatten_union_discriminant_appends_case_tag() {
+        let out = prepare_output_batch(
+            &flatten_union_batch(),
+            &[flatten_field_strategy(
+                "detail",
+                FlattenStrategy::Discriminant,
+            )],
+            &Format::Parquet,
+        )
+        .unwrap();
+        assert_eq!(col_names(&out), vec!["id", "a", "b", "detail_case"]);
+        let tag = out.column_by_name("detail_case").unwrap();
+        let tag = tag.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(tag.value(0), "alpha");
+        assert_eq!(tag.value(1), "beta");
+    }
+
+    /// JSON/JSONL ignore the strategy — per-row keys use raw names regardless of `prefixed`.
+    #[test]
+    fn flatten_union_jsonl_ignores_strategy() {
+        let out = prepare_output_batch(
+            &flatten_union_collision_batch(),
+            &[flatten_field_strategy("detail", FlattenStrategy::Prefixed)],
+            &Format::Jsonl,
+        )
+        .unwrap();
+        // Raw (un-prefixed) names; the two `amount` columns coexist (one fires per row).
+        assert_eq!(col_names(&out), vec!["id", "amount", "amount"]);
+    }
 }

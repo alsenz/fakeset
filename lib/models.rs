@@ -737,6 +737,12 @@ pub struct Field {
     /// ref or specialise tainted fields (see §Specialisation restrictions in specs/IMPORT.md).
     #[serde(skip)]
     pub imported_taint: bool,
+    /// When true, this is a **constraint-bearing variant** (`ref` + its *own* `variants`) that the
+    /// lower-cover planner lowers into case-members. Set by `expand_field_variants` (the only point
+    /// where the user-written `variants` are still distinguishable from a parent carrier later
+    /// copied onto a plain ref by `resolve_refs`). Never present in YAML.
+    #[serde(skip)]
+    pub constraint_bearing: bool,
     /// Number of items per row for `list` type fields. Ignored on all other field types.
     pub count: Option<CountSpec>,
     /// Decimal precision for `number` fields. Positive = decimal places; negative = round by
@@ -952,8 +958,8 @@ pub struct Include {
     pub reinforcement: Option<f64>,
     /// Cross-list sampling scope for list-link draws. `links:` only.
     /// `0` = non-overlapping: each staging row draws from an exclusive shard of the eligible
-    ///       linked pool (the shard is determined by the staging row's index); `1` or absent =
-    ///       unrestricted (all staging rows draw from the full eligible pool); `> 1` = power-law
+    ///       linked rows (the shard is determined by the staging row's index); `1` or absent =
+    ///       unrestricted (all staging rows draw from the full set of eligible linked rows); `> 1` = power-law
     ///       preferential weighting (lower-indexed linked rows are progressively more likely to
     ///       be drawn across all staging rows, producing cross-list clumping).
     /// Values in the open interval `(0, 1)` are invalid.
@@ -969,26 +975,8 @@ pub struct Include {
     pub exclude: Option<Vec<String>>,
 }
 
-/// One combination of the **case-3** cross-product (`ref` + `variants` fields — VAR-SPECIALIZE).
-/// *Not* user input: `expand_field_variants` builds these from a dataset's case-3 fields, and
-/// `plan::lower_member_variants` turns each into a ref-bound, value-pinned case-member. (The
-/// retired top-level `variants:` key once deserialised here directly; it is now rejected at
-/// validation — VAR-UNIFY U4.)
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct VariantSchema {
-    /// Field deltas overlaid on the dataset's base `data` for this combination.
-    /// Same-named base fields are replaced; new names are appended.
-    #[serde(default)]
-    pub data: Schema,
-    /// Locale override for this combination's fields. Falls back to the dataset-level locale.
-    pub locale: Option<Locale>,
-    /// Fraction of the parent dataset's rows this combination receives (product of its cases'
-    /// ratios). Combinations without a ratio share the remainder equally.
-    #[serde(alias = "distribution")]
-    pub ratio: Option<f64>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyntheticDataset {
     pub name: String,
     pub format: Format,
@@ -1021,12 +1009,6 @@ pub struct SyntheticDataset {
     pub links: Vec<Include>,
     #[serde(default)]
     pub data: Schema,
-    /// **Internal** case-3 lowering artifact — see [`VariantSchema`]. Always empty as loaded
-    /// from YAML (top-level `variants:` is rejected at validation, VAR-UNIFY U4); populated by
-    /// `expand_field_variants` with the cross-product of the dataset's `ref` + `variants`
-    /// (case-3) fields, then consumed by `plan::lower_member_variants`.
-    #[serde(default)]
-    pub variants: Vec<VariantSchema>,
 }
 
 impl SyntheticDataset {
