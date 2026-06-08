@@ -125,6 +125,7 @@ fn main() {
             f("constrain_cases", "CaseDelta[]?",   false, "On a field that refs a parent variant: tighten named cases' value-sources (value/generator/range) without dropping any. Each entry names a parent case (VAR-SPECIALIZE)."),
             f("fields",      "Field[]",          false, "Nested fields for object type."),
             f("content",     "ListContent?",     false, "Element spec for list type."),
+            f("normalize",   "Normalize?",       false, "Within-list numeric normalisation (LIST-NORM): rescale a numeric quantity so each list sums to a target total. Valid on any list-producing field (type: list or a list-valued expression). Desugars to an array_normalize/array_normalize_field expression."),
             f("variants",    "FieldVariant[]",   false, "Alternatives for type: variant fields."),
             f("parquet",     "ParquetConfig?",   false, "Arrow/Parquet type override."),
             f("flatten",     "boolean",          false, "Output-only (VAR-UNIFY): elide this field's nesting at write time, pulling its sub-columns up to the parent level. Valid on object and variant fields; requires a name. Object → its fields pull up; variant → the active case's fields pull up (JSON per-row keys; Parquet nullable superset)."),
@@ -138,6 +139,17 @@ fn main() {
             f("after",       "string?",          false, "Lower bound for date / date_time generation. Format: YYYY-MM-DD for date, RFC 3339 for date_time. Must precede before if both set."),
             f("before",      "string?",          false, "Upper bound for date / date_time generation. See after."),
             f("args",        "map?",             false, "Generator-specific arguments. Valid keys: sentence/paragraph/words/sentences/paragraphs/password → min, max (integer); geohash → precision (1–12); number_with_format → format (string); boolean (no generator required) → ratio (0–100, percent-true)."),
+        ]),
+        variants: None,
+    });
+
+    types.insert("Normalize".into(), TypeDoc {
+        description: "Within-list numeric normalisation (LIST-NORM). Rescales a numeric quantity so each list window sums to total. The integer-vs-float output is chosen by precision (or the source field's type) — not by whether total is written 100 or 100.0.".into(),
+        fields: Some(vec![
+            f("total",     "number",   true,  "Per-list sum target (> 0)."),
+            f("field",     "string?",  false, "Numeric sub-field to rescale for a list of structs. Omit for a bare list of numbers."),
+            f("into",      "string?",  false, "Write the rescaled result to this NEW sub-field instead of overwriting field — keeps the raw value alongside the derived one."),
+            f("precision", "integer?", false, "Force the output element type: 0 → integer (exact sum via largest-remainder); > 0 → float. Absent inherits the source field's type."),
         ]),
         variants: None,
     });
@@ -193,7 +205,7 @@ fn main() {
         description: "Element spec for a list field. When from: is set, activates the witness/assembly pipeline.".into(),
         fields: Some(vec![
             f("from",    "string?",  false, "Names the link ref (from links:) from which items are drawn."),
-            f("project", "string?",  false, "Project a single linked field as a scalar list. Mutually exclusive with explicit fields."),
+            f("project", "string?",  false, "Project a single field as a scalar list. Dotted '<link_ref>.<field>' projects from the linked dataset (mutually exclusive with fields); bare '<identifier>' projects a scalar field from fields (requires fields)."),
         ]),
         variants: None,
     });

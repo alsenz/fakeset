@@ -838,6 +838,10 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     if field.imported_taint {
         return Ok(());
     }
+    // `normalize:` is validated in its declarative form here — before `desugar_normalize`
+    // rewrites it into a hidden source + injected expression (LIST-NORM). Valid on both
+    // `type: list` and list-valued `expression` fields, so check it before the early returns.
+    validate_normalize(path, field)?;
     // Expression fields are fully self-contained: no type, ref, or generation constraints.
     if field.expression.is_some() {
         return validate_expression_field(path, field);
@@ -878,13 +882,78 @@ fn validate_field(path: &str, field: &Field, warnings: &mut Vec<String>) -> Resu
     validate_typed_field(path, field, field_type, warnings)
 }
 
-/// An `expression` field carries no type/ref/generation: every other source is banned.
+/// Validate a `normalize:` block in its declarative form (LIST-NORM). Struct-element checks
+/// (`field` presence + numeric-ness, `into` collision) apply only when the element schema is
+/// statically visible — a `type: list` with explicit `content.fields`; for a list-valued
+/// `expression` the shape is unknown until runtime and is left to the UDF.
+fn validate_normalize(path: &str, field: &Field) -> Result<()> {
+    let Some(norm) = &field.normalize else {
+        return Ok(());
+    };
+    if !(norm.total > 0.0) {
+        bail!("field '{path}': `normalize.total` must be greater than 0");
+    }
+    // Must produce a list: a `list` type, or a list-valued expression.
+    match &field.field_type {
+        Some(FieldType::List) => {}
+        Some(other) => bail!("field '{path}': `normalize` is only valid on list fields, not {other}"),
+        None if field.expression.is_some() => return Ok(()),
+        None => bail!(
+            "field '{path}': `normalize` requires a `list` type or a list-valued `expression`"
+        ),
+    }
+
+    // Struct-vs-scalar element check, only when the element schema is visible.
+    // A bare `project` (PROJECT-FIELD) collapses the per-item struct to a scalar list, so it
+    // takes the scalar path even though `content.fields` is populated.
+    let item_fields = field
+        .content
+        .as_deref()
+        .filter(|c| !c.is_bare_project())
+        .map(|c| &c.item.fields)
+        .filter(|f| !f.is_empty());
+    match item_fields {
+        Some(fields) => {
+            let src = norm.field.as_ref().ok_or_else(|| {
+                anyhow!("field '{path}': `normalize.field` is required for a list of structs")
+            })?;
+            let src_field = fields.iter().find(|f| &f.name == src).ok_or_else(|| {
+                anyhow!("field '{path}': `normalize.field` '{src}' is not a sub-field of the list")
+            })?;
+            // Defer the numeric check for ref'd sub-fields (type resolved during rewrite).
+            if let Some(ft) = &src_field.field_type
+                && *ft != FieldType::Number
+            {
+                bail!("field '{path}': `normalize.field` '{src}' must be a numeric sub-field");
+            }
+            if let Some(into) = &norm.into
+                && fields.iter().any(|f| &f.name == into)
+            {
+                bail!(
+                    "field '{path}': `normalize.into` '{into}' collides with an existing sub-field"
+                );
+            }
+        }
+        None => {
+            if norm.field.is_some() {
+                bail!("field '{path}': `normalize.field` is not valid for a scalar list");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate an `expression` field. Two shapes:
+/// - **`ref` + `expression`** (EXPR-RELOCATE PR2): a *computed shared column* — `ref` is wiring
+///   (ties it to the parent/cover column it authors at the atom), `expression` is the value-source.
+///   Allowed, but subject to **one value-source per field** — no other generator/value/range.
+/// - **pure `expression`** (no `ref`): fully self-contained; every other source is banned.
 fn validate_expression_field(path: &str, field: &Field) -> Result<()> {
+    if field.simple_ref().is_some() {
+        return validate_computed_ref_field(path, field);
+    }
     if field.field_type.is_some() {
         bail!("field '{path}': `expression` cannot be combined with `type`");
-    }
-    if field.simple_ref().is_some() {
-        bail!("field '{path}': `expression` cannot be combined with `ref`");
     }
     if field.generator.is_some()
         || field
@@ -899,6 +968,45 @@ fn validate_expression_field(path: &str, field: &Field) -> Result<()> {
     }
     if !field.fields.is_empty() || field.content.is_some() {
         bail!("field '{path}': `expression` cannot be combined with `fields` or `content`");
+    }
+    Ok(())
+}
+
+/// A `ref` + `expression` field (EXPR-RELOCATE PR2): the expression authors the shared/ref'd
+/// column at the atom; `ref` is only wiring. Enforce **one value-source** — the expression is it,
+/// so no other generator/value/one_of/range/variants/nested-schema may ride alongside. `type` is
+/// owned by the ref target, so it may not be declared here either.
+fn validate_computed_ref_field(path: &str, field: &Field) -> Result<()> {
+    if field.field_type.is_some() {
+        bail!(
+            "field '{path}': `ref` + `expression` cannot also declare `type` — the ref target provides the type"
+        );
+    }
+    if field.generator.is_some()
+        || field
+            .range
+            .as_ref()
+            .is_some_and(|r| r.min.is_some() || r.max.is_some())
+    {
+        bail!(
+            "field '{path}': `ref` + `expression` cannot also carry `generator` or `range` — the expression is the sole value-source"
+        );
+    }
+    if field.value.is_some() {
+        bail!(
+            "field '{path}': `ref` + `expression` cannot also carry `value` — the expression is the sole value-source"
+        );
+    }
+    if field.one_of.is_some() {
+        bail!(
+            "field '{path}': `ref` + `expression` cannot also carry `one_of` — the expression is the sole value-source"
+        );
+    }
+    if !field.variants.is_empty() {
+        bail!("field '{path}': `ref` + `expression` cannot be combined with `variants`");
+    }
+    if !field.fields.is_empty() || field.content.is_some() {
+        bail!("field '{path}': `ref` + `expression` cannot be combined with `fields` or `content`");
     }
     Ok(())
 }
@@ -1572,11 +1680,28 @@ fn validate_include_fields(
     }
 }
 
-/// Validate the `project:` directive on a link-content block.
+/// True when a list-content field projects to a scalar (number/string/bool/date) — i.e. is
+/// not itself a struct (`object`), list, or variant/union. Ref fields whose type is not yet
+/// resolved are treated as scalar (the conservative, common case).
+fn is_scalar_content_field(f: &Field) -> bool {
+    use crate::models::FieldType;
+    if !f.fields.is_empty() || f.content.is_some() || !f.variants.is_empty() {
+        return false;
+    }
+    !matches!(
+        f.field_type,
+        Some(FieldType::Object | FieldType::List | FieldType::Variant | FieldType::Union)
+    )
+}
+
+/// Validate the `project:` directive on a link-content block. Two syntactic forms
+/// (PROJECT-FIELD):
 ///
-/// - `project` and explicit `content.fields` are mutually exclusive.
-/// - The ref part of `project` must match the link's reference.
-/// - The field part must exist in the link's target dataset.
+/// - **dotted** `<link_ref>.<field>` — project a field straight from the linked dataset. The
+///   ref part must match the link's reference; the field part must exist in the linked dataset;
+///   mutually exclusive with explicit `content.fields`.
+/// - **bare** `<identifier>` — project a field defined in `content.fields`. *Requires* `fields`;
+///   the identifier must name a present field; that field must be scalar.
 fn validate_project(
     content: &crate::models::ListContent,
     link: &Include,
@@ -1588,6 +1713,28 @@ fn validate_project(
         return Ok(());
     };
 
+    // Bare form: project a field defined in `content.fields`.
+    if content.is_bare_project() {
+        let Some(target) = content.item.fields.iter().find(|f| &f.name == proj) else {
+            bail!(
+                "field '{}': `project: {}` — bare `project` must name a field present in `fields` \
+                 (use `<link_ref>.<field>` to project straight from the linked dataset)",
+                content_path,
+                proj
+            );
+        };
+        if !is_scalar_content_field(target) {
+            bail!(
+                "field '{}': `project: {}` — projected field must be scalar (number/string/bool), \
+                 not a struct/list/variant",
+                content_path,
+                proj
+            );
+        }
+        return Ok(());
+    }
+
+    // Dotted form: project straight from the linked dataset; mutually exclusive with `fields`.
     if !content.item.fields.is_empty() {
         bail!(
             "field '{}': `project` and `fields` are mutually exclusive — remove `fields` when using `project`",
@@ -2100,5 +2247,107 @@ mod import_taint_tests {
         );
         // "suffix" is NOT in the taint set.
         assert!(check_child_against_taint(&child, &inc, &taint(&["symbol"])).is_ok());
+    }
+
+    // ── normalize: validation (LIST-NORM) ──────────────────────────────────
+
+    fn norm_field(yaml: &str) -> Field {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    fn norm_err(yaml: &str) -> String {
+        validate_normalize("ds.f", &norm_field(yaml))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn normalize_struct_list_into_is_valid() {
+        let f = norm_field(
+            r#"
+name: shareholders
+type: list
+normalize: { field: stake, into: pct, total: 100, precision: 0 }
+content: { from: sub, fields: [ { name: stake, type: number } ] }
+"#,
+        );
+        assert!(validate_normalize("ds.f", &f).is_ok());
+    }
+
+    #[test]
+    fn normalize_total_must_be_positive() {
+        let err = norm_err(
+            r#"
+name: w
+type: list
+normalize: { field: stake, total: 0 }
+content: { from: sub, fields: [ { name: stake, type: number } ] }
+"#,
+        );
+        assert!(err.contains("`normalize.total` must be greater than 0"), "{err}");
+    }
+
+    #[test]
+    fn normalize_on_scalar_field_rejected() {
+        let err = norm_err(
+            r#"
+name: w
+type: string
+normalize: { total: 100 }
+"#,
+        );
+        assert!(err.contains("only valid on list fields"), "{err}");
+    }
+
+    #[test]
+    fn normalize_struct_list_requires_field() {
+        let err = norm_err(
+            r#"
+name: w
+type: list
+normalize: { total: 100 }
+content: { from: sub, fields: [ { name: stake, type: number } ] }
+"#,
+        );
+        assert!(err.contains("`normalize.field` is required"), "{err}");
+    }
+
+    #[test]
+    fn normalize_field_must_be_numeric() {
+        let err = norm_err(
+            r#"
+name: w
+type: list
+normalize: { field: label, total: 100 }
+content: { from: sub, fields: [ { name: label, type: string } ] }
+"#,
+        );
+        assert!(err.contains("must be a numeric sub-field"), "{err}");
+    }
+
+    #[test]
+    fn normalize_into_collision_rejected() {
+        let err = norm_err(
+            r#"
+name: w
+type: list
+normalize: { field: stake, into: stake, total: 100 }
+content: { from: sub, fields: [ { name: stake, type: number } ] }
+"#,
+        );
+        assert!(err.contains("collides with an existing sub-field"), "{err}");
+    }
+
+    #[test]
+    fn normalize_list_valued_expression_defers_shape_checks() {
+        // A list-valued expression has unknown element shape statically — only total>0 is checked.
+        let f = norm_field(
+            r#"
+name: weights
+expression: "some_list_expr()"
+normalize: { total: 1.0 }
+"#,
+        );
+        assert!(validate_normalize("ds.f", &f).is_ok());
     }
 }

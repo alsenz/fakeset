@@ -1,0 +1,17 @@
+name: scores
+format: jsonl
+output_file: scores
+rows: 30
+data:
+  - name: base
+    type: number
+    range: { min: 1, max: 9 }
+    precision: 0
+  - name: weight
+    type: number
+    range: { min: 1, max: 5 }
+    precision: 0
+  # Declared range [0, 40] is too tight: base*weight can reach 45 — must error.
+  - name: score
+    type: number
+    range: { min: 0, max: 40 }

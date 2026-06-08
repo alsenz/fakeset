@@ -33,9 +33,9 @@ Output is written to `./output/corporate-registry/`:
 ## Dataset structure
 
 ```
-individuals (1 000 rows)
+individuals (5 000 rows)
   ├── directors          — 30% of individuals; role pinned to "director"
-  └── organisations (100 rows, links individuals → directors list)
+  └── organisations (500 rows, links individuals → directors + shareholders lists)
         └── smes         — 99% of organisations
               ├── micro_enterprises   — 95% of SMEs; 1–9 employees
               ├── small_enterprises   — 4.3% of SMEs; 10–49 employees
@@ -124,3 +124,31 @@ The `ratio:` on a `links:` stanza controls what fraction of the linked dataset i
 places the eligible rows first). This is independent of `cardinality:`, which controls
 how many items each outer row draws.
 </Aside>
+
+### Normalised ownership stakes (UBO)
+
+`organisations` also embeds a `shareholders` list — a second link to `individuals` —
+where each shareholder carries a raw `shareholding` and a derived `ownership_pc`. The
+`normalize:` key rescales the per-company stakes so every company's `ownership_pc` sums
+to **exactly 100**:
+
+```yaml title="organisations.yaml"
+  - name: shareholders
+    type: list
+    normalize: { field: shareholding, into: ownership_pc, total: 100, precision: 0 }
+    content:
+      from: shareholder
+      fields:
+        - name: name
+          ref: shareholder.full_name
+        - name: shareholding
+          type: number
+          range: { min: 1000, max: 5000000 }
+          precision: 0
+```
+
+Each item becomes `{name, shareholding, ownership_pc}` — `into:` keeps the raw holding
+alongside the derived percentage, and `precision: 0` makes the percentages whole numbers
+summing to exactly 100 (largest-remainder rounding). See the
+[Expression Language reference](/reference/expressions/#fakeset-list-helpers) for the
+underlying `array_normalize_field` UDF.

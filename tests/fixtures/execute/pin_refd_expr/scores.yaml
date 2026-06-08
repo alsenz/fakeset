@@ -1,0 +1,17 @@
+name: scores
+format: jsonl
+output_file: scores
+rows: 40
+data:
+  - name: base
+    type: number
+    range: { min: 1, max: 9 }
+    precision: 0
+  - name: weight
+    type: number
+    range: { min: 1, max: 5 }
+    precision: 0
+  # Placeholder shared column — authored at the atom by the child's ref+expression below
+  # (EXPR-RELOCATE PR2), then projected up here.
+  - name: score
+    type: number

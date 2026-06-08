@@ -312,6 +312,7 @@ Defines one column in a dataset's schema.
 | `constrain_cases` | `CaseDelta[]` | — | On a field that `ref`s a parent variant: tighten named cases' value-sources (`value` / `generator` / `range`) without dropping any. Each entry is `{ name: <parent case>, … }`. Non-restrictive (cf. `one_of`, which drops cases). |
 | `fields` | [`Field[]`](#field) | — | Nested fields for `object` type. |
 | `content` | [`ListContent`](#listcontent) | — | Element spec for `list` type. |
+| `normalize` | [`Normalize`](#normalize) | — | Within-list numeric normalisation (rescale a numeric quantity so each list sums to a target). Valid on any list-producing field. See [Normalize](#normalize). |
 | `variants` | [`FieldVariant[]`](#fieldvariant) | — | Alternatives for `type: variant` fields. |
 | `parquet` | [`ParquetConfig`](#parquetconfig) | — | Arrow/Parquet type override. Overrides the default Arrow type inferred from `type`. |
 | `flatten` | boolean | — | Output-only. Elide this field's nesting at write time, pulling its sub-columns up to the parent level (serde `#[serde(flatten)]` analogue). Valid only on `object` and `variant` fields; requires a `name`. See [Flatten](#flatten) below. |
@@ -501,7 +502,7 @@ Specifies the element type for a `list` field.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `from` | string | — | When set, names the link ref (from `links:`) from which items are drawn. Activates the witness/assembly pipeline. |
-| `project` | string | — | Project a single field from the linked dataset, producing a scalar list. Value: `"<link_ref>.<field_name>"`. Mutually exclusive with explicit `fields` in the item spec. |
+| `project` | string | — | Project a single field to a scalar list. **Dotted** `"<link_ref>.<field>"` projects straight from the linked dataset (mutually exclusive with `fields`); **bare** `"<identifier>"` projects a scalar field defined in `fields` (requires `fields`). |
 | *(item fields)* | *(Field fields)* | — | All `Field` properties apply to the list item spec (`type`, `generator`, `fields`, etc.). When `from:` is set, `fields:` describes the struct fields of each list item. |
 
 ### Example — scalar list
@@ -532,6 +533,43 @@ Specifies the element type for a `list` field.
         type: string
         refs: [ company_name ]   # outer-scoped ref
 ```
+
+---
+
+## Normalize
+
+Within-list numeric normalisation (LIST-NORM). Attach `normalize:` to any list-producing field
+(`type: list` or a list-valued `expression`) to rescale a numeric quantity so each list sums to
+`total` — ownership stakes, portfolio weights, budget splits, vote shares. It desugars to the
+[`array_normalize` / `array_normalize_field`](/reference/expressions/#fakeset-list-helpers)
+expression UDFs.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `total` | number | ✓ | Per-list sum target (`> 0`). |
+| `field` | string | — | Numeric sub-field to rescale for a list of structs. Omit for a bare list of numbers. |
+| `into` | string | — | Write the rescaled result to this **new** sub-field instead of overwriting `field` — keeps the raw value alongside the derived one. |
+| `precision` | integer | — | Force the output element type: `0` → integer (exact sum via largest-remainder); `> 0` → float. Absent inherits the source field's type. |
+
+The integer-vs-float choice comes from `precision` (or the source field's type) — **not** from
+whether `total` is written `100` or `100.0`. A `type: number` field is a float, so add
+`precision: 0` when you want whole-number percentages summing to exactly 100.
+
+### Example — shareholdings summing to exactly 100
+
+```yaml
+- name: shareholders
+  type: list
+  normalize: { field: shareholding, into: ownership_pc, total: 100, precision: 0 }
+  content:
+    from: subsidiary
+    fields:
+      - { name: name,         ref: subsidiary.company_name }
+      - { name: shareholding, type: number, range: { min: 1000, max: 5000000 } }
+```
+
+Each item becomes `{name, shareholding, ownership_pc}` — the raw holding **and** its within-company
+percentage, with the percentages summing to exactly 100.
 
 ---
 

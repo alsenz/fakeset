@@ -37,8 +37,9 @@ use crate::constraints::FieldConstraints;
 use crate::dq::apply_data_quality;
 use crate::generator::{generate_column, sample_count};
 use crate::import::{ImportIndex, filter_ring, load_import_index, resolve_import_path};
+use crate::expressions::extract_identifiers;
 use crate::models::{
-    CountSpec, Field, Format, Include, Range, Reducer, RingBounds, Schema, SeedConfig,
+    CountSpec, Field, FieldType, Format, Include, Range, Reducer, RingBounds, Schema, SeedConfig,
     SyntheticDataset, eligible_linked_rows, resolve_include, split_ref,
 };
 use crate::output::{filter_hidden_columns, write_output};
@@ -403,8 +404,12 @@ async fn execute_dataset_core(
         generate_batch(&dataset.data, rows, &inherited_map, &HashMap::new())?
     };
     if is_staging {
-        // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
-        // expressions, and emits.
+        // Scalar-only intermediate; AssembleFromWitness adds list columns and evaluates
+        // assembly-tier expressions before emit. Staging-tier expressions (scalar-only
+        // deps) are evaluated here so they exist in the staging batch and are usable as
+        // outer-scoped refs in list content (EXPR-RELOCATE PR1).
+        let (staging_exprs, _) = classify_expression_placement(dataset);
+        let batch = evaluate_expression_fields(batch, &staging_exprs).await?;
         computed.insert(path.to_path_buf(), batch);
     } else {
         // Evaluate expressions for both normal emit and collect-target deferral.
@@ -514,7 +519,8 @@ async fn execute_lower_cover_group_core(
                     opt_import_batch.as_ref(),
                     computed,
                     parent_computed,
-                )?;
+                )
+                .await?;
 
                 // Project each member from the atom batch (order does not matter —
                 // the atom is already final).
@@ -550,8 +556,11 @@ async fn execute_lower_cover_group_core(
         .await?;
 
     if is_staging {
-        // Scalar-only intermediate; AssembleFromWitness adds list columns, evaluates
-        // expressions, and emits.
+        // Scalar-only intermediate; AssembleFromWitness adds list columns and evaluates
+        // assembly-tier expressions before emit. Staging-tier expressions are evaluated
+        // here so they are usable as outer-scoped refs in list content (EXPR-RELOCATE PR1).
+        let (staging_exprs, _) = classify_expression_placement(dataset);
+        let parent_shuffled = evaluate_expression_fields(parent_shuffled, &staging_exprs).await?;
         computed.insert(path.to_path_buf(), parent_shuffled);
     } else {
         let parent_shuffled = evaluate_expressions(parent_shuffled, dataset).await?;
@@ -1230,7 +1239,10 @@ async fn execute_assemble_from_witness(
         batch = add_column(batch, list_arrow_field, list_col)?;
     }
 
-    let batch = evaluate_expressions(batch, dataset).await?;
+    // Assembly-tier expressions (list-dependent) evaluate here, after the list-fold.
+    // Staging-tier ones were already evaluated into the staging batch (EXPR-RELOCATE PR1).
+    let (_, assembly_exprs) = classify_expression_placement(dataset);
+    let batch = evaluate_expression_fields(batch, &assembly_exprs).await?;
     let output = filter_hidden_columns(batch.clone(), &dataset.data)?;
     computed.insert(staging_path.clone(), batch);
     emit_batch(output, dataset, shared)?;
@@ -1706,7 +1718,7 @@ fn build_segment_atom_schema(
     parent_schema: &Schema,
     members: &[&LowerCoverMember],
     seg_constraints: &HashMap<String, FieldConstraints>,
-) -> (Vec<Field>, HashMap<String, Vec<usize>>) {
+) -> Result<(Vec<Field>, HashMap<String, Vec<usize>>)> {
     let per_member_refs: Vec<HashMap<String, String>> = members
         .iter()
         .map(|m| member_ref_to_parent_map(m))
@@ -1727,14 +1739,50 @@ fn build_segment_atom_schema(
         if providers.is_empty() {
             continue;
         }
-        let entry = seg_constraints
+        let mut entry = seg_constraints
             .get(&pf.name)
             .map(|fc| apply_constraints(pf, fc))
             .unwrap_or_else(|| pf.clone());
+
+        // EXPR-RELOCATE PR2: a providing member field may carry an `expression`, making this a
+        // *computed shared column* authored at the atom (then projected up). Surface that
+        // expression onto the atom entry. One value-source per shared column → at most one.
+        let mut member_exprs: Vec<(String, String)> = Vec::new();
+        for &mi in &providers {
+            let m = members[mi];
+            let prefix = format!("{}.", m.reference);
+            for f in &m.dataset.data {
+                if f.simple_ref()
+                    .and_then(|rs| rs.strip_prefix(prefix.as_str()))
+                    == Some(pf.name.as_str())
+                    && let Some(expr) = &f.expression
+                {
+                    member_exprs.push((m.dataset.name.clone(), expr.clone()));
+                }
+            }
+        }
+        if member_exprs.len() > 1 {
+            let who: Vec<&str> = member_exprs.iter().map(|(n, _)| n.as_str()).collect();
+            bail!(
+                "shared column '{}': {} members declare an `expression` for it ({}) — \
+                 at most one value-source per shared column",
+                pf.name,
+                member_exprs.len(),
+                who.join(", "),
+            );
+        }
+        if let Some((_, expr)) = member_exprs.into_iter().next() {
+            // A restriction on a computed shared column is reconciled soundly at plan time
+            // (EXPR-RELOCATE PR3 — `segment::reconcile`): contained → keep, disjoint → prune,
+            // partial/underivable → error. By the time we author here, the segment survived, so
+            // the restriction is satisfied and the expression is the value-source.
+            entry.expression = Some(expr);
+        }
+
         atom_fields.push(entry);
         providing_members.insert(pf.name.clone(), providers);
     }
-    (atom_fields, providing_members)
+    Ok((atom_fields, providing_members))
 }
 
 /// Effective output field list for a member. A lower-cover member reaching the executor is already
@@ -1771,7 +1819,10 @@ fn member_ref_to_parent_map(m: &LowerCoverMember) -> HashMap<String, String> {
 ///
 /// When `members` provide no parent-ref columns, returns a zero-column batch with
 /// `n_rows` rows (callers that index columns will simply produce empty selections).
-fn generate_segment_atom_batch(
+/// 4. Computed (EXPR-RELOCATE PR2): an atom field carrying an `expression` (surfaced from a
+///    member's `ref` + `expression`) is evaluated over the already-materialised shared columns,
+///    then projected up unchanged — authoring a ref'd column at the atom.
+async fn generate_segment_atom_batch(
     parent_schema: &Schema,
     members: &[&LowerCoverMember],
     n_rows: usize,
@@ -1781,7 +1832,7 @@ fn generate_segment_atom_batch(
     parent_computed: &HashSet<PathBuf>,
 ) -> Result<RecordBatch> {
     let (atom_fields, providing_members) =
-        build_segment_atom_schema(parent_schema, members, seg_constraints);
+        build_segment_atom_schema(parent_schema, members, seg_constraints)?;
 
     if atom_fields.is_empty() {
         let opts = RecordBatchOptions::new().with_row_count(Some(n_rows));
@@ -1792,11 +1843,15 @@ fn generate_segment_atom_batch(
         )?);
     }
 
-    let arrow_fields: Vec<ArrowField> = atom_fields.iter().map(field_to_arrow).collect();
-    let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
-    let mut cols: Vec<ArrayRef> = Vec::with_capacity(atom_fields.len());
+    // Pass 1: non-computed shared columns via import → precomputed → fresh. Computed columns
+    // (those carrying an `expression`) are deferred to pass 2 so their inputs exist first.
+    let mut arrow_fields: Vec<ArrowField> = Vec::new();
+    let mut cols: Vec<ArrayRef> = Vec::new();
 
     for atom_f in &atom_fields {
+        if atom_f.expression.is_some() {
+            continue;
+        }
         let parent_f = parent_schema
             .iter()
             .find(|f| f.name == atom_f.name)
@@ -1807,6 +1862,7 @@ fn generate_segment_atom_batch(
             && let Some(ib) = opt_import_batch
             && let Ok(idx) = ib.schema().index_of(&atom_f.name)
         {
+            arrow_fields.push(field_to_arrow(atom_f));
             cols.push(ib.column(idx).clone());
             continue;
         }
@@ -1846,15 +1902,129 @@ fn generate_segment_atom_batch(
             break;
         }
         if let Some(col) = taken {
+            arrow_fields.push(field_to_arrow(atom_f));
             cols.push(col);
             continue;
         }
 
         // (3) Fresh generate.
+        arrow_fields.push(field_to_arrow(atom_f));
         cols.push(generate_column(atom_f, n_rows, &[])?);
     }
 
-    Ok(RecordBatch::try_new(arrow_schema, cols)?)
+    let partial = RecordBatch::try_new_with_options(
+        Arc::new(ArrowSchema::new(arrow_fields)),
+        cols,
+        &RecordBatchOptions::new().with_row_count(Some(n_rows)),
+    )?;
+
+    // Pass 2: computed shared columns. Their result types fall out of evaluation (PR2a has no
+    // static typing yet). Inputs are limited to the shared columns already materialised above.
+    let expr_atom_fields: Vec<&Field> = atom_fields
+        .iter()
+        .filter(|f| f.expression.is_some())
+        .collect();
+    if expr_atom_fields.is_empty() {
+        return Ok(partial);
+    }
+    let partial_schema = partial.schema();
+    let present: HashSet<&str> = partial_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let parent_names: HashSet<&str> = parent_schema.iter().map(|f| f.name.as_str()).collect();
+    for ef in &expr_atom_fields {
+        let expr = ef.expression.as_ref().unwrap();
+        for id in extract_identifiers(expr) {
+            if parent_names.contains(id) && !present.contains(id) {
+                bail!(
+                    "computed shared column '{}': expression references '{id}', which is not a \
+                     shared (ref'd) column available at the atom — only shared columns may feed a \
+                     computed shared column",
+                    ef.name,
+                );
+            }
+        }
+    }
+
+    // Static type inference (EXPR-RELOCATE PR2b): the computed column's inferred output type must
+    // be compatible with the shared column's declared `type`. Catch genuine mismatches up front
+    // with a clear message, before evaluation and before the Arrow projection would fail cryptically.
+    let inferred =
+        crate::expr_analysis::infer_expression_types(partial_schema.as_ref(), &expr_atom_fields)
+            .await?;
+    let mut declared_types: Vec<DataType> = Vec::with_capacity(expr_atom_fields.len());
+    for (ef, inf) in expr_atom_fields.iter().zip(&inferred) {
+        let parent_f = parent_schema
+            .iter()
+            .find(|f| f.name == ef.name)
+            .expect("computed atom field name is a parent field");
+        let declared = field_to_arrow(parent_f).data_type().clone();
+        if !types_compatible(&declared, inf) {
+            bail!(
+                "computed shared column '{}': expression yields type {inf:?}, incompatible with \
+                 its declared type {declared:?} — declare a matching `type` on the shared column",
+                ef.name,
+            );
+        }
+        declared_types.push(declared);
+    }
+
+    let atom = evaluate_expression_fields(partial, &expr_atom_fields).await?;
+    // Cast each computed column to its declared type (e.g. an Int64 result into a `number`'s
+    // Float64) so projection up to the parent — whose schema is built from declared types — is exact.
+    cast_computed_columns(atom, &expr_atom_fields, &declared_types)
+}
+
+/// Two Arrow types are compatible as a *computed shared column* vs its *declared* type when they
+/// are equal or in the same family (numeric↔numeric, string↔string). Same-family differences
+/// (e.g. `Int64` result for a `number`/`Float64` column, `Utf8View` for `Utf8`) are reconciled by
+/// a cast; cross-family (e.g. a numeric result for a `string` column) is a genuine modelling error.
+fn types_compatible(declared: &DataType, inferred: &DataType) -> bool {
+    if declared == inferred {
+        return true;
+    }
+    let stringy =
+        |d: &DataType| matches!(d, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    (declared.is_numeric() && inferred.is_numeric()) || (stringy(declared) && stringy(inferred))
+}
+
+/// Cast the named computed columns of `batch` to their declared Arrow types, leaving all other
+/// columns untouched. A failed cast is a genuine type mismatch surfaced as a clear error.
+fn cast_computed_columns(
+    batch: RecordBatch,
+    expr_fields: &[&Field],
+    declared: &[DataType],
+) -> Result<RecordBatch> {
+    let want: HashMap<&str, &DataType> = expr_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .zip(declared.iter())
+        .collect();
+    let schema = batch.schema();
+    let mut fields: Vec<ArrowField> = Vec::with_capacity(batch.num_columns());
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (f, c) in schema.fields().iter().zip(batch.columns()) {
+        match want.get(f.name().as_str()) {
+            Some(&target) if f.data_type() != target => {
+                let casted = arrow::compute::cast(c, target).map_err(|e| {
+                    anyhow!(
+                        "computed shared column '{}': cannot cast result {:?} to declared {target:?}: {e}",
+                        f.name(),
+                        f.data_type(),
+                    )
+                })?;
+                fields.push(ArrowField::new(f.name(), target.clone(), true));
+                cols.push(casted);
+            }
+            _ => {
+                fields.push(f.as_ref().clone());
+                cols.push(c.clone());
+            }
+        }
+    }
+    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?)
 }
 
 /// Adjust a precomputed column to length `target_n`:
@@ -2416,6 +2586,44 @@ fn add_column(batch: RecordBatch, field: ArrowField, col: ArrayRef) -> Result<Re
 /// Evaluate all expression fields against the batch, building a CTE chain in
 /// YAML order so each step can reference expression columns defined above it.
 /// Returns the original batch augmented with new expression columns appended.
+/// True when a field materialises a list column (a `type: list` field or a list-link).
+/// Expression fields are excluded — their list-ness is decided transitively by deps.
+fn is_list_producing(field: &Field) -> bool {
+    field.expression.is_none()
+        && (matches!(field.field_type, Some(FieldType::List)) || field.content.is_some())
+}
+
+/// Partition a dataset's expression fields into staging-tier and assembly-tier, preserving
+/// YAML (`data`) order in each so the per-tier CTE chains keep dependency order. A single
+/// forward pass suffices because expression deps point upward (`validate_expression_order`).
+fn classify_expression_placement(dataset: &SyntheticDataset) -> (Vec<&Field>, Vec<&Field>) {
+    let mut assembly_names: HashSet<&str> = HashSet::new();
+    let mut staging: Vec<&Field> = Vec::new();
+    let mut assembly: Vec<&Field> = Vec::new();
+
+    for field in &dataset.data {
+        if is_list_producing(field) {
+            assembly_names.insert(field.name.as_str());
+            continue;
+        }
+        let Some(expr) = &field.expression else {
+            continue;
+        };
+        let depends_on_assembly = extract_identifiers(expr)
+            .iter()
+            .any(|id| assembly_names.contains(id));
+        if depends_on_assembly {
+            assembly_names.insert(field.name.as_str());
+            assembly.push(field);
+        } else {
+            staging.push(field);
+        }
+    }
+    (staging, assembly)
+}
+
+/// Evaluate all of `dataset`'s expression fields over `batch` (used at the non-list
+/// generation/emit sites, where there is a single batch and no staging/assembly split).
 async fn evaluate_expressions(
     batch: RecordBatch,
     dataset: &SyntheticDataset,
@@ -2425,7 +2633,15 @@ async fn evaluate_expressions(
         .iter()
         .filter(|f| f.expression.is_some())
         .collect();
+    evaluate_expression_fields(batch, &expr_fields).await
+}
 
+/// Evaluate a *subset* of expression fields over `batch` via a CTE chain, in the given
+/// order. The caller selects which fields (a materialisation tier) — EXPR-RELOCATE PR1.
+async fn evaluate_expression_fields(
+    batch: RecordBatch,
+    expr_fields: &[&Field],
+) -> Result<RecordBatch> {
     if expr_fields.is_empty() {
         return Ok(batch);
     }
@@ -2433,6 +2649,7 @@ async fn evaluate_expressions(
     // Fresh context per call — table name "src" is stable and the context is dropped
     // at function exit, so there is no registration lifecycle to manage.
     let ctx = SessionContext::new();
+    crate::list_norm::register_list_udfs(&ctx);
     ctx.register_batch("src", batch)?;
 
     let mut ctes = Vec::new();
@@ -2515,6 +2732,85 @@ mod tests {
         // First two rows from the precomputed batch; the remaining three are the
         // freshly generated constant from the field definition.
         assert_eq!(read_strings(&out), vec!["a", "b", "pad", "pad", "pad"]);
+    }
+
+    // --- EXPR-RELOCATE PR1: placement classifier ---
+
+    fn dataset_with(fields: Vec<Field>) -> SyntheticDataset {
+        SyntheticDataset {
+            name: "t".into(),
+            format: Format::Parquet,
+            rows: None,
+            output: None,
+            outputs: vec![],
+            locale: None,
+            include: None,
+            import: None,
+            links: vec![],
+            data: fields,
+        }
+    }
+
+    fn number_field(name: &str) -> Field {
+        Field {
+            name: name.into(),
+            field_type: Some(FieldType::Number),
+            ..Default::default()
+        }
+    }
+
+    fn list_field(name: &str) -> Field {
+        Field {
+            name: name.into(),
+            field_type: Some(FieldType::List),
+            ..Default::default()
+        }
+    }
+
+    fn expr_field(name: &str, expr: &str) -> Field {
+        Field {
+            name: name.into(),
+            expression: Some(expr.into()),
+            ..Default::default()
+        }
+    }
+
+    fn names<'a>(fields: &[&'a Field]) -> Vec<&'a str> {
+        fields.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    #[test]
+    fn classify_places_scalar_only_expr_at_staging() {
+        let dataset = dataset_with(vec![number_field("base"), expr_field("derived", "base * 2")]);
+        let (staging, assembly) = classify_expression_placement(&dataset);
+        assert_eq!(names(&staging), vec!["derived"]);
+        assert!(assembly.is_empty());
+    }
+
+    #[test]
+    fn classify_places_list_dependent_exprs_at_assembly() {
+        // `total` depends on a list column; `doubled` depends transitively on `total`.
+        let dataset = dataset_with(vec![
+            list_field("items"),
+            expr_field("total", "array_sum(items)"),
+            expr_field("doubled", "total * 2"),
+        ]);
+        let (staging, assembly) = classify_expression_placement(&dataset);
+        assert!(staging.is_empty());
+        assert_eq!(names(&assembly), vec!["total", "doubled"]);
+    }
+
+    #[test]
+    fn classify_splits_mixed_exprs_by_dependency() {
+        let dataset = dataset_with(vec![
+            number_field("base"),
+            list_field("items"),
+            expr_field("scalar_expr", "base + 1"),
+            expr_field("list_expr", "array_sum(items)"),
+        ]);
+        let (staging, assembly) = classify_expression_placement(&dataset);
+        assert_eq!(names(&staging), vec!["scalar_expr"]);
+        assert_eq!(names(&assembly), vec!["list_expr"]);
     }
 }
 

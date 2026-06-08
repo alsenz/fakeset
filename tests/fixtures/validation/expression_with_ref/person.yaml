@@ -4,6 +4,9 @@ rows: 5
 data:
   - name: age
     type: number
+  # ref + expression is allowed (EXPR-RELOCATE PR2) — the expression authors the shared
+  # column at the atom. But it is a single value-source: adding `value` violates that.
   - name: adult_life
     ref: some_include.age
     expression: "age - 18"
+    value: 0

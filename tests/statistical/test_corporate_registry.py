@@ -182,6 +182,40 @@ def test_organisation_director_employer_matches_org(corporate):
 
 
 # ---------------------------------------------------------------------------
+# LIST-NORM: per-company UBO stakes sum to exactly 100 (hard invariant)
+# ---------------------------------------------------------------------------
+
+def test_shareholders_ownership_pc_sums_to_exactly_100(corporate):
+    """`normalize: { into: ownership_pc, total: 100, precision: 0 }` must produce integer
+    percentages summing to *exactly* 100 within every company's shareholder list
+    (largest-remainder rounding — CLAUDE.md invariant #5)."""
+    orgs = corporate["organisations"]
+    assert "shareholders__norm_src" not in orgs.columns, (
+        "hidden normalize source column leaked into output"
+    )
+    n_checked = 0
+    for shareholders in orgs["shareholders"].to_list():
+        if not shareholders:  # empty list → no-op
+            continue
+        n_checked += 1
+        total = sum(s["ownership_pc"] for s in shareholders)
+        assert total == 100, f"ownership_pc sums to {total}, not 100: {shareholders}"
+        # ownership_pc is an integer percentage; the raw shareholding is retained alongside it.
+        for s in shareholders:
+            assert isinstance(s["ownership_pc"], int), "ownership_pc must be integer"
+            assert s["shareholding"] >= 1000.0, "raw shareholding retained and within range"
+    _require_rows(orgs, 1, "organisations")
+    assert n_checked > 0, "no non-empty shareholder lists to check"
+
+
+def test_organisation_shareholders_cardinality(corporate):
+    """Every organisation must have 1–6 shareholders (cardinality min:1 max:6)."""
+    lengths = corporate["organisations"]["shareholders"].list.len()
+    assert (lengths >= 1).all(), f"shareholders list shorter than 1; min={lengths.min()}"
+    assert (lengths <= 6).all(), f"shareholders list longer than 6; max={lengths.max()}"
+
+
+# ---------------------------------------------------------------------------
 # Segment partition identity (exact invariant)
 #
 # micro, small, and medium are mutually exclusive lower cover members of smes

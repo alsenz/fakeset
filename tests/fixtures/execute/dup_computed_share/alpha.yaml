@@ -1,0 +1,15 @@
+name: alpha
+format: jsonl
+output_file: alpha
+include:
+  file: scores.yaml
+  ref: s
+  ratio: 0.5
+data:
+  - name: base
+    ref: s.base
+  - name: weight
+    ref: s.weight
+  - name: score
+    ref: s.score
+    expression: "base * weight"

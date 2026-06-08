@@ -173,10 +173,42 @@ The `default:` field on a collect target provides the fallback value for linked 
 that no outer row drew. For list collect targets use `default: []`.
 </Aside>
 
+### Per-edge values: list vs scalar on the linked side
+
+A field on a list *item* is a **per-edge** value — it belongs to the *pairing* of an outer
+row with a linked row, not to the linked row on its own. Because the same linked row can be
+drawn by many outer rows, it sits on many edges, each with its own item value. A cat owned by
+three owners appears on three edges.
+
+This drives what you can and can't send back to the linked dataset:
+
+- ✅ **Per-edge values flow back as a list.** `reducer: collect` gathers one entry per edge
+  into a `[]`-typed field (`default: []`), so the multiplicity has somewhere to live — three
+  owners, three entries.
+- ✅ **…or as a scalar *aggregate*.** `sum` / `max` / `min` / `take_one` collapse the per-edge
+  values into a single number. That is the *only* way a per-edge value becomes a scalar on the
+  linked row.
+- ❌ **A per-edge value cannot be a ref-pinned scalar on the linked row.** There is no single
+  value to pin (three owners → three values), and the direction is wrong: a `ref` pulls a value
+  *from* the linked dataset, whereas an item value is produced *after* the draw. Use `collect`,
+  not a ref.
+
+<Aside type="caution">
+This per-edge / per-row distinction is subtle, but it decides what is expressible. When a
+value belongs to the *pairing itself* — i.e. it depends on **both** the linked row and the
+enclosing outer row — it is intrinsically per-edge. Such a value returns to the linked dataset
+as a `collect`ed list (or an aggregate), **never** as a single pinned column. If you genuinely
+need a per-relationship attribute that is itself a first-class, referenceable value, model the
+relationship as its own dataset (an edge table) rather than as a list item.
+</Aside>
+
 ## The `project:` shorthand
 
-When you want a scalar list of a single field from the linked dataset rather than
-a list of structs, use `project:`:
+When you want a scalar list of a single field rather than a list of structs, use
+`project:`. It has two forms, distinguished by shape:
+
+**Dotted** `<link_ref>.<field>` — project a field straight from the linked dataset.
+Mutually exclusive with explicit `fields:`:
 
 ```yaml
 - name: cat_ids
@@ -186,7 +218,25 @@ a list of structs, use `project:`:
     project: cats.id   # produces List<string> instead of List<{cat_id: string, ...}>
 ```
 
-`project:` is mutually exclusive with explicit `fields:` in the `content`.
+**Bare** `<identifier>` — project a field defined in `content.fields`. Assemble the
+per-item struct as usual, then collapse it to a scalar list of the named sub-field.
+Unlike the dotted form, this *composes with* `fields:` (it requires it):
+
+```yaml
+- name: cat_ids
+  type: list
+  content:
+    from: cats
+    fields:
+      - name: id
+        ref: cats.id
+    project: id        # collapse the struct → List<string> of `id`
+```
+
+The bare field must be present in `content.fields` and must be **scalar**
+(number/string/bool) — not itself a struct or list. The bare form composes with
+[`normalize:`](/reference/expressions/#the-normalize-shorthand): `project` first yields a
+`List<number>`, then `normalize: { total }` (no `field:`) rescales it.
 
 ## Ratio filtering
 

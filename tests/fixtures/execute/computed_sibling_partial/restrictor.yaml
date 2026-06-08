@@ -1,0 +1,17 @@
+name: restrictor
+format: jsonl
+output_file: restrictor
+include:
+  file: scores.yaml
+  ref: s
+  ratio: 0.5
+data:
+  - name: base
+    ref: s.base
+  - name: weight
+    ref: s.weight
+  # Author's derived interval [1,45] only PARTIALLY overlaps [30,50] — some authored rows would
+  # violate the restriction, and a computed column can't be narrowed → hard error (PR3 unsound).
+  - name: score
+    ref: s.score
+    range: { min: 30, max: 50 }

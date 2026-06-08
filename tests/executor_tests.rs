@@ -4,6 +4,7 @@ use fakeset::{
     expressions::pull_down_expression_deps,
     graph::build_dag,
     import::load_import_headers,
+    list_norm::desugar_normalize,
     load_all_datasets,
     models::SeedConfig,
     plan::build_plan,
@@ -33,12 +34,43 @@ async fn run(fixture: &str) -> PathBuf {
         eprintln!("warn: {w}");
     }
     let datasets = expand_field_variants(datasets).expect("expand field variants");
+    let datasets = desugar_normalize(datasets).expect("desugar normalize");
     let datasets = expand_include_fields(&datasets).expect("expand include fields");
     let resolved = resolve_refs(&datasets).expect("resolve refs");
     let plan = build_plan(&dag, &resolved).expect("build plan");
     let seed_config = SeedConfig { ring: 42 };
     execute(&plan, &out, &seed_config).await.expect("execute");
     out
+}
+
+/// Run the pipeline expecting it to fail at **`build_plan` or `execute`**, returning the error
+/// message. Stages up to `resolve_refs` are still asserted to succeed (the failure under test is a
+/// planning/execution concern).
+async fn run_expect_err(fixture: &str) -> String {
+    let fixture_path = PathBuf::from(fixture);
+    let out = std::env::temp_dir().join(format!(
+        "fakeset_test_err_{}_{}",
+        fixture.replace(['/', '\\', '.'], "_"),
+        Uuid::new_v4()
+    ));
+    let mut datasets = load_all_datasets(&[fixture_path]).expect("load datasets");
+    load_import_headers(&mut datasets).expect("load import headers");
+    let dag = build_dag(&datasets).expect("build dag");
+    let datasets = pull_down_expression_deps(&datasets).expect("pull down");
+    validate(&datasets).expect("validate");
+    let datasets = expand_field_variants(datasets).expect("expand field variants");
+    let datasets = desugar_normalize(datasets).expect("desugar normalize");
+    let datasets = expand_include_fields(&datasets).expect("expand include fields");
+    let resolved = resolve_refs(&datasets).expect("resolve refs");
+    let plan = match build_plan(&dag, &resolved) {
+        Ok(plan) => plan,
+        Err(e) => return e.to_string(),
+    };
+    let seed_config = SeedConfig { ring: 42 };
+    execute(&plan, &out, &seed_config)
+        .await
+        .expect_err("build_plan or execute should fail")
+        .to_string()
 }
 
 /// Count data rows in a CSV file (total lines minus the header line).
@@ -680,6 +712,149 @@ async fn test_list_link_refs() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// EXPR-RELOCATE PR1 — a staging-computed expression as an outer-scoped ref
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_staged_expression_usable_as_outer_scoped_ref() {
+    // A scalar-only expression (`title_tag = UPPER(title) || '!'`) is now evaluated at
+    // staging, so it is in scope as an outer-scoped ref inside list content. Each
+    // attendee's `tag` must equal the enclosing event's computed `title_tag`. Before PR1,
+    // expressions were terminal (assembly-only) and this content ref could not resolve.
+    let out = run("tests/fixtures/execute/staged_expr_outer_ref").await;
+    let event_rows = jsonl_rows(&out, "events");
+    assert_eq!(event_rows.len(), 5, "events should have 5 rows");
+
+    for row in &event_rows {
+        let title = row["title"].as_str().expect("title should be a string");
+        let expected = format!("{}!", title.to_uppercase());
+
+        let row_tag = row["title_tag"]
+            .as_str()
+            .expect("title_tag should be a string");
+        assert_eq!(row_tag, expected, "row-level staged expression value");
+
+        let attendees = row["attendees"]
+            .as_array()
+            .expect("attendees should be a list");
+        assert!(!attendees.is_empty(), "every event should have attendees");
+        for attendee in attendees {
+            let tag = attendee["tag"].as_str().expect("attendee tag should be a string");
+            assert_eq!(
+                tag, expected,
+                "attendee.tag (outer-scoped ref to staged expr) should match the event's title_tag"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXPR-RELOCATE PR2 — pin a ref'd/shared column with an expression (project-up)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_pin_refd_field_with_expression_projects_up() {
+    // The child `weighted_scores` authors the shared `score` column via `ref: s.score` +
+    // `expression: base * weight`. That value is computed once at the segment atom and projected
+    // up to the parent `scores` and to the child identically. Both outputs must satisfy
+    // score == base * weight on every row.
+    let out = run("tests/fixtures/execute/pin_refd_expr").await;
+
+    let check = |rows: &[serde_json::Value], who: &str| {
+        assert!(!rows.is_empty(), "{who} should have rows");
+        for row in rows {
+            let base = row["base"].as_f64().expect("base number");
+            let weight = row["weight"].as_f64().expect("weight number");
+            let score = row["score"].as_f64().expect("score number");
+            assert!(
+                (score - base * weight).abs() < 1e-9,
+                "{who}: score ({score}) should equal base*weight ({})",
+                base * weight
+            );
+        }
+    };
+
+    let parent_rows = jsonl_rows(&out, "scores");
+    let child_rows = jsonl_rows(&out, "weighted_scores");
+    assert_eq!(parent_rows.len(), 40, "parent should have 40 rows");
+    check(&parent_rows, "scores (parent)");
+    check(&child_rows, "weighted_scores (child)");
+}
+
+#[tokio::test]
+async fn test_two_members_authoring_one_shared_column_errors() {
+    // Two lower-cover members both author the shared `scores.score` via ref+expression — two
+    // value-sources for one shared column. The atom builder must reject this.
+    let msg = run_expect_err("tests/fixtures/execute/dup_computed_share").await;
+    assert!(
+        msg.contains("value-source") && msg.contains("score"),
+        "error should flag the single value-source rule for `score`: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_computed_column_within_own_range_ok() {
+    // PR3 scenario 1: the expression's derived interval [1,45] fits the declared range [0,100].
+    let out = run("tests/fixtures/execute/computed_own_range_ok").await;
+    for row in jsonl_rows(&out, "scores") {
+        let base = row["base"].as_f64().unwrap();
+        let weight = row["weight"].as_f64().unwrap();
+        let score = row["score"].as_f64().unwrap();
+        assert!((score - base * weight).abs() < 1e-9);
+        assert!((0.0..=100.0).contains(&score));
+    }
+}
+
+#[tokio::test]
+async fn test_computed_column_exceeds_own_range_errors() {
+    // PR3 scenario 1: derived [1,45] is not contained in the declared range [0,40] → error.
+    let msg = run_expect_err("tests/fixtures/execute/computed_own_range_fail").await;
+    assert!(
+        msg.contains("score") && (msg.contains("declared range") || msg.contains("partially")),
+        "error should flag the out-of-range computed column: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_computed_column_type_mismatch_errors() {
+    // PR2b static type inference: the parent declares `score` as a string, but the child authors
+    // it with a numeric expression. The mismatch must be caught up front with a clear message.
+    let msg = run_expect_err("tests/fixtures/execute/computed_type_mismatch").await;
+    assert!(
+        msg.contains("score") && msg.contains("incompatible"),
+        "error should flag the type mismatch for `score`: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_sibling_restriction_disjoint_prunes() {
+    // PR3 scenario 2 (disjoint): author derives score ∈ [1,45]; restrictor pins score ∈ [1000,2000].
+    // The author∧restrictor segment is pruned (sound — no row can be in both); the run succeeds and
+    // each subpopulation's values stay in their own interval.
+    let out = run("tests/fixtures/execute/computed_with_restriction").await;
+    for row in jsonl_rows(&out, "author") {
+        assert!(row["score"].as_f64().unwrap() <= 45.0, "author score within derived interval");
+    }
+    for row in jsonl_rows(&out, "restrictor") {
+        assert!(
+            row["score"].as_f64().unwrap() >= 1000.0,
+            "restrictor score within its restricted interval"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sibling_restriction_partial_overlap_errors() {
+    // PR3 scenario 2 (partial): author derives [1,45]; restrictor pins [30,50] — overlapping but not
+    // contained. A computed column can't be narrowed → hard error.
+    let msg = run_expect_err("tests/fixtures/execute/computed_sibling_partial").await;
+    assert!(
+        msg.contains("score") && msg.contains("partially"),
+        "error should flag the partial-overlap as unsound: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,6 +1533,62 @@ async fn test_project_produces_scalar_list() {
                 "projected name should be non-empty"
             );
         }
+    }
+}
+
+// PROJECT-FIELD: bare `project` collapses a per-item struct (built from `content.fields`)
+// to a scalar list of the named sub-field.
+#[tokio::test]
+async fn test_bare_project_produces_scalar_list() {
+    let out = run("tests/fixtures/execute/project_bare").await;
+
+    let events = jsonl_rows(&out, "events");
+    assert_eq!(events.len(), 3, "events should have 3 rows");
+
+    for row in &events {
+        let attendees = row["attendee_names"]
+            .as_array()
+            .expect("attendee_names should be a list");
+        assert_eq!(
+            attendees.len(),
+            2,
+            "cardinality: 2 → exactly 2 attendee names per event"
+        );
+
+        for attendee in attendees {
+            // bare project: who → list items are scalar strings, not structs.
+            assert!(
+                attendee.is_string(),
+                "attendee_names items should be strings (projected), got: {attendee:?}"
+            );
+            assert!(
+                !attendee.as_str().unwrap().is_empty(),
+                "projected name should be non-empty"
+            );
+        }
+    }
+}
+
+// PROJECT-FIELD composes with LIST-NORM: bare `project` → scalar List<number>, then
+// `normalize: { total }` (no `field:`) rescales each list to the target sum.
+#[tokio::test]
+async fn test_bare_project_composes_with_normalize() {
+    let out = run("tests/fixtures/execute/project_normalize").await;
+
+    let events = jsonl_rows(&out, "events");
+    assert_eq!(events.len(), 3, "events should have 3 rows");
+
+    for row in &events {
+        let shares = row["shares"].as_array().expect("shares should be a list");
+        assert_eq!(shares.len(), 3, "cardinality: 3 → 3 shares per event");
+        let sum: f64 = shares
+            .iter()
+            .map(|v| v.as_f64().expect("share should be numeric"))
+            .sum();
+        assert!(
+            (sum - 100.0).abs() < 1e-6,
+            "normalized shares should sum to 100, got {sum}"
+        );
     }
 }
 

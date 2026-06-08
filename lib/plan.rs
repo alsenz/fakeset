@@ -8,8 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::constraints::FieldConstraints;
+use crate::constraints::{FieldConstraints, Reconciled, reconcile_rigid};
 use crate::expand_variants::{infer_field_type, merge_delta_into};
+use crate::expr_analysis::infer_expression_bounds;
 use crate::graph::DatasetGraph;
 use crate::models::{
     CountSpec, DataQuality, Field, FieldType, FieldVariant, Format, Include, Output, ParquetConfig,
@@ -750,6 +751,51 @@ fn linked_field_default(
 // Per-dataset-shape planning functions (called from the topo-sort loop)
 // ---------------------------------------------------------------------------
 
+/// EXPR-RELOCATE PR3 (scenario 1): verify each computed (`ref`+`expression`) field's derived
+/// numeric interval lies within its own declared `range`. The member's resolved fields carry the
+/// ranges inherited from the parent placeholder, so the check is self-contained per member.
+fn check_computed_field_bounds(member: &SyntheticDataset) -> Result<()> {
+    let fields = &member.data;
+    let has_computed = fields
+        .iter()
+        .any(|f| f.expression.is_some() && f.simple_ref().is_some() && f.range.is_some());
+    if !has_computed {
+        return Ok(());
+    }
+    // Input schema/ranges for interval derivation: the member's scalar (non-expression) columns.
+    let (schema, ranges) = crate::expr_analysis::scalar_input_context(fields);
+
+    for f in fields {
+        if f.expression.is_none() || f.simple_ref().is_none() || f.range.is_none() {
+            continue;
+        }
+        let expr = f.expression.as_ref().unwrap();
+        let Some(interval) = infer_expression_bounds(&schema, &ranges, expr)? else {
+            continue; // non-numeric — type compatibility is enforced elsewhere (PR2b)
+        };
+        let declared = FieldConstraints {
+            min: f.range.as_ref().and_then(|r| r.min),
+            max: f.range.as_ref().and_then(|r| r.max),
+            ..Default::default()
+        };
+        match reconcile_rigid(interval, &declared) {
+            Reconciled::Feasible(_) => {}
+            Reconciled::Infeasible => bail!(
+                "field '{}.{}': the expression's derived range [{:?}, {:?}] is disjoint from its \
+                 declared range [{:?}, {:?}] — the expression can never satisfy it",
+                member.name,
+                f.name,
+                interval.min,
+                interval.max,
+                declared.min,
+                declared.max,
+            ),
+            Reconciled::Unsound(msg) => bail!("field '{}.{}': {msg}", member.name, f.name),
+        }
+    }
+    Ok(())
+}
+
 /// Plan steps for a lower cover group: segment the parent, generate member batches inside
 /// the group step, and append collect steps for any junction-link members.
 #[allow(clippy::too_many_arguments)]
@@ -768,6 +814,12 @@ fn plan_lower_cover_group_steps(
     // Lower any tagged-union members into case-members + exclusion groups before factoring.
     let (members, groups) = lower_member_variants(members, lower_cover_groups);
     let members = members.as_slice();
+    // EXPR-RELOCATE PR3 (scenario 1): a computed (`ref`+`expression`) field's derived interval
+    // must lie within its own declared range. Checked per member, post-resolve (the member's
+    // fields carry inherited ranges).
+    for m in members {
+        check_computed_field_bounds(&m.dataset)?;
+    }
     let segments = plan_segments(row_counts[path], members, &groups)?;
     // VAR-SPECIALIZE S4c: opt-in marginal pinning — subdivide segments by a `preserve_marginal`
     // variant's cases so the parent's declared marginal survives child restrictions.
@@ -1135,11 +1187,7 @@ fn emit_witness_steps(
             });
         }
 
-        let project_col = content
-            .project
-            .as_ref()
-            .and_then(|p| split_ref(p))
-            .map(|(_, f)| f.to_string());
+        let project_col = content.project_col();
         if !field_witness_keys.is_empty() {
             witness_specs.push((field.name.clone(), field_witness_keys, project_col));
         }

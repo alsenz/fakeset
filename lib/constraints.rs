@@ -36,6 +36,37 @@ pub struct FieldConstraints {
     /// merge and applied to a variant field's cases at generation (`apply_constraints`); they do
     /// not participate in conflict pruning (carrier narrowing is always satisfiable).
     pub case_overrides: Vec<CaseDelta>,
+    /// **Rigid** numeric support of an expression-authored (computed) column (EXPR-RELOCATE PR3).
+    /// Unlike `min`/`max` — a *malleable* range a restriction may narrow — this interval is the
+    /// derived output range of the column's `expression` and **cannot be narrowed**: a restriction
+    /// can only be *satisfied* (contained), *contradicted* (disjoint → prune), or *unsatisfiable as
+    /// stated* (partial overlap / underivable → hard error). Set by the planner, never from YAML.
+    /// See [`FieldConstraints::reconcile`].
+    pub computed: Option<NumericInterval>,
+}
+
+/// A numeric interval `[min, max]`; either bound `None` means unbounded on that side. The support
+/// of a numeric value-source (EXPR-RELOCATE PR3 — the reusable primitive for computed-column bound
+/// reasoning, and the substrate for future distribution-constrained / slice-sampled generators).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NumericInterval {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// The outcome of reconciling two constraint sets when at least one carries a **rigid** computed
+/// support. Richer than `merge`'s `Option` because a rigid support admits a third case: a
+/// restriction that is neither satisfiable nor cleanly contradictory is *unsound* (a hard error),
+/// not a silent prune.
+#[derive(Debug)]
+pub enum Reconciled {
+    /// Compatible — keep this merged constraint set.
+    Feasible(FieldConstraints),
+    /// Contradictory — this segment/combination has no rows; prune it.
+    Infeasible,
+    /// Structurally unsound (a restriction would have to narrow a rigid computed column, or the
+    /// computed bounds are not derivable on a constrained side). Surface as a hard error.
+    Unsound(String),
 }
 
 /// Validate the constraint set of a field at `path`, returning detailed error messages.
@@ -114,6 +145,9 @@ impl From<&Field> for FieldConstraints {
             value: f.value.clone(),
             one_of: f.one_of.clone(),
             case_overrides: f.constrain_cases.clone(),
+            // A computed (rigid) support is derived by the planner from the expression, not read
+            // off the field — `From<&Field>` always yields `None` here.
+            computed: None,
         }
     }
 }
@@ -131,6 +165,88 @@ impl FieldConstraints {
             None
         }
     }
+
+    /// Reconcile two constraint sets, accounting for **rigid** computed supports (EXPR-RELOCATE
+    /// PR3). When neither side is computed this is exactly `merge` (lifted into the richer
+    /// `Reconciled` outcome). When one side carries a rigid computed interval, a range/value
+    /// restriction on the other side is checked for *containment* rather than intersected:
+    /// contained → `Feasible`; disjoint → `Infeasible` (prune); partial overlap, a non-range
+    /// restriction (`one_of`), or a bound the computed interval cannot determine → `Unsound`.
+    pub fn reconcile(&self, other: &Self) -> Reconciled {
+        match (self.computed, other.computed) {
+            (None, None) => match self.merge(other) {
+                Some(m) => Reconciled::Feasible(m),
+                None => Reconciled::Infeasible,
+            },
+            (Some(rigid), None) => reconcile_rigid(rigid, other),
+            (None, Some(rigid)) => reconcile_rigid(rigid, self),
+            (Some(_), Some(_)) => Reconciled::Unsound(
+                "two expression-authored value-sources for one shared column".into(),
+            ),
+        }
+    }
+}
+
+/// Reconcile a **rigid** computed interval against a (malleable) restriction `fc`. The restriction
+/// may only be a numeric range and/or constant `value`; a `one_of` finite set cannot be guaranteed
+/// for an arbitrary computed value, so it is `Unsound`.
+pub(crate) fn reconcile_rigid(rigid: NumericInterval, fc: &FieldConstraints) -> Reconciled {
+    if fc.one_of.is_some() {
+        return Reconciled::Unsound(
+            "a `one_of` finite-set restriction cannot be reconciled with a computed column".into(),
+        );
+    }
+    // Restriction interval: range bounds, tightened by a numeric constant `value` if present.
+    let (mut qlo, mut qhi) = (fc.min, fc.max);
+    if let Some(v) = fc.value.as_ref().and_then(|v| v.as_f64()) {
+        qlo = Some(qlo.map_or(v, |m| m.max(v)));
+        qhi = Some(qhi.map_or(v, |m| m.min(v)));
+    }
+    // No actual restriction → trivially satisfied.
+    if qlo.is_none() && qhi.is_none() {
+        return Reconciled::Feasible(FieldConstraints {
+            computed: Some(rigid),
+            ..Default::default()
+        });
+    }
+    let (rlo, rhi) = (rigid.min, rigid.max);
+    // The computed interval is unbounded on a side the restriction constrains → cannot verify.
+    if (qlo.is_some() && rlo.is_none()) || (qhi.is_some() && rhi.is_none()) {
+        return Reconciled::Unsound(
+            "computed column bounds are not statically determinable on a side constrained by a \
+             range — cannot verify the restriction (expression output bounds not derivable)"
+                .into(),
+        );
+    }
+    // Disjoint → infeasible (prune).
+    if let (Some(rh), Some(ql)) = (rhi, qlo)
+        && rh < ql
+    {
+        return Reconciled::Infeasible;
+    }
+    if let (Some(rl), Some(qh)) = (rlo, qhi)
+        && rl > qh
+    {
+        return Reconciled::Infeasible;
+    }
+    // Containment: the whole computed interval lies within the restriction.
+    let lo_ok = qlo.is_none_or(|ql| rlo.is_some_and(|rl| rl >= ql));
+    let hi_ok = qhi.is_none_or(|qh| rhi.is_some_and(|rh| rh <= qh));
+    if lo_ok && hi_ok {
+        return Reconciled::Feasible(FieldConstraints {
+            computed: Some(rigid),
+            ..Default::default()
+        });
+    }
+    // Overlapping but not contained: a restriction would have to narrow a rigid column.
+    Reconciled::Unsound(format!(
+        "a range restriction [{}, {}] only partially overlaps the computed column's derived \
+         interval [{}, {}] — a computed column cannot be narrowed to satisfy it",
+        qlo.map(|v| v.to_string()).unwrap_or_else(|| "-∞".into()),
+        qhi.map(|v| v.to_string()).unwrap_or_else(|| "+∞".into()),
+        rlo.map(|v| v.to_string()).unwrap_or_else(|| "-∞".into()),
+        rhi.map(|v| v.to_string()).unwrap_or_else(|| "+∞".into()),
+    ))
 }
 
 impl Merge for FieldConstraints {
@@ -154,6 +270,9 @@ impl Merge for FieldConstraints {
             value,
             one_of,
             case_overrides,
+            // `merge` is the malleable (non-computed) algebra; `reconcile` intercepts computed
+            // supports before delegating here. Carry a rigid support through defensively.
+            computed: self.computed.or(other.computed),
         };
         merged.satisfiable().then_some(merged)
     }
@@ -529,5 +648,96 @@ mod tests {
     #[test]
     fn value_outside_one_of_conflicts() {
         assert!(with_one_of(&["a", "b"]).merge(&with_value("z")).is_none());
+    }
+
+    // --- reconcile: rigid computed support (EXPR-RELOCATE PR3) ---
+
+    fn rigid(min: f64, max: f64) -> FieldConstraints {
+        FieldConstraints {
+            computed: Some(NumericInterval {
+                min: Some(min),
+                max: Some(max),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reconcile_without_computed_matches_merge() {
+        match bounds(Some(20.0), Some(80.0)).reconcile(&bounds(Some(0.0), Some(100.0))) {
+            Reconciled::Feasible(m) => assert_eq!((m.min, m.max), (Some(20.0), Some(80.0))),
+            other => panic!("expected Feasible, got {other:?}"),
+        }
+        assert!(matches!(
+            bounds(Some(60.0), Some(100.0)).reconcile(&bounds(Some(0.0), Some(30.0))),
+            Reconciled::Infeasible
+        ));
+    }
+
+    #[test]
+    fn reconcile_rigid_contained_is_feasible() {
+        // computed [30,45] within restriction [0,100]
+        assert!(matches!(
+            rigid(30.0, 45.0).reconcile(&bounds(Some(0.0), Some(100.0))),
+            Reconciled::Feasible(_)
+        ));
+    }
+
+    #[test]
+    fn reconcile_rigid_disjoint_is_infeasible() {
+        // computed [1,4] vs restriction [30,50] — no overlap
+        assert!(matches!(
+            rigid(1.0, 4.0).reconcile(&bounds(Some(30.0), Some(50.0))),
+            Reconciled::Infeasible
+        ));
+    }
+
+    #[test]
+    fn reconcile_rigid_partial_overlap_is_unsound() {
+        // computed [1,45] vs restriction [30,50] — overlaps [30,45] but not contained
+        assert!(matches!(
+            rigid(1.0, 45.0).reconcile(&bounds(Some(30.0), Some(50.0))),
+            Reconciled::Unsound(_)
+        ));
+    }
+
+    #[test]
+    fn reconcile_rigid_is_symmetric() {
+        assert!(matches!(
+            bounds(Some(30.0), Some(50.0)).reconcile(&rigid(1.0, 45.0)),
+            Reconciled::Unsound(_)
+        ));
+    }
+
+    #[test]
+    fn reconcile_rigid_unbounded_against_range_is_unsound() {
+        // computed unbounded above, restriction caps it → cannot verify
+        let r = FieldConstraints {
+            computed: Some(NumericInterval {
+                min: Some(0.0),
+                max: None,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            r.reconcile(&bounds(None, Some(100.0))),
+            Reconciled::Unsound(_)
+        ));
+    }
+
+    #[test]
+    fn reconcile_rigid_no_restriction_is_feasible() {
+        assert!(matches!(
+            rigid(1.0, 45.0).reconcile(&FieldConstraints::default()),
+            Reconciled::Feasible(_)
+        ));
+    }
+
+    #[test]
+    fn reconcile_rigid_against_one_of_is_unsound() {
+        assert!(matches!(
+            rigid(1.0, 45.0).reconcile(&with_one_of(&["a", "b"])),
+            Reconciled::Unsound(_)
+        ));
     }
 }

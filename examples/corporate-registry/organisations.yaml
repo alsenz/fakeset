@@ -9,6 +9,12 @@ links:
     cardinality:
       min: 1
       max: 25
+  - file: individuals.yaml
+    ref: shareholder
+    ratio: 0.1
+    cardinality:
+      min: 1
+      max: 6
 data:
   - name: org_id
     type: string
@@ -39,3 +45,20 @@ data:
         - name: employer
           type: string
           ref: company_name
+  # Ultimate Beneficial Owners: per-company stakes normalised to sum to exactly 100.
+  # `into` keeps the raw holding alongside the derived percentage; `precision: 0`
+  # forces integer percentages via largest-remainder rounding.
+  - name: shareholders
+    type: list
+    normalize: { field: shareholding, into: ownership_pc, total: 100, precision: 0 }
+    content:
+      from: shareholder
+      fields:
+        - name: name
+          ref: shareholder.full_name
+        - name: shareholding
+          type: number
+          range:
+            min: 1000
+            max: 5000000
+          precision: 0

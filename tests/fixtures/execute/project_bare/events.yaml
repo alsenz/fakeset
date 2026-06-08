@@ -1,0 +1,22 @@
+name: events
+format: jsonl
+output_file: events
+rows: 3
+links:
+  - file: people.yaml
+    ref: person
+    cardinality: 2
+data:
+  - name: title
+    type: string
+    generator: word
+  # Bare project: build a per-item struct from `fields`, then collapse to a scalar
+  # list of the named sub-field (PROJECT-FIELD).
+  - name: attendee_names
+    type: list
+    content:
+      from: person
+      fields:
+        - name: who
+          ref: person.full_name
+      project: who

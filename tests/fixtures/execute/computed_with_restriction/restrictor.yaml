@@ -1,0 +1,18 @@
+name: restrictor
+format: jsonl
+output_file: restrictor
+include:
+  file: scores.yaml
+  ref: s
+  ratio: 0.5
+data:
+  - name: base
+    ref: s.base
+  - name: weight
+    ref: s.weight
+  # Restricts the same shared `scores.score` that `author` computes via an expression. The author's
+  # derived interval [1,45] is DISJOINT from [1000,2000] → the author∧restrictor segment is pruned
+  # (sound: no row can be in both). Author and restrictor subpopulations still generate.
+  - name: score
+    ref: s.score
+    range: { min: 1000, max: 2000 }

@@ -1,0 +1,33 @@
+name: events
+format: jsonl
+output_file: events
+rows: 5
+links:
+  - file: people.yaml
+    ref: person
+    cardinality:
+      min: 1
+      max: 3
+data:
+  - name: event_id
+    type: string
+    generator: uuid
+  - name: title
+    type: string
+    generator: word
+  # Scalar-only expression -> staging-tier (EXPR-RELOCATE PR1). Computed at staging so it
+  # is in scope as an outer-scoped ref inside the list content below. Before PR1 expressions
+  # were terminal (assembly-only), so this column did not exist in the staging batch and the
+  # content ref errored ("outer-scoped column not found in staging batch").
+  - name: title_tag
+    expression: "UPPER(title) || '!'"
+  - name: attendees
+    type: list
+    content:
+      from: person
+      fields:
+        - name: name
+          ref: person.full_name
+        - name: tag
+          type: string
+          ref: title_tag

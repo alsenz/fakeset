@@ -1,0 +1,15 @@
+name: scores
+format: jsonl
+output_file: scores
+rows: 20
+data:
+  - name: base
+    type: number
+    range: { min: 1, max: 9 }
+    precision: 0
+  - name: weight
+    type: number
+    range: { min: 1, max: 5 }
+    precision: 0
+  - name: score
+    type: number

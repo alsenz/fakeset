@@ -1,0 +1,8 @@
+name: people
+format: csv
+output_file: people
+rows: 8
+data:
+  - name: full_name
+    type: string
+    generator: name

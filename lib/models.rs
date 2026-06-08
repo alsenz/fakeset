@@ -613,6 +613,26 @@ pub struct Range {
     pub max: Option<f64>,
 }
 
+/// Within-list normalisation (LIST-NORM): rescale a numeric quantity so each list window sums
+/// to `total`. Desugared by `desugar_normalize` into a hidden `<name>__norm_src` source field
+/// plus an injected `expression:` calling `array_normalize`/`array_normalize_field`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Normalize {
+    /// Per-list sum target (`> 0`). Int or float in YAML; the integer-vs-float output is chosen
+    /// by `precision` (or the source field type) — not by whether `total` is written `100` or
+    /// `100.0`.
+    pub total: f64,
+    /// Numeric sub-field to rescale for a `List<Struct>`. Omit for a bare `List<number>`.
+    pub field: Option<String>,
+    /// Write the rescaled result to this **new** sub-field instead of overwriting `field`.
+    /// Keeps the raw value alongside the derived one.
+    pub into: Option<String>,
+    /// Force the output element type: `0` → integer (exact sum via largest-remainder); `> 0` →
+    /// float. Absent inherits the source field's type.
+    pub precision: Option<i32>,
+}
+
 /// Specifies one or more ref bindings on a field.
 ///
 /// `Single` covers the common case (`ref: include_ref.field`) and `Multi` supports
@@ -698,6 +718,10 @@ pub struct Field {
     pub fields: Vec<Field>,
     /// Element spec for list fields.
     pub content: Option<Box<ListContent>>,
+    /// Within-list numeric normalisation (LIST-NORM). Valid on any list-producing field
+    /// (`type: list` or a list-valued `expression`). Desugared to a hidden source field plus an
+    /// injected `array_normalize`/`array_normalize_field` expression before `resolve_refs`.
+    pub normalize: Option<Normalize>,
     /// For `type: variant` fields: the list of alternative field definitions.
     /// Expanded into global dataset variants by `expand_field_variants` before execution.
     /// Must be empty on all other field types.
@@ -874,12 +898,32 @@ pub struct ListContent {
     /// When set, names the link (by its `ref:` value in the dataset's `links:` list) from
     /// which list items are drawn. Marks this as a list-link field.
     pub from: Option<String>,
-    /// Project a single field from the linked dataset, producing a scalar list instead of a
-    /// list of structs. Value must be `"<link_ref>.<field_name>"`. Mutually exclusive with
-    /// explicit `fields` in `item`.
+    /// Project a single field out of the per-item content, producing a scalar list instead of a
+    /// list of structs. Two syntactic forms (PROJECT-FIELD):
+    /// - **dotted** `"<link_ref>.<field>"` — project a field straight from the linked dataset;
+    ///   mutually exclusive with explicit `fields`.
+    /// - **bare** `"<identifier>"` — project a field defined in `content.fields`; *requires*
+    ///   `fields`.
     pub project: Option<String>,
     #[serde(flatten)]
     pub item: Field,
+}
+
+impl ListContent {
+    /// True when `project` is the **bare** form (no `.`) — projects a field from `content.fields`
+    /// rather than straight from the linked dataset.
+    pub(crate) fn is_bare_project(&self) -> bool {
+        self.project.as_deref().is_some_and(|p| !p.contains('.'))
+    }
+
+    /// The column name to project out of the assembled per-item batch, if `project` is set:
+    /// the `<field>` part for the dotted form, the whole identifier for the bare form.
+    pub(crate) fn project_col(&self) -> Option<String> {
+        self.project.as_ref().map(|p| match split_ref(p) {
+            Some((_, f)) => f.to_string(),
+            None => p.clone(),
+        })
+    }
 }
 
 /// One concrete variant of a dataset: a data schema fragment (merged on top of the

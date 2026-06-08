@@ -1,0 +1,16 @@
+name: weighted_scores
+format: jsonl
+output_file: weighted_scores
+include:
+  file: scores.yaml
+  ref: s
+  ratio: 1.0
+data:
+  - name: base
+    ref: s.base
+  - name: weight
+    ref: s.weight
+  # ref = wiring (this IS the shared scores.score column); expression = authoring at the atom.
+  - name: score
+    ref: s.score
+    expression: "base * weight"

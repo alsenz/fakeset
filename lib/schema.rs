@@ -44,6 +44,13 @@ pub fn field_to_arrow(field: &Field) -> ArrowField {
             let item_dt = match field.content.as_deref() {
                 None => DataType::Utf8,
                 Some(c) if c.from.is_none() => field_to_arrow(&c.item).data_type().clone(),
+                // Bare `project` (PROJECT-FIELD): the list element is the projected content
+                // field's scalar type, not the per-item struct.
+                Some(c) if c.is_bare_project() => c
+                    .project_col()
+                    .and_then(|p| c.item.fields.iter().find(|f| f.name == p))
+                    .map(|f| field_to_arrow(f).data_type().clone())
+                    .unwrap_or(DataType::Utf8),
                 Some(c) => {
                     let sub: Vec<ArrowField> = c.item.fields.iter().map(field_to_arrow).collect();
                     DataType::Struct(sub.into())

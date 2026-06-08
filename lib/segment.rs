@@ -6,7 +6,7 @@ use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::constraints::{FieldConstraints, Merge};
+use crate::constraints::{FieldConstraints, Reconciled};
 use crate::models::{CountSpec, RingBounds, SyntheticDataset};
 
 /// Hard cap on the number of feasible segments produced by DFS enumeration.
@@ -177,9 +177,11 @@ pub fn plan_segments(
         }]);
     }
 
-    let conflict_masks = precompute_conflicts(members);
-    let member_constraints: Vec<HashMap<String, FieldConstraints>> =
-        members.iter().map(lower_cover_field_constraints).collect();
+    let conflict_masks = precompute_conflicts(members)?;
+    let member_constraints: Vec<HashMap<String, FieldConstraints>> = members
+        .iter()
+        .map(lower_cover_field_constraints)
+        .collect::<Result<Vec<_>>>()?;
 
     // Collapse each tagged union's lowered cases into one categorical DFS entry; all
     // other members stay independent Bernoulli entries. With `groups == &[]` every
@@ -366,7 +368,8 @@ fn enumerate_segments_dfs(
 
             // Branch B: include member i — prune on conflict / unmergeable constraints.
             if mask.is_disjoint(&conflict_masks[i])
-                && let Some(new_merged) = try_merge_incremental(merged, &member_constraints[i])
+                && let Some(new_merged) =
+                    try_merge_incremental(merged, &member_constraints[i])?
             {
                 let mut inc = mask;
                 inc.insert(i);
@@ -414,7 +417,7 @@ fn enumerate_segments_dfs(
                     continue;
                 }
                 if let Some(new_merged) =
-                    try_merge_incremental(merged.clone(), &member_constraints[ci])
+                    try_merge_incremental(merged.clone(), &member_constraints[ci])?
                 {
                     let mut inc = mask.clone();
                     inc.insert(ci);
@@ -444,46 +447,59 @@ fn enumerate_segments_dfs(
 pub(crate) fn try_merge_incremental(
     mut base: HashMap<String, FieldConstraints>,
     extra: &HashMap<String, FieldConstraints>,
-) -> Option<HashMap<String, FieldConstraints>> {
+) -> Result<Option<HashMap<String, FieldConstraints>>> {
     for (field_name, fc) in extra {
         match base.get(field_name) {
             None => {
                 base.insert(field_name.clone(), fc.clone());
             }
-            Some(existing) => {
-                let merged = existing.merge(fc)?;
-                base.insert(field_name.clone(), merged);
-            }
+            Some(existing) => match existing.reconcile(fc) {
+                Reconciled::Feasible(merged) => {
+                    base.insert(field_name.clone(), merged);
+                }
+                Reconciled::Infeasible => return Ok(None),
+                Reconciled::Unsound(msg) => bail!("shared column '{field_name}': {msg}"),
+            },
         }
     }
-    Some(base)
+    Ok(Some(base))
 }
 
 /// For each lower cover member i, build a bitmask of all members j that are pairwise
 /// incompatible with i (their merged constraints are infeasible). Any mask containing
 /// such a pair can be eliminated without further constraint computation.
-fn precompute_conflicts(members: &[LowerCoverMember]) -> Vec<SegMask> {
+fn precompute_conflicts(members: &[LowerCoverMember]) -> Result<Vec<SegMask>> {
     let n = members.len();
-    let constraints: Vec<HashMap<String, FieldConstraints>> =
-        members.iter().map(lower_cover_field_constraints).collect();
+    let constraints: Vec<HashMap<String, FieldConstraints>> = members
+        .iter()
+        .map(lower_cover_field_constraints)
+        .collect::<Result<Vec<_>>>()?;
     let mut conflict_masks = vec![FixedBitSet::with_capacity(n); n];
     for i in 0..n {
         for j in (i + 1)..n {
-            if constraints_conflict(&constraints[i], &constraints[j]) {
+            if constraints_conflict(&constraints[i], &constraints[j])? {
                 conflict_masks[i].insert(j);
                 conflict_masks[j].insert(i);
             }
         }
     }
-    conflict_masks
+    Ok(conflict_masks)
 }
 
 pub(crate) fn constraints_conflict(
     a: &HashMap<String, FieldConstraints>,
     b: &HashMap<String, FieldConstraints>,
-) -> bool {
-    a.iter()
-        .any(|(field, fc_a)| b.get(field).is_some_and(|fc_b| fc_a.merge(fc_b).is_none()))
+) -> Result<bool> {
+    for (field, fc_a) in a {
+        if let Some(fc_b) = b.get(field) {
+            match fc_a.reconcile(fc_b) {
+                Reconciled::Feasible(_) => {}
+                Reconciled::Infeasible => return Ok(true),
+                Reconciled::Unsound(msg) => bail!("shared column '{field}': {msg}"),
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// IPF over the sparse feasible set. Iterates only feasible mask keys rather than
@@ -542,17 +558,31 @@ fn ipf_rescale_sparse(
 /// by the parent field name.
 pub(crate) fn lower_cover_field_constraints(
     member: &LowerCoverMember,
-) -> HashMap<String, FieldConstraints> {
+) -> Result<HashMap<String, FieldConstraints>> {
     let prefix = format!("{}.", member.reference);
+    // For deriving a computed (ref+expression) field's rigid bounds (EXPR-RELOCATE PR3) from the
+    // member's own resolved input columns (which carry inherited ranges).
+    let (schema, ranges) = crate::expr_analysis::scalar_input_context(&member.dataset.data);
     let mut map = HashMap::new();
     for field in &member.dataset.data {
         if let Some(ref_str) = field.simple_ref()
             && let Some(parent_field_name) = ref_str.strip_prefix(prefix.as_str())
         {
-            map.insert(parent_field_name.to_string(), FieldConstraints::from(field));
+            let fc = if let Some(expr) = &field.expression {
+                // Computed shared column: carry the **rigid** derived support, not the inherited
+                // malleable range (the own-range is validated separately in `plan.rs`). A
+                // non-numeric expression derives `None` → no numeric constraint participates.
+                FieldConstraints {
+                    computed: crate::expr_analysis::infer_expression_bounds(&schema, &ranges, expr)?,
+                    ..Default::default()
+                }
+            } else {
+                FieldConstraints::from(field)
+            };
+            map.insert(parent_field_name.to_string(), fc);
         }
     }
-    map
+    Ok(map)
 }
 
 #[cfg(test)]

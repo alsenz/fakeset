@@ -261,7 +261,9 @@ fn test_expression_with_type_errors() {
 }
 
 #[test]
-fn test_expression_with_ref_errors() {
+fn test_ref_expression_plus_value_errors() {
+    // EXPR-RELOCATE PR2: `ref` + `expression` is now allowed (a computed shared column), but it
+    // is a single value-source — adding `value` alongside it must error.
     let paths = vec![PathBuf::from(
         "tests/fixtures/validation/expression_with_ref",
     )];
@@ -269,10 +271,9 @@ fn test_expression_with_ref_errors() {
     let err = validate(&datasets).expect_err("should fail validation");
     let msg = err.to_string();
     assert!(
-        msg.contains("expression"),
-        "error should mention `expression`: {msg}"
+        msg.contains("value-source"),
+        "error should mention the single value-source rule: {msg}"
     );
-    assert!(msg.contains("ref"), "error should mention `ref`: {msg}");
 }
 
 #[test]
@@ -786,6 +787,43 @@ fn test_project_field_missing_errors() {
     assert!(
         msg.contains("nonexistent_field"),
         "error should name the missing field: {msg}"
+    );
+}
+
+// --- PROJECT-FIELD: bare `project` validation ---
+
+#[test]
+fn test_bare_project_with_fields_accepted() {
+    let paths = vec![PathBuf::from("tests/fixtures/execute/project_bare")];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    validate(&datasets).expect("bare project alongside fields should validate");
+}
+
+#[test]
+fn test_bare_project_missing_field_errors() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/project_bare_missing",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("bare project naming a missing field should error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("project") && msg.contains("nonexistent"),
+        "error should name the missing projected field: {msg}"
+    );
+}
+
+#[test]
+fn test_bare_project_nonscalar_field_errors() {
+    let paths = vec![PathBuf::from(
+        "tests/fixtures/validation/project_bare_nonscalar",
+    )];
+    let datasets = load_all_datasets(&paths).expect("should load");
+    let err = validate(&datasets).expect_err("bare project of a non-scalar field should error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("scalar"),
+        "error should mention the scalar requirement: {msg}"
     );
 }
 

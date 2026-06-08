@@ -21,22 +21,45 @@ use std::sync::Arc;
 use crate::arrow_util::downcast;
 use crate::models::{Field, FlattenStrategy, Format, discriminant_tag_column};
 
-/// Remove columns marked `hidden` from a batch before writing output.
-/// The full batch (including hidden columns) is kept in `computed` for inherited
-/// field wiring; only the filtered batch is written to output.
+/// Remove columns marked `hidden` from a batch and project the survivors into **canonical
+/// YAML (`fields`) order** before writing output. Canonical ordering makes output
+/// independent of *where* each column was computed — required by EXPR-RELOCATE, which
+/// relocates expression evaluation to earlier pipeline points (so a relocated column would
+/// otherwise shift its position in the batch). The full batch (including hidden columns) is
+/// kept in `computed` for inherited field wiring; only this filtered, reordered batch is
+/// written.
+///
+/// Declared, non-hidden fields lead in `fields` order; any leftover batch column with no
+/// matching declared field (e.g. a carried sentinel) keeps its original relative position at
+/// the end, preserving the prior inclusion set.
 pub(crate) fn filter_hidden_columns(batch: RecordBatch, fields: &[Field]) -> Result<RecordBatch> {
-    if !fields.iter().any(|f| f.hidden) {
-        return Ok(batch);
-    }
+    let schema = batch.schema();
     let hidden: HashSet<&str> = fields
         .iter()
         .filter(|f| f.hidden)
         .map(|f| f.name.as_str())
         .collect();
-    let visible: Vec<usize> = (0..batch.num_columns())
-        .filter(|&i| !hidden.contains(batch.schema().field(i).name().as_str()))
-        .collect();
-    Ok(batch.project(&visible)?)
+
+    let mut order: Vec<usize> = Vec::with_capacity(batch.num_columns());
+    let mut taken = vec![false; batch.num_columns()];
+    for f in fields {
+        if f.hidden {
+            continue;
+        }
+        if let Ok(i) = schema.index_of(&f.name) {
+            if !taken[i] {
+                order.push(i);
+                taken[i] = true;
+            }
+        }
+    }
+    for i in 0..batch.num_columns() {
+        if taken[i] || hidden.contains(schema.field(i).name().as_str()) {
+            continue;
+        }
+        order.push(i);
+    }
+    Ok(batch.project(&order)?)
 }
 
 /// True if `dt` is, or nests, an Arrow union.

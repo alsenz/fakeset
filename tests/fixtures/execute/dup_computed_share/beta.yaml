@@ -1,0 +1,17 @@
+name: beta
+format: jsonl
+output_file: beta
+include:
+  file: scores.yaml
+  ref: s
+  ratio: 0.5
+data:
+  - name: base
+    ref: s.base
+  - name: weight
+    ref: s.weight
+  # Second member also authoring the shared scores.score — two value-sources for one shared
+  # column. Must be rejected (EXPR-RELOCATE PR2 one-value-source rule).
+  - name: score
+    ref: s.score
+    expression: "base + weight"

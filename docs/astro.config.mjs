@@ -34,6 +34,7 @@ export default defineConfig({
           label: 'Reference',
           items: [
             { label: 'YAML Schema', link: '/reference/yaml-schema/' },
+            { label: 'Expression Language', link: '/reference/expressions/' },
             { label: 'Generators & Locales', link: '/reference/generators/' },
             { label: 'CLI', link: '/reference/cli/' },
             { label: 'Statistical Tests', link: '/reference/testing/' },

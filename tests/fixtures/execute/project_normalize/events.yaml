@@ -1,0 +1,23 @@
+name: events
+format: jsonl
+output_file: events
+rows: 3
+links:
+  - file: people.yaml
+    ref: person
+    cardinality: 3
+data:
+  - name: title
+    type: string
+    generator: word
+  # Bare project to a scalar List<number>, then LIST-NORM rescales each list to sum 100.
+  - name: shares
+    type: list
+    content:
+      from: person
+      fields:
+        - name: w
+          ref: person.weight
+      project: w
+    normalize:
+      total: 100

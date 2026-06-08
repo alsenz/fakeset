@@ -1,0 +1,234 @@
+---
+title: Expression Language
+description: Computed fields in fakeset — the SQL expression language, available functions, scoping rules, and the array/list helpers including normalize.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A field with an `expression:` is **computed** from other fields rather than generated. Its
+value is a [DataFusion](https://datafusion.apache.org/) SQL scalar expression evaluated once
+per row, after the row's other fields exist.
+
+```yaml
+- name: vat_amount
+  expression: "price * 0.2"
+```
+
+This page covers what expressions can reference, the full set of functions available, and
+fakeset's own list helpers (`array_normalize`, `array_normalize_field`, and the declarative
+`normalize:` sugar).
+
+## How expressions are evaluated
+
+Expression fields are evaluated together as a **chain, in YAML declaration order**. Each
+expression is layered on top of the previous one, so an expression may reference any field —
+generated *or* expression — declared **above** it in the same dataset:
+
+```yaml
+data:
+  - { name: price,      type: number, range: { min: 10, max: 100 } }
+  - { name: tax,        expression: "price * 0.2" }        # sees price
+  - { name: total,      expression: "price + tax" }        # sees price and tax
+```
+
+Referencing a field declared *below* the expression is an error (caught at validation).
+
+<Aside type="note" title="Per-row, not aggregate">
+Expressions are **scalar** — they compute one value per row from that same row's columns.
+They run without a `GROUP BY`, so row-collapsing aggregates (`sum(x)` over the table,
+`count(*)`, …) are **not** available here. Cross-row aggregation — "sum every child's amount
+into the parent" — is done with [`reducer:` bindings and `collect`](/concepts/list-links/),
+not expressions. Functions that operate on a single **list cell** (e.g. `array_length`,
+`array_to_string`) *are* scalar and fully available.
+</Aside>
+
+## What an expression can reference
+
+| Source | How | Notes |
+|--------|-----|-------|
+| **Sibling fields** | bare name | Any field declared above the expression in the same dataset. |
+| **Parent / included fields** | bare name | A field defined only in an `include:`d parent is **auto-pulled-down** as a hidden ref — you can reference it directly without re-declaring it. |
+| **Imported columns** | `<ref>.<column>` | For an `import:`ed dataset, reference columns through the import's `ref:` namespace, e.g. `tickers.symbol`. |
+| **List columns** | bare name | A `type: list` or list-valued expression column is an Arrow `List`; pass it to the array functions below. |
+
+```yaml
+# Concatenate an imported column with generated text
+- name: label
+  expression: "concat(tickers.symbol, ' — ', tickers.sector)"
+```
+
+### Identifiers and quoting
+
+Unquoted identifiers follow SQL rules (case-insensitive, lower-cased). If a field name has
+mixed case or unusual characters, wrap it in **double quotes** to reference it verbatim:
+`"MyField"`. String literals use **single quotes**: `'active'`.
+
+### Rules
+
+- `expression:` is mutually exclusive with `type`, `ref`, `generator`, `range`, and `value` —
+  an expression *is* the field's value source.
+- A field only needed to compute an expression (and not wanted in the output) can be marked
+  `hidden: true`; it stays in the internal batch and is dropped from the written file.
+- Expression results are typed by DataFusion from the inputs (e.g. `price * 0.2` on a `number`
+  is a float). Use `CAST(x AS BIGINT)` or `arrow_cast(x, 'Int64')` to pin a type.
+
+## Function reference
+
+Expressions can use **any scalar function in DataFusion's standard library**. The full
+authoritative list is the [DataFusion SQL function
+reference](https://datafusion.apache.org/user-guide/sql/scalar_functions.html); the tables
+below are the families most useful for synthetic data, all verified against the pinned
+DataFusion 53.1.
+
+### Math
+
+| Function | Meaning |
+|----------|---------|
+| `abs(x)`, `sign(x)` | absolute value, sign |
+| `round(x, d)`, `trunc(x, d)`, `ceil(x)`, `floor(x)` | rounding |
+| `power(x, y)` / `pow`, `sqrt(x)`, `cbrt(x)` | powers and roots |
+| `ln(x)`, `log(b, x)`, `log10(x)`, `log2(x)`, `exp(x)` | logs and exponential |
+| `mod(x, y)`, `gcd(a, b)`, `lcm(a, b)` | modular arithmetic |
+| `random()` | uniform `[0, 1)` per row |
+
+### Strings
+
+| Function | Meaning |
+|----------|---------|
+| `concat(a, b, …)`, `concat_ws(sep, a, b, …)` | concatenation |
+| `upper(s)`, `lower(s)`, `initcap(s)` | case |
+| `length(s)` / `char_length`, `octet_length(s)` | length |
+| `substr(s, start, len)`, `left(s, n)`, `right(s, n)` | substrings |
+| `replace(s, from, to)`, `translate(s, from, to)`, `overlay(...)` | replacement |
+| `trim(s)`, `ltrim(s)`, `rtrim(s)`, `btrim(s, chars)` | trimming |
+| `lpad(s, n, pad)`, `rpad(s, n, pad)`, `repeat(s, n)`, `reverse(s)` | padding |
+| `starts_with(s, p)`, `ends_with(s, p)`, `strpos(s, sub)` | search |
+| `split_part(s, sep, n)` | split and pick |
+| `regexp_replace(s, pat, rep, flags)`, `regexp_match(s, pat)` | regex |
+| `md5(s)`, `sha256(s)`, `to_hex(i)` | hashing/encoding |
+
+### Conditional & null handling
+
+| Function | Meaning |
+|----------|---------|
+| `CASE WHEN … THEN … ELSE … END` | branching |
+| `coalesce(a, b, …)`, `nvl(a, b)` | first non-null |
+| `nullif(a, b)` | null when equal |
+| `greatest(a, b, …)`, `least(a, b, …)` | min/max of arguments |
+
+### Dates & times
+
+| Function | Meaning |
+|----------|---------|
+| `now()`, `current_date`, `current_time` | current instants |
+| `date_part('field', ts)` / `extract`, `date_trunc('unit', ts)` | component extraction/truncation |
+| `date_bin(interval, ts, origin)` | bucket a timestamp |
+| `to_timestamp(...)`, `to_date(...)`, `to_char(ts, fmt)` | parse/format |
+| `ts + interval '1 day'` | interval arithmetic |
+
+### Casting
+
+| Function | Meaning |
+|----------|---------|
+| `CAST(x AS BIGINT)`, `x::BIGINT` | SQL cast |
+| `try_cast(x AS …)` | cast, null on failure |
+| `arrow_cast(x, 'Int64')` | cast to an exact Arrow type |
+
+### Arrays & lists
+
+List columns (from `type: list` or a list-valued expression) work with DataFusion's nested
+functions. Each operates per list cell (scalar), so they are valid in expressions:
+
+| Function | Meaning |
+|----------|---------|
+| `make_array(a, b, …)` | build a list |
+| `array_length(l)`, `cardinality(l)` | element count |
+| `array_element(l, i)` | 1-based indexing |
+| `array_slice(l, from, to)`, `array_pop_front/back(l)` | sub-lists |
+| `array_cat(a, b)` / `array_concat`, `array_append(l, x)`, `array_prepend(x, l)` | combine |
+| `array_distinct(l)`, `array_sort(l)`, `array_reverse(l)` | reshape |
+| `array_to_string(l, sep)` | join to a string |
+| `array_position(l, x)`, `array_has(l, x)` | search |
+| `array_union/intersect/except(a, b)` | set operations |
+| `flatten(l)` | flatten nested lists |
+
+`list_*` aliases exist for all of these (`list_cat`, `list_length`, …).
+
+## fakeset list helpers
+
+On top of the standard library, fakeset registers two list-normalisation UDFs (LIST-NORM).
+They rescale a numeric quantity so each list **sums to a target total** — ownership stakes,
+portfolio weights, budget splits, vote shares.
+
+```text
+array_normalize(list_of_number, total [, precision])
+array_normalize_field(list_of_struct, 'src', total [, 'dst'] [, precision])
+```
+
+- **`array_normalize`** rescales a bare `List<number>` so each list sums to `total`.
+- **`array_normalize_field`** rescales the numeric sub-field `'src'` of a `List<Struct>`. Pass a
+  fourth string `'dst'` to write the result to a **new** sub-field (keeping the raw value);
+  omit it to overwrite `'src'` in place.
+- **`precision`** (trailing integer) forces the output type: `0` → integer, summing to *exactly*
+  `total` via largest-remainder (Hamilton) rounding; `> 0` → float. Omitted, the output inherits
+  the source's type. (A `type: number` field is a float, so add `precision: 0` when you want a
+  whole-number percentage that sums to exactly 100.)
+
+Empty lists pass through unchanged; an all-zero list becomes an equal split.
+
+### The `normalize:` shorthand
+
+You rarely call the UDFs by hand — the declarative `normalize:` key on any list-producing
+field desugars to exactly these calls:
+
+```yaml
+- name: shareholders
+  type: list
+  normalize: { field: shareholding, into: ownership_pc, total: 100, precision: 0 }
+  content:
+    from: subsidiary
+    fields:
+      - { name: name,        ref: subsidiary.company_name }
+      - { name: shareholding, type: number, range: { min: 1000, max: 5000000 } }
+```
+
+Each item becomes `{name, shareholding, ownership_pc}` — the raw holding **and** its
+within-company percentage, with the percentages summing to exactly 100. See the
+[YAML schema reference](/reference/yaml-schema/#normalize) for the `Normalize` fields.
+
+### Composing: roll up, then normalise
+
+Because expressions chain in order, an `array_cat` rollup and a normalisation compose as two
+steps — concatenate two shareholder lists, then normalise the combined stake:
+
+```yaml
+- name: shareholders_raw
+  expression: "array_cat(individual_shareholders, corporate_shareholders)"
+  hidden: true
+- name: shareholders
+  expression: "array_normalize_field(shareholders_raw, 'stake', 100, 'pct', 0)"
+```
+
+## Worked examples
+
+```yaml
+# Derived monetary field
+- name: net_premium
+  expression: "claim_amount - deductible"
+
+# Human-readable label from parts
+- name: display_name
+  expression: "concat(initcap(first_name), ' ', upper(last_name))"
+
+# Conditional categorisation
+- name: risk_band
+  expression: "CASE WHEN score >= 700 THEN 'low' WHEN score >= 500 THEN 'medium' ELSE 'high' END"
+
+# Age in whole years from a generated date of birth
+- name: age_years
+  expression: "CAST(date_part('year', now()) - date_part('year', date_of_birth) AS BIGINT)"
+
+# Count items in a list column
+- name: director_count
+  expression: "array_length(directors)"
+```

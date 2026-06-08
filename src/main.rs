@@ -6,6 +6,7 @@ use fakeset::{
     expressions::pull_down_expression_deps,
     graph::build_dag,
     import::load_import_headers,
+    list_norm::desugar_normalize,
     load_all_datasets,
     models::{Format, SeedConfig, SyntheticDataset},
     plan::{ExecutionPlan, ExecutionStep, apply_scale, build_plan},
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
         eprintln!("{warning}");
     }
     let datasets = expand_field_variants(datasets)?;
+    let datasets = desugar_normalize(datasets)?;
     let datasets = expand_include_fields(&datasets)?;
 
     if cli.print_dag {
