@@ -157,8 +157,8 @@ empty batch the step is skipped as ⊥.
 | `GenerateLowerCoverGroup` | Generate a segmented parent and fan row segments to its lower cover members. Parent emits if it has no list links. |
 | `GenerateStagingLowerCoverGroup` | Staging counterpart of the above for parents with list-link fields. |
 | `GenerateWitness` | Generate the witness batch — one row per unique linked-dataset row drawn, carrying `_staging_refs`. |
-| `AssembleFromWitness` | Fold witness batches into list columns, evaluate expressions, emit the final output. |
-| `AccumulateToLinked` | Accumulate atom-level values back into linked-dataset fields via collect/reduce bindings. |
+| `AssembleFromWitness` | Build the per-edge **junction** (`unnest_staging_refs`), evaluate per-item content-expressions on it, fold into list columns, evaluate the dataset's expressions, emit. Stashes the junction when a content field is `collect`ed. |
+| `AccumulateToLinked` | Accumulate per-edge values back into linked-dataset fields via collect/reduce bindings — sourced from the stashed junction (list-link collects) or the junction dataset's rows (top-level collects), grouped by `_linked_idx`. |
 | `WriteSharedOutput` | Union and shuffle all accumulated batches for a shared output file, apply any data-quality pass, then write once. |
 
 ## Sentinel columns

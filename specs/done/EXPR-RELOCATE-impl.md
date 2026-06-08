@@ -1,5 +1,16 @@
 # EXPR-RELOCATE — implementation plan
 
+**Status: COMPLETE (PR1–PR4) + a theory-alignment tidy-up pass.** As-built notes vs this plan:
+- **PR2b:** type inference uses the planned `DataFrame` schema (`infer_expression_types`), not raw
+  `ExprSchemable`. A computed column's type is checked then **cast** to its declared type.
+- **PR3:** "Option A" full bound-merge. The rigid/malleable distinction lives in the constraint
+  algebra; `ExprIntervalGraph` forward evaluation derives bounds **synchronously**.
+- **PR4:** all content-expressions evaluate at the assembly **junction** (per-edge), not split
+  witness/assembly — value-identical, simpler.
+- **Tidy-up:** one per-edge collect path through the junction; `expression` is the tightest
+  value-source carrying `rigid_support`; `reconcile` is the single combinator. Expression
+  placement/eval/typing lives in `lib/expr_analysis.rs`.
+
 Implementation plan for `specs/EXPR-RELOCATE.md`. Read the spec first for the design — the
 placement rule, the materialisation-point tables (include **and** link), the merge algebra,
 and the `ref`+`expression` reframing.

@@ -1,12 +1,15 @@
 # EXPR-RELOCATE — evaluate expressions during materialisation, not at emit
 
-**Status:** Future — designed, not built.
+**Status:** **COMPLETE** — implemented across PR1–PR4 (placement scheduler; computed atom
+column-source + static type inference; bound-merge algebra; content-expressions + edge-granular
+collect). A follow-on tidy-up pass aligned the code to theory (single per-edge collect path through
+the **junction**; `expression` as the tightest point on the value-source spectrum with a rigid
+support; `reconcile` the single constraint combinator). See `specs/EXPR-RELOCATE-impl.md` for the
+as-built PR notes.
 
 **Sequencing:** Third (last) of the list/expression specs — **LIST-NORM → PROJECT-FIELD →
-EXPR-RELOCATE**. LIST-NORM and PROJECT-FIELD's **projection half** are both **done**; the
-largest of the three remains. It lifts the content-expression gate (`validate.rs:1148`) that
-LIST-NORM rollups and **PROJECT-FIELD's derivation half** still wait on. Implementation plan:
-`specs/EXPR-RELOCATE-impl.md`.
+EXPR-RELOCATE** (all three now done). It lifted the content-expression gate that LIST-NORM rollups
+and **PROJECT-FIELD's derivation half** waited on — both now work.
 
 ## Goal
 

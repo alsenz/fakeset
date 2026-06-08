@@ -42,6 +42,41 @@ not expressions. Functions that operate on a single **list cell** (e.g. `array_l
 `array_to_string`) *are* scalar and fully available.
 </Aside>
 
+## Where an expression runs (placement)
+
+An expression is evaluated at the **earliest point in the pipeline where every field it
+references already exists** — not at one terminal step. A scalar expression over ordinary fields
+computes early (so it can even feed a list's `content` as an outer-scoped ref); one that
+references a folded list column computes at assembly. For an ordinary field this is invisible —
+the value is identical either way — but it unlocks the two capabilities below.
+
+## Authoring a shared column (pin a ref'd field)
+
+`ref` + `expression` on one field is allowed: `ref` is *wiring* (this **is** the shared /
+inherited column) and `expression` is *authoring* (compute its value). The value is computed once
+at the lattice **atom** and projected up to the parent and every member identically — the natural
+way to derive a shared column.
+
+```yaml
+# weighted_scores includes scores; `score` is a placeholder column on the parent.
+- { name: base,   ref: s.base }
+- { name: weight, ref: s.weight }
+- name: score
+  ref: s.score                 # wiring: THE shared scores.score column
+  expression: "base * weight"  # authoring: computed at the atom, projected up
+```
+
+A numeric computed column carries a **rigid** derived range — it is the tightest value-source, so
+a declared `range` (or a sibling member's restriction) on it can only be *verified*, never narrow
+it: fakeset checks statically that the expression's possible values fit (contained → ok, disjoint →
+that member-combination is pruned, partial overlap / underivable → a clear error).
+
+## Expressions in list content
+
+An `expression:` may also be a **list item** field — computed per item at assembly, over the
+item's linked- and outer-scoped fields, and optionally `collect`ed back to the linked dataset. See
+[field scoping in list items](/concepts/list-links/#field-scoping-in-list-items).
+
 ## What an expression can reference
 
 | Source | How | Notes |
@@ -65,8 +100,9 @@ mixed case or unusual characters, wrap it in **double quotes** to reference it v
 
 ### Rules
 
-- `expression:` is mutually exclusive with `type`, `ref`, `generator`, `range`, and `value` —
-  an expression *is* the field's value source.
+- `expression:` is the field's value source, so it is mutually exclusive with `type`,
+  `generator`, `range`, and `value`. It **may** combine with `ref` — see
+  [Authoring a shared column](#authoring-a-shared-column-pin-a-refd-field) below.
 - A field only needed to compute an expression (and not wanted in the output) can be marked
   `hidden: true`; it stays in the internal batch and is dropped from the written file.
 - Expression results are typed by DataFusion from the inputs (e.g. `price * 0.2` on a `number`

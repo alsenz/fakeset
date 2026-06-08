@@ -11,7 +11,12 @@ pub trait Satisfiable {
     fn satisfiable(&self) -> bool;
 }
 
-/// Two constraint sets can be narrowed into one. Returns `None` when they conflict.
+/// The **malleable core** of the value-source combinator: narrow two constraint sets along the
+/// `generator`/`one_of`/`value` spectrum (tightest source wins, supports intersect), returning
+/// `None` on conflict. [`FieldConstraints::reconcile`] is the full combinator — it adds the
+/// **rigid** (expression) case on top and delegates here when neither side is expression-authored.
+/// Used directly only in pure-malleable contexts (e.g. ref specialisation in `rewrite`, before any
+/// expression rigid support exists).
 pub trait Merge: Sized {
     fn merge(&self, other: &Self) -> Option<Self>;
 }
@@ -19,11 +24,14 @@ pub trait Merge: Sized {
 /// All generation constraints that live on a field, extracted for merging and
 /// satisfiability checks during lower cover segmentation.
 ///
-/// `generator` / `one_of` / `value` form a single **value-source spectrum** ordered by how
-/// much of the domain they pin down (VAR-SPECIALIZE): type-default ≻ `generator` ≻ `one_of`
-/// (finite set) ≻ `value` (static singleton). A child specialises a parent by moving to a
-/// *tighter* point on the spectrum — never a conflict. `min`/`max` are orthogonal numeric
-/// bounds that always intersect.
+/// The value-source spectrum, ordered tightest-first:
+/// **`expression` ≻ `value` ≻ `one_of` ≻ `generator` ≻ type-default** (VAR-SPECIALIZE +
+/// EXPR-RELOCATE). A child specialises a parent by moving to a *tighter* point — never a conflict.
+/// The first four (`generator`/`one_of`/`value`) are **malleable**: a restriction narrows them and
+/// supports intersect. `expression` is the tightest source and is **rigid** — it authors the value,
+/// so a restriction can only be *verified* against its derived support (`rigid_support`), never
+/// narrow it. `min`/`max` are orthogonal numeric bounds that always intersect (a malleable range).
+/// [`FieldConstraints::reconcile`] is the single combinator over this spectrum.
 #[derive(Debug, Clone, Default)]
 pub struct FieldConstraints {
     pub generator: Option<Generator>,
@@ -36,13 +44,13 @@ pub struct FieldConstraints {
     /// merge and applied to a variant field's cases at generation (`apply_constraints`); they do
     /// not participate in conflict pruning (carrier narrowing is always satisfiable).
     pub case_overrides: Vec<CaseDelta>,
-    /// **Rigid** numeric support of an expression-authored (computed) column (EXPR-RELOCATE PR3).
-    /// Unlike `min`/`max` — a *malleable* range a restriction may narrow — this interval is the
-    /// derived output range of the column's `expression` and **cannot be narrowed**: a restriction
-    /// can only be *satisfied* (contained), *contradicted* (disjoint → prune), or *unsatisfiable as
-    /// stated* (partial overlap / underivable → hard error). Set by the planner, never from YAML.
+    /// The **rigid support** of the tightest value-source — an `expression`-authored column's
+    /// derived output interval (EXPR-RELOCATE). Its presence *means* "this column's value-source is
+    /// an expression." Unlike the malleable `min`/`max`, it **cannot be narrowed**: a restriction is
+    /// only *satisfied* (contained), *contradicted* (disjoint → prune), or *unsatisfiable as stated*
+    /// (partial overlap / underivable → hard error). Set by the planner, never from YAML.
     /// See [`FieldConstraints::reconcile`].
-    pub computed: Option<NumericInterval>,
+    pub rigid_support: Option<NumericInterval>,
 }
 
 /// A numeric interval `[min, max]`; either bound `None` means unbounded on that side. The support
@@ -145,9 +153,9 @@ impl From<&Field> for FieldConstraints {
             value: f.value.clone(),
             one_of: f.one_of.clone(),
             case_overrides: f.constrain_cases.clone(),
-            // A computed (rigid) support is derived by the planner from the expression, not read
-            // off the field — `From<&Field>` always yields `None` here.
-            computed: None,
+            // The rigid support is derived by the planner from the expression, not read off the
+            // field — `From<&Field>` always yields `None` here.
+            rigid_support: None,
         }
     }
 }
@@ -166,14 +174,15 @@ impl FieldConstraints {
         }
     }
 
-    /// Reconcile two constraint sets, accounting for **rigid** computed supports (EXPR-RELOCATE
-    /// PR3). When neither side is computed this is exactly `merge` (lifted into the richer
-    /// `Reconciled` outcome). When one side carries a rigid computed interval, a range/value
-    /// restriction on the other side is checked for *containment* rather than intersected:
-    /// contained → `Feasible`; disjoint → `Infeasible` (prune); partial overlap, a non-range
-    /// restriction (`one_of`), or a bound the computed interval cannot determine → `Unsound`.
+    /// The single combinator over the value-source spectrum. When neither side is
+    /// expression-authored, this is the malleable `merge` (tightest source wins, supports
+    /// intersect), lifted into the richer `Reconciled` outcome. When one side carries a
+    /// `rigid_support` (its value-source is an `expression`), a range/value restriction on the
+    /// other side is checked for *containment* rather than narrowed: contained → `Feasible`;
+    /// disjoint → `Infeasible` (prune); partial overlap, a non-range restriction (`one_of`), or a
+    /// bound the rigid interval cannot determine → `Unsound`.
     pub fn reconcile(&self, other: &Self) -> Reconciled {
-        match (self.computed, other.computed) {
+        match (self.rigid_support, other.rigid_support) {
             (None, None) => match self.merge(other) {
                 Some(m) => Reconciled::Feasible(m),
                 None => Reconciled::Infeasible,
@@ -187,9 +196,9 @@ impl FieldConstraints {
     }
 }
 
-/// Reconcile a **rigid** computed interval against a (malleable) restriction `fc`. The restriction
-/// may only be a numeric range and/or constant `value`; a `one_of` finite set cannot be guaranteed
-/// for an arbitrary computed value, so it is `Unsound`.
+/// Reconcile a **rigid support** (an expression-authored column's derived interval) against a
+/// (malleable) restriction `fc`. The restriction may only be a numeric range and/or constant
+/// `value`; a `one_of` finite set cannot be guaranteed for an arbitrary computed value → `Unsound`.
 pub(crate) fn reconcile_rigid(rigid: NumericInterval, fc: &FieldConstraints) -> Reconciled {
     if fc.one_of.is_some() {
         return Reconciled::Unsound(
@@ -205,7 +214,7 @@ pub(crate) fn reconcile_rigid(rigid: NumericInterval, fc: &FieldConstraints) -> 
     // No actual restriction → trivially satisfied.
     if qlo.is_none() && qhi.is_none() {
         return Reconciled::Feasible(FieldConstraints {
-            computed: Some(rigid),
+            rigid_support: Some(rigid),
             ..Default::default()
         });
     }
@@ -234,7 +243,7 @@ pub(crate) fn reconcile_rigid(rigid: NumericInterval, fc: &FieldConstraints) -> 
     let hi_ok = qhi.is_none_or(|qh| rhi.is_some_and(|rh| rh <= qh));
     if lo_ok && hi_ok {
         return Reconciled::Feasible(FieldConstraints {
-            computed: Some(rigid),
+            rigid_support: Some(rigid),
             ..Default::default()
         });
     }
@@ -270,9 +279,9 @@ impl Merge for FieldConstraints {
             value,
             one_of,
             case_overrides,
-            // `merge` is the malleable (non-computed) algebra; `reconcile` intercepts computed
-            // supports before delegating here. Carry a rigid support through defensively.
-            computed: self.computed.or(other.computed),
+            // `merge` is the malleable algebra; `reconcile` intercepts rigid (expression) supports
+            // before delegating here. Carry a rigid support through defensively.
+            rigid_support: self.rigid_support.or(other.rigid_support),
         };
         merged.satisfiable().then_some(merged)
     }
@@ -654,7 +663,7 @@ mod tests {
 
     fn rigid(min: f64, max: f64) -> FieldConstraints {
         FieldConstraints {
-            computed: Some(NumericInterval {
+            rigid_support: Some(NumericInterval {
                 min: Some(min),
                 max: Some(max),
             }),
@@ -713,7 +722,7 @@ mod tests {
     fn reconcile_rigid_unbounded_against_range_is_unsound() {
         // computed unbounded above, restriction caps it → cannot verify
         let r = FieldConstraints {
-            computed: Some(NumericInterval {
+            rigid_support: Some(NumericInterval {
                 min: Some(0.0),
                 max: None,
             }),

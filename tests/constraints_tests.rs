@@ -14,7 +14,7 @@ fn constraints(
         value,
         one_of: None,
         case_overrides: vec![],
-        computed: None,
+        rigid_support: None,
     }
 }
 

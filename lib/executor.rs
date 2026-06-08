@@ -37,9 +37,13 @@ use crate::constraints::FieldConstraints;
 use crate::dq::apply_data_quality;
 use crate::generator::{generate_column, sample_count};
 use crate::import::{ImportIndex, filter_ring, load_import_index, resolve_import_path};
+use crate::expr_analysis::{
+    cast_computed_columns, classify_expression_placement, evaluate_expression_fields,
+    evaluate_expressions, infer_expression_types, types_compatible,
+};
 use crate::expressions::extract_identifiers;
 use crate::models::{
-    CountSpec, Field, FieldType, Format, Include, Range, Reducer, RingBounds, Schema, SeedConfig,
+    CountSpec, Field, Format, Include, Range, Reducer, RingBounds, Schema, SeedConfig,
     SyntheticDataset, eligible_linked_rows, resolve_include, split_ref,
 };
 use crate::output::{filter_hidden_columns, write_output};
@@ -1971,7 +1975,7 @@ async fn compute_shared_columns(
     }
 
     let inferred =
-        crate::expr_analysis::infer_expression_types(partial_schema.as_ref(), &expr_atom_fields)
+        infer_expression_types(partial_schema.as_ref(), &expr_atom_fields)
             .await?;
     let mut declared_types: Vec<DataType> = Vec::with_capacity(expr_atom_fields.len());
     for (ef, inf) in expr_atom_fields.iter().zip(&inferred) {
@@ -1992,56 +1996,6 @@ async fn compute_shared_columns(
 
     let atom = evaluate_expression_fields(partial, &expr_atom_fields).await?;
     cast_computed_columns(atom, &expr_atom_fields, &declared_types)
-}
-
-/// Two Arrow types are compatible as a *computed shared column* vs its *declared* type when they
-/// are equal or in the same family (numeric↔numeric, string↔string). Same-family differences
-/// (e.g. `Int64` result for a `number`/`Float64` column, `Utf8View` for `Utf8`) are reconciled by
-/// a cast; cross-family (e.g. a numeric result for a `string` column) is a genuine modelling error.
-fn types_compatible(declared: &DataType, inferred: &DataType) -> bool {
-    if declared == inferred {
-        return true;
-    }
-    let stringy =
-        |d: &DataType| matches!(d, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
-    (declared.is_numeric() && inferred.is_numeric()) || (stringy(declared) && stringy(inferred))
-}
-
-/// Cast the named computed columns of `batch` to their declared Arrow types, leaving all other
-/// columns untouched. A failed cast is a genuine type mismatch surfaced as a clear error.
-fn cast_computed_columns(
-    batch: RecordBatch,
-    expr_fields: &[&Field],
-    declared: &[DataType],
-) -> Result<RecordBatch> {
-    let want: HashMap<&str, &DataType> = expr_fields
-        .iter()
-        .map(|f| f.name.as_str())
-        .zip(declared.iter())
-        .collect();
-    let schema = batch.schema();
-    let mut fields: Vec<ArrowField> = Vec::with_capacity(batch.num_columns());
-    let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    for (f, c) in schema.fields().iter().zip(batch.columns()) {
-        match want.get(f.name().as_str()) {
-            Some(&target) if f.data_type() != target => {
-                let casted = arrow::compute::cast(c, target).map_err(|e| {
-                    anyhow!(
-                        "computed shared column '{}': cannot cast result {:?} to declared {target:?}: {e}",
-                        f.name(),
-                        f.data_type(),
-                    )
-                })?;
-                fields.push(ArrowField::new(f.name(), target.clone(), true));
-                cols.push(casted);
-            }
-            _ => {
-                fields.push(f.as_ref().clone());
-                cols.push(c.clone());
-            }
-        }
-    }
-    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?)
 }
 
 /// Adjust a precomputed column to length `target_n`:
@@ -2614,98 +2568,6 @@ fn add_column(batch: RecordBatch, field: ArrowField, col: ArrayRef) -> Result<Re
         Arc::new(ArrowSchema::new(fields)),
         columns,
     )?)
-}
-
-/// Evaluate all expression fields against the batch, building a CTE chain in
-/// YAML order so each step can reference expression columns defined above it.
-/// Returns the original batch augmented with new expression columns appended.
-/// True when a field materialises a list column (a `type: list` field or a list-link).
-/// Expression fields are excluded — their list-ness is decided transitively by deps.
-fn is_list_producing(field: &Field) -> bool {
-    field.expression.is_none()
-        && (matches!(field.field_type, Some(FieldType::List)) || field.content.is_some())
-}
-
-/// Partition a dataset's expression fields into staging-tier and assembly-tier, preserving
-/// YAML (`data`) order in each so the per-tier CTE chains keep dependency order. A single
-/// forward pass suffices because expression deps point upward (`validate_expression_order`).
-fn classify_expression_placement(dataset: &SyntheticDataset) -> (Vec<&Field>, Vec<&Field>) {
-    let mut assembly_names: HashSet<&str> = HashSet::new();
-    let mut staging: Vec<&Field> = Vec::new();
-    let mut assembly: Vec<&Field> = Vec::new();
-
-    for field in &dataset.data {
-        if is_list_producing(field) {
-            assembly_names.insert(field.name.as_str());
-            continue;
-        }
-        let Some(expr) = &field.expression else {
-            continue;
-        };
-        let depends_on_assembly = extract_identifiers(expr)
-            .iter()
-            .any(|id| assembly_names.contains(id));
-        if depends_on_assembly {
-            assembly_names.insert(field.name.as_str());
-            assembly.push(field);
-        } else {
-            staging.push(field);
-        }
-    }
-    (staging, assembly)
-}
-
-/// Evaluate all of `dataset`'s expression fields over `batch` (used at the non-list
-/// generation/emit sites, where there is a single batch and no staging/assembly split).
-async fn evaluate_expressions(
-    batch: RecordBatch,
-    dataset: &SyntheticDataset,
-) -> Result<RecordBatch> {
-    let expr_fields: Vec<_> = dataset
-        .data
-        .iter()
-        .filter(|f| f.expression.is_some())
-        .collect();
-    evaluate_expression_fields(batch, &expr_fields).await
-}
-
-/// Evaluate a *subset* of expression fields over `batch` via a CTE chain, in the given
-/// order. The caller selects which fields (a materialisation tier) — EXPR-RELOCATE PR1.
-async fn evaluate_expression_fields(
-    batch: RecordBatch,
-    expr_fields: &[&Field],
-) -> Result<RecordBatch> {
-    if expr_fields.is_empty() {
-        return Ok(batch);
-    }
-
-    // Fresh context per call — table name "src" is stable and the context is dropped
-    // at function exit, so there is no registration lifecycle to manage.
-    let ctx = SessionContext::new();
-    crate::list_norm::register_list_udfs(&ctx);
-    ctx.register_batch("src", batch)?;
-
-    let mut ctes = Vec::new();
-    let mut prev = "src".to_string();
-    for (i, field) in expr_fields.iter().enumerate() {
-        let step = format!("step{i}");
-        let expr = field.expression.as_ref().unwrap();
-        ctes.push(format!(
-            "{step} AS (SELECT *, {expr} AS \"{fname}\" FROM {prev})",
-            fname = field.name
-        ));
-        prev = step;
-    }
-
-    let sql = format!("WITH {} SELECT * FROM {prev}", ctes.join(", "));
-    let df = ctx.sql(&sql).await?;
-    let batches = df.collect().await?;
-
-    let schema = batches
-        .first()
-        .map(|b| b.schema())
-        .ok_or_else(|| anyhow!("expression evaluation returned no rows"))?;
-    Ok(concat_batches(&schema, &batches)?)
 }
 
 #[cfg(test)]

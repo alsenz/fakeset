@@ -1,16 +1,20 @@
-//! Static type inference for expressions (EXPR-RELOCATE PR2b).
+//! Expression placement, evaluation, and static analysis (EXPR-RELOCATE).
 //!
-//! Infers an expression's output Arrow `DataType` from its input column types using DataFusion's
-//! logical planner — **without executing any rows**. We register an empty (zero-row) batch
-//! carrying just the input schema, plan the same `WITH … SELECT *, <expr> AS <name>` chain that
-//! [`crate::executor::evaluate_expression_fields`] runs, and read the planned `DataFrame` schema
-//! rather than calling `.collect()`. Reading the logical schema is enough because type coercion
-//! happens at planning time; no data is materialised.
+//! Everything about turning a YAML `expression:` into a column lives here:
+//! - **placement** — [`classify_expression_placement`] buckets a dataset's expression fields into
+//!   staging-tier vs assembly-tier by dependency;
+//! - **evaluation** — [`evaluate_expression_fields`] runs a DataFusion CTE chain over a batch;
+//! - **analysis** — [`infer_expression_types`] / [`infer_expression_bounds`] read the planned
+//!   output type / derived interval **without executing rows** (an empty schema-only batch); and
+//! - **coercion** — [`types_compatible`] / [`cast_computed_columns`] reconcile a computed column's
+//!   result type with its declared type.
 //!
-//! This is the analysis stepping-stone the EXPR-RELOCATE roadmap adopts ahead of PR3's interval
-//! (bound) analysis: the same "ask DataFusion, don't write our own compiler" discipline.
+//! The analysis half is the "ask DataFusion, don't write our own compiler" discipline; the
+//! evaluation half is the one place that actually materialises expression columns.
 use anyhow::{Result, anyhow};
-use arrow::datatypes::{DataType, Schema as ArrowSchema};
+use arrow::array::ArrayRef;
+use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::interval_arithmetic::Interval;
@@ -19,11 +23,12 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion::physical_expr::utils::collect_columns;
 use datafusion::prelude::SessionContext;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::constraints::NumericInterval;
-use crate::models::Field;
+use crate::expressions::extract_identifiers;
+use crate::models::{Field, FieldType, SyntheticDataset};
 
 /// Infer the output `DataType` of each expression field (in order), evaluated over a table whose
 /// columns are `input_schema`. Earlier expressions are visible to later ones — identical scoping
@@ -179,6 +184,151 @@ fn scalar_to_opt_f64(sv: &ScalarValue) -> Option<f64> {
         Ok(ScalarValue::Float64(opt)) => opt,
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Placement + evaluation (relocated from executor.rs — EXPR-RELOCATE)
+// ---------------------------------------------------------------------------
+
+/// True when a field materialises a list column (a `type: list` field or a list-link).
+/// Expression fields are excluded — their list-ness is decided transitively by deps.
+fn is_list_producing(field: &Field) -> bool {
+    field.expression.is_none()
+        && (matches!(field.field_type, Some(FieldType::List)) || field.content.is_some())
+}
+
+/// Partition a dataset's expression fields into staging-tier and assembly-tier, preserving
+/// YAML (`data`) order in each so the per-tier CTE chains keep dependency order. A single
+/// forward pass suffices because expression deps point upward (`validate_expression_order`).
+pub(crate) fn classify_expression_placement(
+    dataset: &SyntheticDataset,
+) -> (Vec<&Field>, Vec<&Field>) {
+    let mut assembly_names: HashSet<&str> = HashSet::new();
+    let mut staging: Vec<&Field> = Vec::new();
+    let mut assembly: Vec<&Field> = Vec::new();
+
+    for field in &dataset.data {
+        if is_list_producing(field) {
+            assembly_names.insert(field.name.as_str());
+            continue;
+        }
+        let Some(expr) = &field.expression else {
+            continue;
+        };
+        let depends_on_assembly = extract_identifiers(expr)
+            .iter()
+            .any(|id| assembly_names.contains(id));
+        if depends_on_assembly {
+            assembly_names.insert(field.name.as_str());
+            assembly.push(field);
+        } else {
+            staging.push(field);
+        }
+    }
+    (staging, assembly)
+}
+
+/// Evaluate all of `dataset`'s expression fields over `batch` (used at the non-list
+/// generation/emit sites, where there is a single batch and no staging/assembly split).
+pub(crate) async fn evaluate_expressions(
+    batch: RecordBatch,
+    dataset: &SyntheticDataset,
+) -> Result<RecordBatch> {
+    let expr_fields: Vec<_> = dataset
+        .data
+        .iter()
+        .filter(|f| f.expression.is_some())
+        .collect();
+    evaluate_expression_fields(batch, &expr_fields).await
+}
+
+/// Evaluate a *subset* of expression fields over `batch` via a CTE chain, in the given
+/// order. The caller selects which fields (a materialisation tier) — EXPR-RELOCATE PR1.
+pub(crate) async fn evaluate_expression_fields(
+    batch: RecordBatch,
+    expr_fields: &[&Field],
+) -> Result<RecordBatch> {
+    if expr_fields.is_empty() {
+        return Ok(batch);
+    }
+
+    // Fresh context per call — table name "src" is stable and the context is dropped
+    // at function exit, so there is no registration lifecycle to manage.
+    let ctx = SessionContext::new();
+    crate::list_norm::register_list_udfs(&ctx);
+    ctx.register_batch("src", batch)?;
+
+    let mut ctes = Vec::new();
+    let mut prev = "src".to_string();
+    for (i, field) in expr_fields.iter().enumerate() {
+        let step = format!("step{i}");
+        let expr = field.expression.as_ref().unwrap();
+        ctes.push(format!(
+            "{step} AS (SELECT *, {expr} AS \"{fname}\" FROM {prev})",
+            fname = field.name
+        ));
+        prev = step;
+    }
+
+    let sql = format!("WITH {} SELECT * FROM {prev}", ctes.join(", "));
+    let df = ctx.sql(&sql).await?;
+    let batches = df.collect().await?;
+
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .ok_or_else(|| anyhow!("expression evaluation returned no rows"))?;
+    Ok(concat_batches(&schema, &batches)?)
+}
+
+/// Two Arrow types are compatible as a *computed shared column* vs its *declared* type when they
+/// are equal or in the same family (numeric↔numeric, string↔string). Same-family differences
+/// (e.g. `Int64` result for a `number`/`Float64` column, `Utf8View` for `Utf8`) are reconciled by
+/// a cast; cross-family (e.g. a numeric result for a `string` column) is a genuine modelling error.
+pub(crate) fn types_compatible(declared: &DataType, inferred: &DataType) -> bool {
+    if declared == inferred {
+        return true;
+    }
+    let stringy =
+        |d: &DataType| matches!(d, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    (declared.is_numeric() && inferred.is_numeric()) || (stringy(declared) && stringy(inferred))
+}
+
+/// Cast the named computed columns of `batch` to their declared Arrow types, leaving all other
+/// columns untouched. A failed cast is a genuine type mismatch surfaced as a clear error.
+pub(crate) fn cast_computed_columns(
+    batch: RecordBatch,
+    expr_fields: &[&Field],
+    declared: &[DataType],
+) -> Result<RecordBatch> {
+    let want: HashMap<&str, &DataType> = expr_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .zip(declared.iter())
+        .collect();
+    let schema = batch.schema();
+    let mut fields: Vec<ArrowField> = Vec::with_capacity(batch.num_columns());
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (f, c) in schema.fields().iter().zip(batch.columns()) {
+        match want.get(f.name().as_str()) {
+            Some(&target) if f.data_type() != target => {
+                let casted = arrow::compute::cast(c, target).map_err(|e| {
+                    anyhow!(
+                        "computed shared column '{}': cannot cast result {:?} to declared {target:?}: {e}",
+                        f.name(),
+                        f.data_type(),
+                    )
+                })?;
+                fields.push(ArrowField::new(f.name(), target.clone(), true));
+                cols.push(casted);
+            }
+            _ => {
+                fields.push(f.as_ref().clone());
+                cols.push(c.clone());
+            }
+        }
+    }
+    Ok(RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?)
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::constraints::{FieldConstraints, Reconciled};
+use crate::constraints::{FieldConstraints, Reconciled, reconcile_rigid};
 use crate::models::{CountSpec, RingBounds, SyntheticDataset};
 
 /// Hard cap on the number of feasible segments produced by DFS enumeration.
@@ -569,11 +569,34 @@ pub(crate) fn lower_cover_field_constraints(
             && let Some(parent_field_name) = ref_str.strip_prefix(prefix.as_str())
         {
             let fc = if let Some(expr) = &field.expression {
-                // Computed shared column: carry the **rigid** derived support, not the inherited
-                // malleable range (the own-range is validated separately in `plan.rs`). A
-                // non-numeric expression derives `None` → no numeric constraint participates.
+                // Expression-authored shared column: derive its **rigid support** from the member's
+                // own input ranges (a non-numeric expression derives `None` → no numeric constraint
+                // participates). Validate the support lies within the field's *own* declared range
+                // here too — deriving once (U3): disjoint *or* partial is an error, since that is
+                // the column's own assertion (EXPR-RELOCATE scenario 1).
+                let rigid_support =
+                    crate::expr_analysis::infer_expression_bounds(&schema, &ranges, expr)?;
+                if let (Some(iv), Some(r)) = (rigid_support, &field.range) {
+                    let declared = FieldConstraints {
+                        min: r.min,
+                        max: r.max,
+                        ..Default::default()
+                    };
+                    if !matches!(reconcile_rigid(iv, &declared), Reconciled::Feasible(_)) {
+                        bail!(
+                            "field '{}.{}': the expression's derived range [{:?}, {:?}] is not \
+                             within its declared range [{:?}, {:?}]",
+                            member.dataset.name,
+                            field.name,
+                            iv.min,
+                            iv.max,
+                            r.min,
+                            r.max,
+                        );
+                    }
+                }
                 FieldConstraints {
-                    computed: crate::expr_analysis::infer_expression_bounds(&schema, &ranges, expr)?,
+                    rigid_support,
                     ..Default::default()
                 }
             } else {
