@@ -10,5 +10,10 @@ data:
     content:
       from: src
       fields:
+        - name: v
+          ref: src.val
+        # A content `expression` is allowed (EXPR-RELOCATE PR4) but is the sole value-source:
+        # combining it with `type` must error.
         - name: doubled
-          expression: "src_val * 2"    # error: expression not supported in rich content
+          type: number
+          expression: "v * 2"

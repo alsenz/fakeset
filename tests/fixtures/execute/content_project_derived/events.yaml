@@ -1,0 +1,25 @@
+name: events
+format: jsonl
+output_file: events
+rows: 4
+links:
+  - file: people.yaml
+    ref: person
+    cardinality:
+      min: 1
+      max: 3
+data:
+  - name: event_id
+    type: string
+    generator: uuid
+  # PROJECT-FIELD derivation half: derive `doubled` per item, then collapse to a scalar list.
+  - name: doubled_weights
+    type: list
+    content:
+      from: person
+      project: doubled
+      fields:
+        - name: w
+          ref: person.weight
+        - name: doubled
+          expression: "w * 2"

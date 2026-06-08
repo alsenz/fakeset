@@ -317,7 +317,7 @@ Defines one column in a dataset's schema.
 | `parquet` | [`ParquetConfig`](#parquetconfig) | — | Arrow/Parquet type override. Overrides the default Arrow type inferred from `type`. |
 | `flatten` | boolean | — | Output-only. Elide this field's nesting at write time, pulling its sub-columns up to the parent level (serde `#[serde(flatten)]` analogue). Valid only on `object` and `variant` fields; requires a `name`. See [Flatten](#flatten) below. |
 | `flatten_strategy` | [`FlattenStrategy`](#flattenstrategy) | — | Layout for a flattened **variant**'s case fields in flat columnar output (Parquet/CSV): `superset` (default), `prefixed`, or `discriminant`. Ignored for JSON/JSONL. |
-| `expression` | string | — | SQL expression evaluated after all other fields are generated. Must reference only fields declared above this one. Mutually exclusive with `type`, `ref`, `generator`, `range`, `value`. |
+| `expression` | string | — | SQL expression over fields declared above this one. It is the field's value-source, so it is mutually exclusive with `type`, `generator`, `range`, `value`. It **may** combine with `ref` to author a shared/ref'd column (the value is computed once at the atom and projected up the lattice — a numeric result is checked/reconciled against any declared or sibling range). Evaluated at the earliest pipeline point where its inputs exist (EXPR-RELOCATE). |
 | `hidden` | boolean | — | Present in the internal batch but excluded from output. Set automatically for expression dependency pull-down. |
 | `count` | [`CountSpec`](#countspec) | — | Items per row for `list` fields. Ignored on other types. |
 | `precision` | integer | — | Decimal precision for `number` fields. Positive = decimal places; negative = rounds by powers of 10 (e.g. `-2` rounds to the nearest 100). |
@@ -532,6 +532,29 @@ Specifies the element type for a `list` field.
       - name: employer
         type: string
         refs: [ company_name ]   # outer-scoped ref
+```
+
+### Content expressions
+
+A list-item field may be an `expression`, computed **per item** at assembly time over the other
+item fields — both linked-scoped (drawn from the linked dataset) and outer-scoped (the enclosing
+row's fields, brought in by an outer-scoped `ref`). As with top-level expressions it is the sole
+value-source (no `type`/`ref`/`generator`/`value`) and may only reference item fields declared
+above it. Combine with a bare `project` to derive a scalar list.
+
+```yaml
+- name: holdings
+  type: list
+  content:
+    from: position
+    fields:
+      - name: weight                     # linked-scoped
+        ref: position.weight
+      - name: multiplier                 # outer-scoped ref (enclosing row)
+        type: number
+        ref: portfolio_multiplier
+      - name: adjusted_weight            # per-item content expression
+        expression: "weight * multiplier"
 ```
 
 ---

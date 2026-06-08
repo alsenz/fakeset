@@ -1053,6 +1053,12 @@ fn witness_key_seg(staging_path: &Path, field_name: &str, seg_idx: usize) -> Pat
     internal_path(staging_path, &format!("{field_name}___witness_{seg_idx}"))
 }
 
+/// Key under which `AssembleFromWitness` stashes the per-edge junction for a list field, consumed
+/// by a content-expression `collect` (EXPR-RELOCATE PR4b). Shared by the planner and executor.
+pub(crate) fn junction_key(staging_path: &Path, field_name: &str) -> PathBuf {
+    internal_path(staging_path, &format!("{field_name}___junction"))
+}
+
 /// Push a step plus any follow-on witness steps if `dataset` has list-link fields.
 ///
 /// The two closures exist because the correct step variant differs between staging and
@@ -1097,6 +1103,12 @@ fn emit_witness_steps(
     steps: &mut Vec<ExecutionStep>,
 ) {
     let mut witness_specs: Vec<(String, Vec<PathBuf>, Option<String>)> = Vec::new();
+    // Linked datasets targeted by any list-link content `collect`. Their values are per-edge (the
+    // assembled junction), so their `AccumulateToLinked` + `EmitDataset` run after
+    // `AssembleFromWitness` (tidy-up U2 — one unified post-assembly collect path).
+    let mut collect_linked: HashSet<PathBuf> = HashSet::new();
+    let mut deferred_collects: Vec<(PathBuf, String, PathBuf, String, Reducer, YamlValue)> =
+        Vec::new();
     for field in &dataset.data {
         let Some(content) = &field.content else {
             continue;
@@ -1145,46 +1157,34 @@ fn emit_witness_steps(
                 shard_q,
             });
             field_witness_keys.push(wkey.clone());
-
-            // Collect bindings: one AccumulateToLinked per segment per binding.
-            // Cumulative: each call merges new items with the existing list values
-            // written by previous segments' AccumulateToLinked calls.
-            for cf in &content.item.fields {
-                for binding in cf.collect_bindings() {
-                    let Some(bind) = binding.bind.as_deref() else {
-                        continue;
-                    };
-                    let Some((_, linked_field)) = split_ref(bind) else {
-                        continue;
-                    };
-                    let lf_name = linked_field.to_string();
-                    let def = linked_field_default(&linked_path, &lf_name, all_datasets);
-                    steps.push(ExecutionStep::AccumulateToLinked {
-                        source_path: wkey.clone(),
-                        source_field: cf.name.clone(),
-                        linked_path: linked_path.clone(),
-                        linked_field: lf_name,
-                        group_by: "_linked_idx".to_string(),
-                        reducer: binding.reducer.clone().unwrap_or(Reducer::Collect),
-                        default_val: def,
-                    });
-                }
-            }
-
             slot_start += seg.rows;
         }
 
-        // After all segments: emit EmitDataset once if any content field has collect bindings.
-        let has_collect = content
-            .item
-            .fields
-            .iter()
-            .any(|cf| !cf.collect_bindings().is_empty());
-        if has_collect && let Some(linked_ds) = all_datasets.get(&linked_path) {
-            steps.push(ExecutionStep::EmitDataset {
-                path: linked_path.clone(),
-                dataset: Arc::new(linked_ds.clone()),
-            });
+        // Every list-link content `collect` accumulates from the per-edge **junction** that
+        // `AssembleFromWitness` stashes — one `AccumulateToLinked` per binding, after assembly
+        // (tidy-up U2 — a single per-edge collect path for plain content fields and
+        // content-expressions alike). The linked dataset's emit is deferred to after the
+        // accumulates (recorded in `collect_linked`).
+        for cf in &content.item.fields {
+            for binding in cf.collect_bindings() {
+                let Some(bind) = binding.bind.as_deref() else {
+                    continue;
+                };
+                let Some((_, linked_field)) = split_ref(bind) else {
+                    continue;
+                };
+                let lf_name = linked_field.to_string();
+                let def = linked_field_default(&linked_path, &lf_name, all_datasets);
+                deferred_collects.push((
+                    junction_key(path, &field.name),
+                    cf.name.clone(),
+                    linked_path.clone(),
+                    lf_name,
+                    binding.reducer.clone().unwrap_or(Reducer::Collect),
+                    def,
+                ));
+                collect_linked.insert(linked_path.clone());
+            }
         }
 
         let project_col = content.project_col();
@@ -1198,6 +1198,29 @@ fn emit_witness_steps(
             dataset: Arc::new(dataset.clone()),
             witness_specs,
         });
+    }
+
+    // EXPR-RELOCATE PR4b: post-assembly content-expression collects. Each sources the per-edge
+    // junction that `AssembleFromWitness` stashed; all accumulates precede the (deferred) emits so
+    // every reducer result is written before the linked output file is finalised.
+    for (jkey, source_field, linked_path, linked_field, reducer, default_val) in deferred_collects {
+        steps.push(ExecutionStep::AccumulateToLinked {
+            source_path: jkey,
+            source_field,
+            linked_path,
+            linked_field,
+            group_by: "_linked_idx".to_string(),
+            reducer,
+            default_val,
+        });
+    }
+    for linked_path in &collect_linked {
+        if let Some(linked_ds) = all_datasets.get(linked_path) {
+            steps.push(ExecutionStep::EmitDataset {
+                path: linked_path.clone(),
+                dataset: Arc::new(linked_ds.clone()),
+            });
+        }
     }
 }
 

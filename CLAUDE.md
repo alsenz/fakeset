@@ -147,6 +147,8 @@ The full theoretical framing is in `specs/done/REFRAME-1.md`.
 | **witness node** | An atom carrying the linked dataset's schema. One witness row per unique linked-row draw. A hidden `_staging_refs: List<UInt32>` column maps each witness row back to the staging source slots that drew it. |
 | **assembly node** | A virtual node above the staging node that folds witness rows into list columns, evaluates expressions, and emits the final output. |
 | **source slot** | One row of a staging batch, identified by `_slot_idx`. |
+| **edge** | One (source slot, linked row) pairing — a single drawn relationship. The same linked row sits on many edges (many outer rows can draw it). |
+| **junction** (per-edge table) | The materialised table of **edges** — one row per (source slot × linked-row draw). Built by `unnest_staging_refs` from a witness batch (`_staging_refs` expanded). The assembly folds it into list columns; a per-edge content-expression is evaluated on it and a content-expression `collect` accumulates it up by `_linked_idx`. A per-edge value lives here, never as a pinned scalar on the linked row. |
 | **linked dataset** | The target of a `links:` stanza (formerly "pool dataset"). |
 | **linked content list** | A `links:` list field whose per-item (`content:`) fields are drawn from a linked dataset. (≠ "linked list".) Variants on its item fields are not yet supported — see `specs/VAR-LINKED-CONTENT.md`. |
 | **seed edge** | The execution edge from linked dataset atoms to the witness node — the draw that populates witness rows from the linked dataset. |

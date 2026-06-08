@@ -1,0 +1,14 @@
+name: people
+format: jsonl
+rows: 12
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: full_name
+    type: string
+    generator: name
+  - name: score
+    type: number
+    range: { min: 1, max: 10 }
+    precision: 0

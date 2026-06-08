@@ -419,13 +419,13 @@ fn list_link_collect_produces_correct_step_sequence() {
     // pool: plain dataset (rows: 5) with a collect-target list field.
     // outer: nested-include dataset; content field has refs: [pool.item_name, {bind: pool.collected_labels, reducer: collect}].
     //
-    // Expected step order:
+    // Expected step order (unified per-edge collect path — tidy-up U2):
     //   GenerateDataset[pool, defer_emit=true]  ← collect target, file write deferred
     //   GenerateStagingNode[outer]              ← has list-link fields
     //   GenerateWitness[items]
-    //   AccumulateToLinked[items.item → pool.collected_labels]
+    //   AssembleFromWitness[outer]              ← builds & stashes the per-edge junction
+    //   AccumulateToLinked[items.item → pool.collected_labels]  ← sources the junction
     //   EmitDataset[pool]
-    //   AssembleFromWitness[outer]
     let steps = plan_for("tests/fixtures/plan/nested_collect");
 
     // pool must be generated with deferred file write (it is a collect target).
@@ -500,17 +500,20 @@ fn list_link_collect_produces_correct_step_sequence() {
         matches!(s, ExecutionStep::AssembleFromWitness { dataset, .. } if dataset.name == "outer")
     }).expect("AssembleFromWitness not found");
 
+    // Unified collect path (tidy-up U2): every list-link content collect sources the per-edge
+    // junction built by AssembleFromWitness, so the order is
+    //   GenerateWitness → AssembleFromWitness → AccumulateToLinked → EmitDataset[pool].
     assert!(
-        flat_pos < collect_pos,
-        "GenerateWitness must precede AccumulateToLinked"
+        flat_pos < assemble_pos,
+        "GenerateWitness must precede AssembleFromWitness"
+    );
+    assert!(
+        assemble_pos < collect_pos,
+        "AssembleFromWitness must precede AccumulateToLinked (collect sources the junction)"
     );
     assert!(
         collect_pos < emit_pos,
         "AccumulateToLinked must precede EmitDataset[pool]"
-    );
-    assert!(
-        emit_pos < assemble_pos,
-        "EmitDataset[pool] must precede AssembleFromWitness"
     );
 }
 

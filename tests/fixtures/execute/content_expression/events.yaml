@@ -1,0 +1,35 @@
+name: events
+format: jsonl
+output_file: events
+rows: 6
+links:
+  - file: people.yaml
+    ref: person
+    cardinality:
+      min: 1
+      max: 3
+data:
+  - name: event_id
+    type: string
+    generator: uuid
+  - name: multiplier
+    type: number
+    range: { min: 2, max: 4 }
+    precision: 0
+  - name: attendees
+    type: list
+    content:
+      from: person
+      fields:
+        - name: base
+          ref: person.score
+        # Outer-scoped ref brings the enclosing event's `multiplier` into each item.
+        - name: m
+          type: number
+          ref: multiplier
+        # Linked-only content-expression.
+        - name: doubled
+          expression: "base * 2"
+        # Outer-dependent content-expression (per-edge): linked base × outer multiplier.
+        - name: weighted
+          expression: "base * m"

@@ -1,0 +1,16 @@
+name: positions
+format: jsonl
+output_file: positions
+rows: 8
+data:
+  - name: id
+    type: string
+    generator: uuid
+  - name: raw_weight
+    type: number
+    range: { min: 1, max: 5 }
+    precision: 0
+  # Receives the per-edge collect of `score` (raw_weight × portfolio multiplier).
+  - name: adjusted
+    type: list
+    default: []

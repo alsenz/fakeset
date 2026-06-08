@@ -115,9 +115,17 @@ Fields inside `content.fields:` live in a two-namespace environment:
 | `refs: cats.field_name` | Linked-scoped: value taken from the linked batch; stored in the witness node |
 | `refs: outer_field_name` | Outer-scoped: value taken from the staging node at assembly time; not stored in the witness |
 | `type: string` (no refs) | Fresh: generated once per unique linked row in the witness node |
+| `expression: "..."` | Computed **per item** at the assembly junction, over the item fields above it (linked- and outer-scoped) |
 
 Outer-scoped refs allow list items to carry values from the enclosing row — e.g.
 an owner's `owner_id` appearing inside each pet entry.
+
+**Content expressions** (EXPR-RELOCATE) are evaluated at the assembly junction, where each edge
+already carries its linked content columns *and* the `take`-replicated outer-scoped refs — so a
+per-item derivation like `weight * multiplier` (linked × outer) is just an `expression` item field.
+They are skipped at the witness node (nothing to materialise there) and computed once the junction
+is assembled. Combine with a bare [`project:`](#the-project-shorthand) to collapse a derived item
+field to a scalar list.
 
 ## Per-segment witness replication
 
@@ -192,6 +200,23 @@ This drives what you can and can't send back to the linked dataset:
   value to pin (three owners → three values), and the direction is wrong: a `ref` pulls a value
   *from* the linked dataset, whereas an item value is produced *after* the draw. Use `collect`,
   not a ref.
+
+A per-edge value may itself be a **content expression** mixing a linked-scoped term with an
+outer-scoped one — e.g. `score = raw_weight * multiplier` (linked `raw_weight` × the enclosing
+row's `multiplier`). It is computed per edge at the assembly junction and `collect`s back to the
+linked dataset like any other item value (EXPR-RELOCATE):
+
+```yaml
+content:
+  from: position
+  fields:
+    - { name: rw, ref: position.raw_weight }      # linked-scoped
+    - { name: m,  type: number, ref: multiplier } # outer-scoped
+    - name: score
+      expression: "rw * m"                         # per-edge
+      refs:
+        - { bind: position.adjusted, reducer: collect }   # → []float on the linked row
+```
 
 <Aside type="caution">
 This per-edge / per-row distinction is subtle, but it decides what is expressible. When a

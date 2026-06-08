@@ -43,7 +43,7 @@ use crate::models::{
     SyntheticDataset, eligible_linked_rows, resolve_include, split_ref,
 };
 use crate::output::{filter_hidden_columns, write_output};
-use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField};
+use crate::plan::{ExecutionPlan, ExecutionStep, InheritedField, junction_key};
 use crate::schema::{field_to_arrow, schema_to_arrow};
 use crate::segment::{LowerCoverMember, Segment};
 
@@ -998,6 +998,11 @@ fn execute_witness(
     let mut columns: Vec<ArrayRef> = Vec::new();
 
     for field in inner_fields {
+        // Content-expressions (EXPR-RELOCATE PR4) are computed per-edge at the assembly junction,
+        // not materialised at the witness — skip them here, like outer-scoped refs.
+        if field.expression.is_some() {
+            continue;
+        }
         let col: ArrayRef = if let Some(ref_str) = field.simple_ref() {
             let is_linked_scoped = split_ref(ref_str)
                 .map(|(rp, _)| include.reference == rp)
@@ -1137,8 +1142,26 @@ async fn execute_assemble_from_witness(
         let staging_n = batch.num_rows();
 
         // Unnest _staging_refs to reconstruct the anonymous junction table.
-        let (mut junction, slot_arr_sorted, _witness_row_arr_sorted) =
+        let (mut junction, slot_arr_sorted, witness_row_arr_sorted) =
             unnest_staging_refs(&witness)?;
+
+        // Carry `_linked_idx` per edge into the junction (EXPR-RELOCATE PR4b) so a content-
+        // expression `collect` can group by it. Taken from the witness via the per-edge witness-row
+        // map; it rides through expression evaluation and is stripped before the list-fold.
+        let linked_idx_src = witness
+            .schema()
+            .index_of("_linked_idx")
+            .map_err(|_| anyhow!("witness missing '_linked_idx'"))?;
+        let linked_idx_col = take(
+            witness.column(linked_idx_src).as_ref(),
+            &witness_row_arr_sorted,
+            None,
+        )?;
+        junction = add_column(
+            junction,
+            ArrowField::new("_linked_idx", DataType::UInt32, false),
+            linked_idx_col,
+        )?;
 
         // Identify outer-scoped fields: defined in the content schema but absent from the
         // witness (because execute_witness skips them). Look them up from the staging batch.
@@ -1173,6 +1196,32 @@ async fn execute_assemble_from_witness(
             }
         }
 
+        // EXPR-RELOCATE PR4: evaluate content-expressions per-edge on the junction, which now
+        // carries the linked content columns (replicated per draw) and the outer-scoped refs —
+        // everything a content-expression can reference. Result columns fold into the list below.
+        let content_expr_fields: Vec<&Field> = content_field_defs
+            .iter()
+            .filter(|f| f.expression.is_some())
+            .collect();
+        if !content_expr_fields.is_empty() {
+            junction = evaluate_expression_fields(junction, &content_expr_fields).await?;
+            // The offset-based list-fold below requires the junction grouped by `_slot_idx`
+            // (`unnest_staging_refs` produced it sorted). Expression evaluation is a DataFusion
+            // projection that does not contractually preserve row order, so re-sort defensively
+            // (EXPR-RELOCATE F1) rather than relying on incidental single-partition ordering.
+            junction = sort_batch_by_slot_idx(junction)?;
+        }
+
+        // Stash the evaluated per-edge junction (it carries `_linked_idx`, the content columns, and
+        // any content-expression columns) so every list-link content `collect` accumulates from it
+        // post-assembly — one unified per-edge source (EXPR-RELOCATE PR4b + tidy-up U1/U2).
+        let needs_junction = content_field_defs
+            .iter()
+            .any(|f| !f.collect_bindings().is_empty());
+        if needs_junction {
+            computed.insert(junction_key(staging_path, field_name), junction.clone());
+        }
+
         // Slot-grouped list fold: count rows per slot, build offsets, fold into ListArray.
         let slot_idx_arr = downcast::<UInt32Array>(
             junction
@@ -1192,7 +1241,7 @@ async fn execute_assemble_from_witness(
             counts[idx as usize] += 1;
         }
 
-        let inner = strip_sentinel(junction, "_slot_idx");
+        let inner = strip_sentinel(strip_sentinel(junction, "_slot_idx"), "_linked_idx");
         let offsets = OffsetBuffer::<i32>::from_lengths(counts.iter().copied());
 
         let list_col: ArrayRef = if let Some(col_name) = project_col {
@@ -1302,7 +1351,12 @@ async fn execute_accumulate_to_linked(
     computed: &mut HashMap<PathBuf, RecordBatch>,
     accumulated_fields: &mut HashSet<(PathBuf, String)>,
 ) -> Result<()> {
-    let raw_source = computed
+    // Every accumulation source is already at **edge granularity** with a `_linked_idx` group key:
+    // a list-link content `collect` sources the per-edge junction stashed by `AssembleFromWitness`
+    // (`unnest_staging_refs` already expanded `_staging_refs`), and a top-level junction `collect`
+    // sources the junction dataset's own rows. So no `_staging_refs` expansion is needed here —
+    // that lives solely in `unnest_staging_refs` (tidy-up U1).
+    let source_batch = computed
         .get(source_path)
         .ok_or_else(|| {
             anyhow!(
@@ -1311,45 +1365,6 @@ async fn execute_accumulate_to_linked(
             )
         })?
         .clone();
-
-    // If the source is a Stage-4 witness batch (has `_staging_refs`), expand it to a flat
-    // junction table: one row per (staging-slot, linked-row) draw. This restores the K entries
-    // per linked row that the aggregation needs, since the witness carries only 1 row per unique
-    // linked-row draw with `_staging_refs` encoding the back-references.
-    let source_batch = if raw_source.schema().index_of("_staging_refs").is_ok() {
-        let refs_col_idx = raw_source.schema().index_of("_staging_refs")?;
-        let staging_refs = downcast::<ListArray>(
-            raw_source.column(refs_col_idx).as_ref(),
-            "AccumulateToLinked: _staging_refs",
-        )?;
-        let total: usize = (0..raw_source.num_rows())
-            .map(|r| staging_refs.value(r).len())
-            .sum();
-        let mut witness_row_idxs: Vec<u32> = Vec::with_capacity(total);
-        for wr in 0..raw_source.num_rows() {
-            let n = staging_refs.value(wr).len();
-            for _ in 0..n {
-                witness_row_idxs.push(wr as u32);
-            }
-        }
-        let witness_row_arr = UInt32Array::from(witness_row_idxs);
-        // Strip _staging_refs; keep _linked_idx and content columns (replicated per draw).
-        let stripped = strip_sentinel(raw_source, "_staging_refs");
-        let fields: Vec<ArrowField> = stripped
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect();
-        let cols: Vec<ArrayRef> = stripped
-            .columns()
-            .iter()
-            .map(|c| take(c.as_ref(), &witness_row_arr, None))
-            .collect::<Result<_, _>>()?;
-        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols)?
-    } else {
-        raw_source
-    };
 
     let linked_batch = computed
         .get(linked_path)
@@ -1785,13 +1800,6 @@ fn build_segment_atom_schema(
     Ok((atom_fields, providing_members))
 }
 
-/// Effective output field list for a member. A lower-cover member reaching the executor is already
-/// lowered into concrete case-members (constraint-bearing variants resolved in the planner), so
-/// its `data` is the final column list.
-fn member_effective_fields(m: &LowerCoverMember) -> Vec<Field> {
-    m.dataset.data.clone()
-}
-
 /// Map a member's local field name → parent field name, for every field whose
 /// `ref:` points at a column of the member's include parent (matched by
 /// `member.reference`).
@@ -1918,8 +1926,22 @@ async fn generate_segment_atom_batch(
         &RecordBatchOptions::new().with_row_count(Some(n_rows)),
     )?;
 
-    // Pass 2: computed shared columns. Their result types fall out of evaluation (PR2a has no
-    // static typing yet). Inputs are limited to the shared columns already materialised above.
+    // (4) Computed: evaluate atom fields carrying an `expression` over the shared columns just
+    // materialised, then project up unchanged.
+    compute_shared_columns(partial, &atom_fields, parent_schema).await
+}
+
+/// The **computed** atom-column source (EXPR-RELOCATE PR2): evaluate every atom field carrying an
+/// `expression` over `partial` (the shared columns already materialised by the import/precomputed/
+/// fresh passes). Returns `partial` unchanged when there are no computed fields. Each computed
+/// column is type-checked against its declared type up front (a clear error beats a cryptic Arrow
+/// failure) and cast to it (e.g. an `Int64` result into a `number`'s `Float64`) so projection up to
+/// the parent — whose schema is built from declared types — is exact.
+async fn compute_shared_columns(
+    partial: RecordBatch,
+    atom_fields: &[Field],
+    parent_schema: &Schema,
+) -> Result<RecordBatch> {
     let expr_atom_fields: Vec<&Field> = atom_fields
         .iter()
         .filter(|f| f.expression.is_some())
@@ -1948,9 +1970,6 @@ async fn generate_segment_atom_batch(
         }
     }
 
-    // Static type inference (EXPR-RELOCATE PR2b): the computed column's inferred output type must
-    // be compatible with the shared column's declared `type`. Catch genuine mismatches up front
-    // with a clear message, before evaluation and before the Arrow projection would fail cryptically.
     let inferred =
         crate::expr_analysis::infer_expression_types(partial_schema.as_ref(), &expr_atom_fields)
             .await?;
@@ -1972,8 +1991,6 @@ async fn generate_segment_atom_batch(
     }
 
     let atom = evaluate_expression_fields(partial, &expr_atom_fields).await?;
-    // Cast each computed column to its declared type (e.g. an Int64 result into a `number`'s
-    // Float64) so projection up to the parent — whose schema is built from declared types — is exact.
     cast_computed_columns(atom, &expr_atom_fields, &declared_types)
 }
 
@@ -2151,7 +2168,7 @@ fn project_member_columns(
         let mut out_fields: Vec<ArrowField> =
             vec![ArrowField::new("_slot_idx", DataType::UInt32, false)];
         let mut out_cols: Vec<ArrayRef> = vec![Arc::new(UInt32Array::from(slot_tags))];
-        for f in &member_effective_fields(m) {
+        for f in &m.dataset.data {
             if f.expression.is_some() || f.is_list_link() {
                 continue;
             }
@@ -2193,7 +2210,7 @@ fn project_member_columns(
     };
     let mut out_fields: Vec<ArrowField> = Vec::new();
     let mut out_cols: Vec<ArrayRef> = Vec::new();
-    for f in &member_effective_fields(m) {
+    for f in &m.dataset.data {
         if f.expression.is_some() || f.is_list_link() {
             continue;
         }
@@ -2344,6 +2361,22 @@ fn sample_with_polya(mut weights: Vec<f64>, count: usize, reinforcement: f64) ->
         weights[chosen] *= reinforcement;
     }
     result
+}
+
+/// Reorder a junction batch so its rows are grouped/ascending by `_slot_idx`. The offset-based
+/// list-fold in `execute_assemble_from_witness` depends on this grouping; see EXPR-RELOCATE F1.
+fn sort_batch_by_slot_idx(batch: RecordBatch) -> Result<RecordBatch> {
+    let idx = batch
+        .schema()
+        .index_of("_slot_idx")
+        .map_err(|_| anyhow!("sort_batch_by_slot_idx: junction missing '_slot_idx'"))?;
+    let order = arrow::compute::sort_to_indices(batch.column(idx), None, None)?;
+    let cols = batch
+        .columns()
+        .iter()
+        .map(|c| take(c.as_ref(), &order, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), cols)?)
 }
 
 fn strip_sentinel(batch: RecordBatch, sentinel: &str) -> RecordBatch {

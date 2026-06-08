@@ -858,6 +858,68 @@ async fn test_sibling_restriction_partial_overlap_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// EXPR-RELOCATE PR4 — content-expressions (per-edge, at the assembly junction)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_content_expressions_per_item() {
+    // A linked-only content-expression (`doubled = base*2`) and an outer-dependent one
+    // (`weighted = base*m`, where `m` is the event's `multiplier` brought in by an outer-scoped
+    // ref) are both computed per item at the assembly junction.
+    let out = run("tests/fixtures/execute/content_expression").await;
+    let events = jsonl_rows(&out, "events");
+    assert_eq!(events.len(), 6);
+    for ev in &events {
+        let mult = ev["multiplier"].as_f64().expect("multiplier");
+        let attendees = ev["attendees"].as_array().expect("attendees list");
+        assert!(!attendees.is_empty());
+        for a in attendees {
+            let base = a["base"].as_f64().expect("base");
+            let m = a["m"].as_f64().expect("m");
+            assert_eq!(m, mult, "outer-scoped m should equal the event multiplier");
+            assert!((a["doubled"].as_f64().unwrap() - base * 2.0).abs() < 1e-9);
+            assert!((a["weighted"].as_f64().unwrap() - base * m).abs() < 1e-9);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_content_expression_bare_project_to_scalar_list() {
+    // PROJECT-FIELD's derivation half: a derived content field (`doubled = w*2`) collapsed to a
+    // scalar list via bare `project`. `w` is a constant 5, so every projected value is 10.
+    let out = run("tests/fixtures/execute/content_project_derived").await;
+    let events = jsonl_rows(&out, "events");
+    assert_eq!(events.len(), 4);
+    for ev in &events {
+        let doubled = ev["doubled_weights"].as_array().expect("scalar list");
+        assert!(!doubled.is_empty());
+        for v in doubled {
+            assert_eq!(v.as_f64().unwrap(), 10.0, "w(5)*2 projected to scalar list");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_content_expression_edge_granular_collect() {
+    // PR4b: a per-edge content-expression (`score = rw * m`, m = the portfolio's constant
+    // multiplier 3) is collected into the linked dataset's `adjusted` []float. Each position's
+    // adjusted entries must all equal raw_weight * 3 (one per portfolio edge that drew it).
+    let out = run("tests/fixtures/execute/content_collect_expr").await;
+    let positions = jsonl_rows(&out, "positions");
+    assert_eq!(positions.len(), 8);
+    let mut total_collected = 0;
+    for p in &positions {
+        let rw = p["raw_weight"].as_f64().expect("raw_weight");
+        let adjusted = p["adjusted"].as_array().expect("adjusted list");
+        for v in adjusted {
+            assert_eq!(v.as_f64().unwrap(), rw * 3.0, "collected per-edge score = rw*3");
+            total_collected += 1;
+        }
+    }
+    assert!(total_collected > 0, "at least some edges should have been collected");
+}
+
+// ---------------------------------------------------------------------------
 // Variant tests
 // ---------------------------------------------------------------------------
 

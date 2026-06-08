@@ -410,20 +410,18 @@ fn test_list_link_include_scoped_missing_target_field_errors() {
 }
 
 #[test]
-fn test_list_link_expression_in_content_errors() {
+fn test_list_link_content_expression_with_type_errors() {
+    // EXPR-RELOCATE PR4: a content `expression` is allowed, but it is the sole value-source —
+    // combining it with `type` (or ref/generator/value) must error.
     let paths = vec![PathBuf::from(
         "tests/fixtures/validation/list_link_expression_in_content",
     )];
     let datasets = load_all_datasets(&paths).expect("should load");
-    let err = validate(&datasets).expect_err("expression inside link content should error");
+    let err = validate(&datasets).expect_err("content expression + type should error");
     let msg = err.to_string();
     assert!(
-        msg.contains("expression"),
-        "error should mention 'expression': {msg}"
-    );
-    assert!(
-        msg.contains("list-link") || msg.contains("nested include"),
-        "error should mention 'list-link' or 'nested include': {msg}"
+        msg.contains("expression") && msg.contains("cannot be combined"),
+        "error should flag the one-value-source rule: {msg}"
     );
 }
 

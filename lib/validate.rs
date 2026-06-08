@@ -1247,14 +1247,38 @@ fn validate_list_link_content(
     all: &HashMap<PathBuf, SyntheticDataset>,
     _warnings: &mut Vec<String>,
 ) -> Result<()> {
+    let all_content_names: HashSet<&str> = data.iter().map(|f| f.name.as_str()).collect();
+    let mut available: HashSet<&str> = HashSet::new();
     for field in data {
         if field.name.is_empty() {
             bail!("list-link content at '{path}': a field is missing a `name`");
         }
         let fpath = format!("{path}.{}", field.name);
 
-        if field.expression.is_some() {
-            bail!("field '{fpath}': `expression` is not supported inside list-link content");
+        // EXPR-RELOCATE PR4: a content field may be an `expression`, evaluated per-edge at the
+        // assembly junction. It is the sole value-source (no `type`/`ref`/`generator`/`value`), and
+        // any reference to another *content* field must be defined above it (YAML order).
+        if let Some(expr) = &field.expression {
+            if field.field_type.is_some()
+                || field.simple_ref().is_some()
+                || field.generator.is_some()
+                || field.value.is_some()
+            {
+                bail!(
+                    "field '{fpath}': a content `expression` cannot be combined with `type`, \
+                     `ref`, `generator`, or `value`"
+                );
+            }
+            for ident in extract_identifiers(expr) {
+                if all_content_names.contains(ident) && !available.contains(ident) {
+                    bail!(
+                        "field '{fpath}': expression references content field '{ident}' which \
+                         must be defined above it"
+                    );
+                }
+            }
+            available.insert(field.name.as_str());
+            continue;
         }
 
         // VAR-LINKED-CONTENT gate: tagged-union (`type: variant`) item fields on a linked
@@ -1332,6 +1356,7 @@ fn validate_list_link_content(
         {
             bail!("field '{fpath}': generator `{g}` is not valid for type `{ft}`");
         }
+        available.insert(field.name.as_str());
     }
     Ok(())
 }

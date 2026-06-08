@@ -1,0 +1,33 @@
+name: portfolios
+format: jsonl
+output_file: portfolios
+rows: 6
+links:
+  - file: positions.yaml
+    ref: position
+    cardinality:
+      min: 1
+      max: 3
+data:
+  - name: portfolio_id
+    type: string
+    generator: uuid
+  - name: multiplier
+    type: number
+    value: 3
+  - name: holdings
+    type: list
+    content:
+      from: position
+      fields:
+        - name: rw
+          ref: position.raw_weight
+        - name: m
+          type: number
+          ref: multiplier
+        # Per-edge content-expression collected back into the linked dataset's `adjusted` list.
+        - name: score
+          expression: "rw * m"
+          refs:
+            - bind: position.adjusted
+              reducer: collect
